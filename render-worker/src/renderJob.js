@@ -86,12 +86,8 @@ function runFfmpeg({ clipPaths, audioPath, scriptPath, finalVideoLabel, outputPa
 
     const cmd = ffmpeg();
 
-    // Add all video clip inputs with trim
-    // NOTE: We pass the full file and let the normalisation filter handle fps.
-    //       Trimming is done via -ss/-t input options for efficiency.
-    // We need to handle trim separately since we set it per clip.
-    // Actually, we add inputs and handle trimming via the setpts filter approach,
-    // but for simplicity and accuracy we use input seeking:
+    // Add all video clip inputs (full files; trimming is handled inside
+    // the filter graph via trim=start:end,setpts=PTS-STARTPTS).
     clipPaths.forEach((p) => {
       cmd.input(p);
     });
@@ -109,6 +105,7 @@ function runFfmpeg({ clipPaths, audioPath, scriptPath, finalVideoLabel, outputPa
       `-map`, `${finalVideoLabel}`,
       `-map`, `${audioInputIndex}:a`,
       `-c:v`, `libx264`,
+      `-pix_fmt`, `yuv420p`,
       `-preset`, `veryfast`,
       `-crf`, `23`,
       `-c:a`, `aac`,

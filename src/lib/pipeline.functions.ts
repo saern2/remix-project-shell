@@ -50,22 +50,45 @@ export const startPipeline = createServerFn({ method: "POST" })
     }
 
     try {
-      const { getAsrProvider } = await import("@/lib/asr.server");
-      const provider = getAsrProvider();
-      const { jobId } = await provider.submit(signed.signedUrl);
+      const { transcribeAudio } = await import("@/lib/asr.server");
+      const result = await transcribeAudio(signed.signedUrl);
 
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+      if (result.mode === "async") {
+        // AssemblyAI-style: hand off to the poll loop.
+        const { error: updErr } = await supabaseAdmin
+          .from("projects")
+          .update({
+            status: "transcribing",
+            provider_job_id: result.jobId,
+            error_message: null,
+          })
+          .eq("id", projectId);
+        if (updErr) throw new Error(updErr.message);
+        return { ok: true, status: "transcribing" };
+      }
+
+      // Sync path (Deepgram): persist transcript + scenes now, jump ahead.
+      await persistTranscriptAndScenes(projectId, {
+        provider: result.provider,
+        full_text: result.full_text,
+        language: result.language,
+        words: result.words,
+        sentences: result.sentences,
+        duration_sec: result.duration_sec,
+      });
+
       const { error: updErr } = await supabaseAdmin
         .from("projects")
         .update({
-          status: "transcribing",
-          provider_job_id: jobId,
+          status: "generating_scenes",
+          provider_job_id: null,
           error_message: null,
         })
         .eq("id", projectId);
       if (updErr) throw new Error(updErr.message);
-
-      return { ok: true, status: "transcribing" };
+      return { ok: true, status: "generating_scenes" };
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to start pipeline.";
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -76,6 +99,90 @@ export const startPipeline = createServerFn({ method: "POST" })
       throw new Error(message);
     }
   });
+
+/**
+ * Persist a completed ASR result: update audio duration, insert transcript
+ * row, insert scene rows. Shared by the sync Deepgram path in startPipeline
+ * and the async AssemblyAI path in advanceFromTranscribing.
+ */
+async function persistTranscriptAndScenes(
+  projectId: string,
+  completed: {
+    provider: string;
+    full_text: string;
+    language: string | null;
+    words: Array<{ text: string; start_ms: number; end_ms: number; confidence?: number }>;
+    sentences: Array<{ text: string; start_ms: number; end_ms: number }>;
+    duration_sec: number | null;
+  },
+) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+  // Unconditionally clear any prior scenes for this project before
+  // re-inserting. clip_candidates and selected_clips cascade off scenes,
+  // so this also cleans up partial matching data from a failed attempt.
+  // No-op on a fresh project.
+  {
+    const { error: delErr } = await supabaseAdmin
+      .from("scenes")
+      .delete()
+      .eq("project_id", projectId);
+    if (delErr) throw new Error(delErr.message);
+  }
+
+  const { data: asset } = await supabaseAdmin
+    .from("audio_assets")
+    .select("id")
+    .eq("project_id", projectId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (asset?.id && typeof completed.duration_sec === "number") {
+    await supabaseAdmin
+      .from("audio_assets")
+      .update({ duration_sec: completed.duration_sec })
+      .eq("id", asset.id);
+  }
+
+  const { data: transcript, error: tErr } = await supabaseAdmin
+    .from("transcripts")
+    .insert({
+      project_id: projectId,
+      audio_asset_id: asset?.id ?? null,
+      provider: completed.provider,
+      full_text: completed.full_text,
+      language: completed.language,
+      word_timestamps: completed.words as unknown as never,
+    })
+    .select("id")
+    .single();
+  if (tErr || !transcript) throw new Error(tErr?.message ?? "Failed to save transcript.");
+
+  const sentences = completed.sentences.length
+    ? completed.sentences
+    : [
+        {
+          text: completed.full_text,
+          start_ms: completed.words[0]?.start_ms ?? 0,
+          end_ms: completed.words.at(-1)?.end_ms ?? 0,
+        },
+      ];
+
+  const sceneRows = sentences.map((s, idx) => ({
+    project_id: projectId,
+    transcript_id: transcript.id,
+    idx,
+    text: s.text,
+    start_ts: s.start_ms / 1000,
+    end_ts: s.end_ms / 1000,
+    status: "pending",
+  }));
+  if (sceneRows.length) {
+    const { error: sErr } = await supabaseAdmin.from("scenes").insert(sceneRows);
+    if (sErr) throw new Error(sErr.message);
+  }
+}
 
 /**
  * Drive the pipeline forward one step. Safe to call repeatedly:
@@ -141,65 +248,14 @@ async function advanceFromTranscribing(projectId: string, providerJobId: string 
       return { status: "transcribing", error_message: null };
     }
 
-
-    // Completed. Find audio asset id (for FK).
-    const { data: asset } = await supabaseAdmin
-      .from("audio_assets")
-      .select("id")
-      .eq("project_id", projectId)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    // Patch audio_assets.duration_sec from the ASR response (AssemblyAI
-    // returns audio_duration in seconds). This is the first point in the
-    // pipeline where we actually know how long the audio is.
-    if (asset?.id && typeof result.duration_sec === "number") {
-      await supabaseAdmin
-        .from("audio_assets")
-        .update({ duration_sec: result.duration_sec })
-        .eq("id", asset.id);
-    }
-
-    const { data: transcript, error: tErr } = await supabaseAdmin
-      .from("transcripts")
-      .insert({
-        project_id: projectId,
-        audio_asset_id: asset?.id ?? null,
-        provider: provider.name,
-        full_text: result.full_text,
-        language: result.language,
-        word_timestamps: result.words as unknown as never,
-      })
-      .select("id")
-      .single();
-    if (tErr || !transcript) throw new Error(tErr?.message ?? "Failed to save transcript.");
-
-    // Fallback: if AssemblyAI returned no sentences for some reason, treat
-    // the whole transcript as one scene rather than blocking the pipeline.
-    const sentences = result.sentences.length
-      ? result.sentences
-      : [
-          {
-            text: result.full_text,
-            start_ms: result.words[0]?.start_ms ?? 0,
-            end_ms: result.words.at(-1)?.end_ms ?? 0,
-          },
-        ];
-
-    const sceneRows = sentences.map((s, idx) => ({
-      project_id: projectId,
-      transcript_id: transcript.id,
-      idx,
-      text: s.text,
-      start_ts: s.start_ms / 1000,
-      end_ts: s.end_ms / 1000,
-      status: "pending",
-    }));
-    if (sceneRows.length) {
-      const { error: sErr } = await supabaseAdmin.from("scenes").insert(sceneRows);
-      if (sErr) throw new Error(sErr.message);
-    }
+    await persistTranscriptAndScenes(projectId, {
+      provider: provider.name,
+      full_text: result.full_text,
+      language: result.language,
+      words: result.words,
+      sentences: result.sentences,
+      duration_sec: result.duration_sec,
+    });
 
     await supabaseAdmin
       .from("projects")

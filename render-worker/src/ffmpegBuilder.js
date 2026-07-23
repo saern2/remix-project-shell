@@ -35,16 +35,23 @@ const SUPPORTED_TRANSITIONS = new Set(['hard-cut', 'crossfade']);
 /**
  * Returns a per-clip normalisation filter fragment.
  *
+ * Trim is applied first (inside the filter graph) so that only the
+ * requested [start, end] segment is scaled/padded — this is more
+ * accurate than input-level seeking (-ss/-t) for variable-fps sources.
+ *
  * @param {number} inputIndex  - FFmpeg input index (0-based)
  * @param {string} outLabel    - Output label, e.g. '[v0]'
- * @param {number} width
- * @param {number} height
+ * @param {number} width       - Must be even (libx264 requirement)
+ * @param {number} height      - Must be even (libx264 requirement)
  * @param {number} fps
+ * @param {number} start       - Clip trim start in seconds
+ * @param {number} end         - Clip trim end in seconds
  */
-function buildNormFilter(inputIndex, outLabel, width, height, fps) {
+function buildNormFilter(inputIndex, outLabel, width, height, fps, start, end) {
   // Note: stream specifier [N:v] selects the video stream of the Nth input.
   return (
     `[${inputIndex}:v]` +
+    `trim=start=${start}:end=${end},setpts=PTS-STARTPTS,` +
     `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
     `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,` +
     `setsar=1,` +
@@ -87,12 +94,17 @@ function buildFilterGraph({ clips, width, height, fps, transition, transitionDur
     );
   }
 
+  // libx264 requires even dimensions; round down if odd.
+  const w = width  % 2 === 0 ? width  : width  - 1;
+  const h = height % 2 === 0 ? height : height - 1;
+
   const n = clips.length;
   const lines = [];
 
-  // ── Step 1: Normalise every input clip ──────────────────────────────────
+  // ── Step 1: Normalise every input clip (trim → scale → pad → fps) ──────
   for (let i = 0; i < n; i++) {
-    lines.push(buildNormFilter(i, `[v${i}]`, width, height, fps));
+    const { start, end } = clips[i];
+    lines.push(buildNormFilter(i, `[v${i}]`, w, h, fps, start, end));
   }
 
   let finalLabel;

@@ -4,12 +4,13 @@ import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
+import { submitRenderJob, pollRenderJob } from "@/lib/render.functions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
-import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle } from "lucide-react";
+import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/projects/$projectId")({
@@ -56,6 +57,7 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_footage"]);
+const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering"]);
 
 
 function ProjectDetail() {
@@ -152,6 +154,70 @@ function ProjectDetail() {
       setSwappingId(null);
     }
   };
+
+  // ---- Render job ----
+  const runSubmitRender = useServerFn(submitRenderJob);
+  const runPollRender = useServerFn(pollRenderJob);
+  const [submittingRender, setSubmittingRender] = useState(false);
+
+  const renderJobQuery = useQuery({
+    enabled: !!project,
+    queryKey: ["render-job", projectId],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("render_jobs")
+        .select("id, status, progress_pct, output_url, error, created_at")
+        .eq("project_id", projectId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return data;
+    },
+    refetchInterval: (q) => (q.state.data && RENDER_ACTIVE.has(q.state.data.status) ? 3000 : false),
+  });
+  const renderJob = renderJobQuery.data;
+
+  const handleRender = async () => {
+    setSubmittingRender(true);
+    try {
+      await runSubmitRender({ data: { projectId } });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["render-job", projectId] }),
+      ]);
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setSubmittingRender(false);
+    }
+  };
+
+  // Poll worker while the current render job is active.
+  useEffect(() => {
+    if (!renderJob || !RENDER_ACTIVE.has(renderJob.status)) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      try {
+        await runPollRender({ data: { jobId: renderJob.id } });
+      } catch (err) {
+        if (!cancelled) toast.error((err as Error).message);
+      }
+      if (!cancelled) {
+        queryClient.invalidateQueries({ queryKey: ["render-job", projectId] });
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+        timer = setTimeout(tick, 3000);
+      }
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [renderJob?.id, renderJob?.status, projectId, queryClient, runPollRender]);
+
+
 
 
   // Poll the pipeline server function whenever the project is mid-flight.
@@ -343,6 +409,78 @@ function ProjectDetail() {
                 </CardContent>
               </Card>
             )}
+
+            {(isReady ||
+              project.status === "rendering" ||
+              project.status === "completed" ||
+              (project.status === "failed" && renderJob)) && (
+              <Card>
+                <CardHeader>
+                  <div className="flex items-center justify-between gap-4">
+                    <CardTitle className="text-base">Final video</CardTitle>
+                    {isReady && (!renderJob || !RENDER_ACTIVE.has(renderJob.status)) ? (
+                      <Button size="sm" onClick={handleRender} disabled={submittingRender}>
+                        {submittingRender ? (
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        ) : (
+                          <Film className="mr-2 h-4 w-4" />
+                        )}
+                        {renderJob?.status === "completed" ? "Re-render" : "Render video"}
+                      </Button>
+                    ) : null}
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {renderJob && RENDER_ACTIVE.has(renderJob.status) ? (
+                    <>
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        {renderJob.status === "queued"
+                          ? "Queued on the render worker…"
+                          : renderJob.status === "downloading"
+                            ? "Downloading source clips…"
+                            : "Rendering video…"}
+                        <span className="ml-auto font-mono text-xs">{renderJob.progress_pct}%</span>
+                      </div>
+                      <Progress value={renderJob.progress_pct} />
+                    </>
+                  ) : null}
+
+                  {renderJob?.status === "completed" && renderJob.output_url ? (
+                    <div className="space-y-2">
+                      <video
+                        src={renderJob.output_url}
+                        controls
+                        playsInline
+                        className="w-full max-h-[70vh] rounded-md bg-black"
+                      />
+                      <div className="flex justify-end">
+                        <Button size="sm" variant="outline" asChild>
+                          <a href={renderJob.output_url} download>
+                            Download MP4
+                          </a>
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {renderJob?.status === "failed" ? (
+                    <p className="text-sm text-destructive">
+                      {renderJob.error ?? "Render failed."}
+                    </p>
+                  ) : null}
+
+                  {!renderJob && isReady ? (
+                    <p className="text-sm text-muted-foreground">
+                      Everything looks good. Click <span className="font-medium">Render video</span> to
+                      stitch the timeline into an MP4.
+                    </p>
+                  ) : null}
+                </CardContent>
+              </Card>
+            )}
+
+
 
             {(isReady || project.status === "generating_scenes" || project.status === "matching_footage") && (
               <Card>

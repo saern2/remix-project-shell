@@ -138,7 +138,57 @@ async function safeText(res: Response): Promise<string> {
   }
 }
 
-/** Default provider — swap this to change the entire pipeline. */
+/** Async fallback provider (used by the poll loop). */
 export function getAsrProvider(): AsrProvider {
   return assemblyAiProvider;
+}
+
+// ---------------------------------------------------------------------------
+// Top-level transcription entry point.
+//
+// Deepgram is the DEFAULT provider (single synchronous call, fastest path).
+// If Deepgram fails for any reason — misconfigured keys, auth failure,
+// timeout, 5xx, exhausted key rotation — we automatically fall back to the
+// AssemblyAI async submit/poll flow rather than failing the whole project.
+// ---------------------------------------------------------------------------
+
+export type TranscribeResult =
+  | {
+      mode: "sync";
+      provider: "deepgram";
+      full_text: string;
+      language: string | null;
+      words: AsrWord[];
+      sentences: AsrSentence[];
+      duration_sec: number | null;
+    }
+  | {
+      mode: "async";
+      provider: "assemblyai";
+      jobId: string;
+    };
+
+export async function transcribeAudio(audioUrl: string): Promise<TranscribeResult> {
+  // Prefer Deepgram if any keys are configured.
+  const hasDeepgram = !!(process.env.DEEPGRAM_API_KEYS ?? "").trim();
+  if (hasDeepgram) {
+    try {
+      const { transcribeWithDeepgram } = await import("./asr/deepgram.server");
+      const result = await transcribeWithDeepgram(audioUrl);
+      console.log("[asr] transcript served by deepgram");
+      return {
+        mode: "sync",
+        provider: "deepgram",
+        ...result,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[asr] deepgram failed, falling back to assemblyai: ${message}`);
+      // fall through to AssemblyAI
+    }
+  }
+
+  const { jobId } = await assemblyAiProvider.submit(audioUrl);
+  console.log("[asr] transcript submitted to assemblyai");
+  return { mode: "async", provider: "assemblyai", jobId };
 }

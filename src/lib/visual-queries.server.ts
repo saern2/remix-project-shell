@@ -1,5 +1,9 @@
 // Server-only helper for turning scene sentences into concrete, visually
 // searchable stock-footage phrases via Lovable AI Gateway.
+//
+// Matching is by explicit {idx} — never by array position — because the
+// model can drop, reorder, or duplicate entries. Missing idx values are
+// retried once in a small follow-up call before we give up.
 
 const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const MODEL = "google/gemini-2.5-flash";
@@ -17,18 +21,20 @@ Examples:
 - "Success requires patience and discipline." -> "runner training empty stadium"
 - "Our economy is entering a period of uncertainty." -> "stock market screens red charts"
 - "She never gave up on her dream." -> "young woman painting late night"
-- "The whole team celebrated the launch." -> "office team high five laptops"
-- "Time slips away faster than we realize." -> "clock hands spinning close up"
 
-Return STRICT JSON matching this schema: {"queries": ["phrase1", "phrase2", ...]}. The queries array MUST have exactly one entry per input sentence, in the same order.`;
+Input: a JSON array of {"idx": number, "text": string} objects.
+Output: STRICT JSON matching {"results": [{"idx": number, "query": string}, ...]}.
+- Preserve each input's idx exactly in your output.
+- Return one result per input idx. Never invent new idx values.
+- No commentary, no extra keys.`;
 
-export async function generateVisualQueries(sentences: string[]): Promise<string[]> {
-  if (sentences.length === 0) return [];
+type SceneInput = { idx: number; text: string };
+
+async function callGateway(items: SceneInput[]): Promise<Map<number, string>> {
   const key = process.env.LOVABLE_API_KEY;
   if (!key) throw new Error("LOVABLE_API_KEY is not configured.");
 
-  const numbered = sentences.map((s, i) => `${i + 1}. ${s.replace(/\s+/g, " ").trim()}`).join("\n");
-  const userPrompt = `Convert each of the following ${sentences.length} narration sentences into a concrete visual stock-footage phrase. Return exactly ${sentences.length} phrases in order, as JSON.\n\nSentences:\n${numbered}`;
+  const userPrompt = `Convert each of the following ${items.length} narration sentences into a concrete visual stock-footage phrase. Return one entry per input idx.\n\nInput:\n${JSON.stringify(items)}`;
 
   const res = await fetch(GATEWAY_URL, {
     method: "POST",
@@ -59,22 +65,68 @@ export async function generateVisualQueries(sentences: string[]): Promise<string
   const content = payload.choices?.[0]?.message?.content;
   if (!content) throw new Error("AI response was empty.");
 
-  let parsed: { queries?: unknown };
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(content) as { queries?: unknown };
+    parsed = JSON.parse(content);
   } catch {
     throw new Error("AI returned invalid JSON for visual queries.");
   }
-  const queries = parsed.queries;
-  if (!Array.isArray(queries) || queries.length !== sentences.length) {
-    throw new Error(
-      `AI returned ${Array.isArray(queries) ? queries.length : "no"} queries but expected ${sentences.length}.`,
-    );
+
+  // Accept either { results: [...] } or a bare array, for resilience.
+  const raw =
+    Array.isArray(parsed)
+      ? parsed
+      : Array.isArray((parsed as { results?: unknown }).results)
+        ? (parsed as { results: unknown[] }).results
+        : Array.isArray((parsed as { queries?: unknown }).queries)
+          ? (parsed as { queries: unknown[] }).queries
+          : null;
+  if (!raw) throw new Error("AI response missing results array.");
+
+  const allowed = new Set(items.map((i) => i.idx));
+  const map = new Map<number, string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as { idx?: unknown; query?: unknown };
+    if (typeof e.idx !== "number" || !allowed.has(e.idx)) continue;
+    if (typeof e.query !== "string") continue;
+    const q = e.query.trim().toLowerCase();
+    if (!q) continue;
+    map.set(e.idx, q);
   }
-  return queries.map((q, i) => {
-    if (typeof q !== "string" || !q.trim()) {
-      throw new Error(`Empty visual query at index ${i}.`);
+  return map;
+}
+
+export async function generateVisualQueries(sentences: string[]): Promise<string[]> {
+  if (sentences.length === 0) return [];
+
+  const items: SceneInput[] = sentences.map((s, idx) => ({
+    idx,
+    text: s.replace(/\s+/g, " ").trim(),
+  }));
+
+  const map = await callGateway(items);
+
+  // Retry only missing idx values, in one follow-up call.
+  const missing = items.filter((i) => !map.has(i.idx));
+  if (missing.length > 0) {
+    try {
+      const retryMap = await callGateway(missing);
+      for (const [idx, q] of retryMap) map.set(idx, q);
+    } catch {
+      // Swallow retry error; the check below produces a clearer message.
     }
-    return q.trim().toLowerCase();
-  });
+  }
+
+  const result: string[] = [];
+  for (const item of items) {
+    const q = map.get(item.idx);
+    if (!q) {
+      throw new Error(
+        `Visual query generation failed for scene ${item.idx + 1} after retry.`,
+      );
+    }
+    result.push(q);
+  }
+  return result;
 }
