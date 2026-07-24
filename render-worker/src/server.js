@@ -24,7 +24,7 @@ const express = require('express');
 const { Queue, Job } = require('bullmq');
 const config = require('./config');
 const logger = require('./logger');
-const { getQueue, getJobStatus, getRedisConnection, startWorker } = require('./queue');
+const { getQueue, getJobStatus, getRedisConnection, startWorker, getFlowProducer, QUEUE_NAME, QUEUE_CHUNK, QUEUE_STITCH } = require('./queue');
 const { validatePayload } = require('./renderJob');
 
 const app = express();
@@ -135,8 +135,13 @@ app.get('/jobs/:id', requireApiKey, async (req, res) => {
   const jobId = req.params.id;
 
   try {
-    const queue = getQueue();
-    const job = await Job.fromId(queue, jobId);
+    const legacyQueue = getQueue(QUEUE_NAME);
+    let job = await Job.fromId(legacyQueue, jobId);
+
+    if (!job) {
+      const stitchQueue = getQueue(QUEUE_STITCH);
+      job = await Job.fromId(stitchQueue, `${jobId}-stitch`);
+    }
 
     if (!job) {
       return res.status(404).json({ error: 'Job not found', job_id: jobId });
@@ -198,8 +203,9 @@ async function main() {
     logger.info({ signal }, 'Shutting down gracefully');
     server.close(async () => {
       try {
-        const queue = getQueue();
-        await queue.close();
+        await getQueue(QUEUE_NAME).close();
+        await getQueue(QUEUE_CHUNK).close();
+        await getQueue(QUEUE_STITCH).close();
         const redis = getRedisConnection();
         await redis.quit();
       } catch (err) {
