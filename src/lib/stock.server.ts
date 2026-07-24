@@ -191,10 +191,10 @@ export async function searchStockFootage(opts: {
   const topN = candidates.slice(0, Math.min(5, candidates.length));
   const pick = topN[Math.floor(Math.random() * topN.length)];
 
-  // 6. Choose file with width closest to target
-  const chosenFile = pick.files.reduce((best, f) =>
-    Math.abs(f.width - opts.targetWidth) < Math.abs(best.width - opts.targetWidth) ? f : best,
-  );
+  // 6. Choose smallest file >= targetWidth, fallback to largest if all smaller
+  const sortedFiles = [...pick.files].sort((a, b) => a.width - b.width);
+  let chosenFile = sortedFiles.find((f) => f.width >= opts.targetWidth);
+  if (!chosenFile) chosenFile = sortedFiles[sortedFiles.length - 1];
 
   return { pick, chosenFile, candidates };
 }
