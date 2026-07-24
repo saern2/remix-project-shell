@@ -26,7 +26,7 @@ const { promisify } = require('util');
 const ffmpeg = require('fluent-ffmpeg');
 const config = require('./config');
 const logger = require('./logger');
-const { downloadAll } = require('./downloader');
+const { downloadAll, preFlightCheckUrl, asyncPool } = require('./downloader');
 const { buildFilterGraph, SUPPORTED_TRANSITIONS } = require('./ffmpegBuilder');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ function validatePayload(payload) {
  * resolves with the final output path or rejects with full stderr.
  *
  * @param {object} params
- * @param {string[]} params.clipPaths      - Local clip file paths (in order)
+ * @param {Array<{path: string, start: number, duration: number}>} params.clipInputs - Clip sources (local or remote URL) with trim params
  * @param {string}   params.audioPath      - Local audio file path
  * @param {string}   params.scriptPath     - filter_complex_script file path
  * @param {string}   params.finalVideoLabel- e.g. '[vout]'
@@ -79,23 +79,25 @@ function validatePayload(payload) {
  * @param {number}   params.fps
  * @param {AbortSignal} params.signal      - Abort signal (hard timeout)
  */
-function runFfmpeg({ clipPaths, audioPath, scriptPath, finalVideoLabel, outputPath, fps, signal }) {
+function runFfmpeg({ clipInputs, audioPath, scriptPath, finalVideoLabel, outputPath, fps, signal }) {
   return new Promise((resolve, reject) => {
     let stderrLines = [];
     let killed = false;
 
     const cmd = ffmpeg();
 
-    // Add all video clip inputs (full files; trimming is handled inside
-    // the filter graph via trim=start:end,setpts=PTS-STARTPTS).
-    clipPaths.forEach((p) => {
-      cmd.input(p);
+    // Add all video clip inputs with input-level trimming (-ss and -t)
+    clipInputs.forEach((ci) => {
+      cmd.input(ci.path).inputOptions([
+        '-ss', String(ci.start),
+        '-t', String(ci.duration)
+      ]);
     });
 
     // Add audio input last
     cmd.input(audioPath);
 
-    const audioInputIndex = clipPaths.length;
+    const audioInputIndex = clipInputs.length;
 
     // Use the filter_complex_script file
     cmd.addOption('-filter_complex_script', scriptPath);
@@ -118,6 +120,7 @@ function runFfmpeg({ clipPaths, audioPath, scriptPath, finalVideoLabel, outputPa
 
     // Capture stderr
     cmd.on('stderr', (line) => {
+      console.log('FFMPEG:', line);
       stderrLines.push(line);
       // Keep memory bounded during long encodes
       if (stderrLines.length > 5000) stderrLines = stderrLines.slice(-4000);
@@ -182,6 +185,137 @@ async function uploadOutput(filePath, uploadUrl, signal) {
   logger.info({ uploadUrl }, 'Upload complete');
 }
 
+// ─── Stitch Pipeline ──────────────────────────────────────────────────────────
+
+async function processStitchJob(job) {
+  const payload = job.data;
+  const jobId = job.id;
+  const parentJobId = jobId.replace('-stitch', '');
+  
+  const tempDir = path.join(config.tempDir, parentJobId);
+  await fsp.mkdir(tempDir, { recursive: true });
+  logger.info({ jobId: parentJobId, tempDir }, 'Stitch job started');
+
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => {
+    logger.warn({ jobId: parentJobId }, 'Stitch job timeout — aborting');
+    abortController.abort();
+  }, config.stitchTimeoutSeconds * 1000);
+
+  const { signal } = abortController;
+
+  try {
+    await job.updateData({ ...payload, _status: 'stitching' });
+    await job.updateProgress(50);
+
+    // Write concat file
+    const concatFilePath = path.join(tempDir, 'chunks.txt');
+    let concatContent = '';
+    
+    // Check if chunks exist locally or we just use the chunks array
+    for (let i = 0; i < payload.chunks_total; i++) {
+      const chunkPath = path.join(config.tempDir, `${parentJobId}-chunk-${i}`, 'output.mp4');
+      
+      // Enforce local file exists
+      try {
+        await fsp.access(chunkPath);
+      } catch (err) {
+        throw new Error(`Chunk file missing for concat: ${chunkPath}`);
+      }
+      
+      // FFmpeg concat format
+      concatContent += `file '${chunkPath.replace(/'/g, "'\\''")}'\n`;
+    }
+
+    await fsp.writeFile(concatFilePath, concatContent);
+
+    // Download original audio for the final mux
+    const { audioPath } = await downloadAll({
+      clips: [],
+      fallbackIndices: [],
+      audioUrl: payload.audio_url,
+      tempDir,
+      signal,
+    });
+
+    const outputPath = path.join(tempDir, 'final_output.mp4');
+
+    logger.info({ jobId: parentJobId }, 'Running FFmpeg concat + audio mux');
+    
+    await new Promise((resolve, reject) => {
+      let killed = false;
+      let stderrLines = [];
+
+      const cmd = ffmpeg()
+        .input(concatFilePath)
+        .inputOptions(['-f concat', '-safe 0'])
+        .input(audioPath)
+        .outputOptions([
+          '-map 0:v',
+          '-map 1:a',
+          '-c copy',
+          '-shortest',
+        ])
+        .output(outputPath);
+
+      cmd.on('stderr', (line) => {
+        stderrLines.push(line);
+        if (stderrLines.length > 1000) stderrLines = stderrLines.slice(-500);
+      });
+
+      cmd.on('error', (err) => {
+        const stderrSnippet = stderrLines.join('\n').slice(-2000);
+        const enriched = new Error(`Stitch FFmpeg error: ${err.message}`);
+        enriched.ffmpegStderr = stderrSnippet;
+        enriched.killed = killed;
+        reject(enriched);
+      });
+
+      cmd.on('end', () => resolve());
+
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          killed = true;
+          try { cmd.kill('SIGKILL'); } catch {}
+        }, { once: true });
+      }
+
+      cmd.run();
+    });
+
+    await job.updateProgress(90);
+
+    // Upload
+    if (payload.output_upload_url) {
+      await job.updateData({ ...payload, _status: 'uploading' });
+      await uploadOutput(outputPath, payload.output_upload_url, signal);
+    } else {
+      logger.info({ jobId: parentJobId }, 'No output_upload_url provided, skipping upload');
+    }
+
+    await job.updateProgress(100);
+    await job.updateData({ ...payload, _status: 'completed', _outputUrl: payload.output_upload_url });
+    return { success: true, uploaded: !!payload.output_upload_url };
+
+  } catch (err) {
+    await job.updateData({ ...payload, _status: 'failed', _error: err.message, _ffmpegStderr: err.ffmpegStderr });
+    throw err;
+  } finally {
+    clearTimeout(timeoutHandle);
+    
+    // Cleanup chunk temp dirs and stitch temp dir
+    try {
+      for (let i = 0; i < payload.chunks_total; i++) {
+        const chunkDir = path.join(config.tempDir, `${parentJobId}-chunk-${i}`);
+        await fsp.rm(chunkDir, { recursive: true, force: true }).catch(() => {});
+      }
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      logger.warn({ jobId: parentJobId, err: cleanupErr.message }, 'Cleanup failed');
+    }
+  }
+}
+
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 /**
@@ -223,12 +357,20 @@ async function processRenderJob(job) {
   const { signal } = abortController;
 
   try {
+    // ── Status: pre-flight ────────────────────────────────────────────────
+    await job.updateData({ ...payload, _status: 'pre-flight' });
+    
+    // The pre-flight check function is kept, but we no longer determine 
+    // network seek vs local fetch here. We download every clip locally.
+    const fallbackIndices = clips.map((_, i) => i);
+
     // ── Status: downloading ───────────────────────────────────────────────
     await job.updateData({ ...payload, _status: 'downloading' });
     await job.updateProgress(5);
 
     const { clipPaths, audioPath } = await downloadAll({
       clips,
+      fallbackIndices,
       audioUrl: audio_url,
       tempDir,
       signal,
@@ -252,17 +394,21 @@ async function processRenderJob(job) {
 
     const outputPath = path.join(tempDir, `output.mp4`);
 
-    // Trim: re-write clipPaths trimmed files so the concat sees the right segment
-    // We use FFmpeg input options per clip for trimming before the filter graph.
-    // This requires adjusting how we add inputs in runFfmpeg.
-    // We trim each clip separately first via a dedicated pre-trim step.
-    const trimmedPaths = await trimClips({ clips, clipPaths, tempDir, fps, signal });
-
     await job.updateProgress(40);
+
+    // Map clips to their local downloaded paths
+    const clipInputs = clips.map((c, i) => {
+      if (!clipPaths.has(i)) throw new Error(`Clip ${i} was not downloaded locally`);
+      return {
+        path: clipPaths.get(i),
+        start: c.start,
+        duration: c.end - c.start
+      };
+    });
 
     // Run the main FFmpeg encode
     await runFfmpeg({
-      clipPaths: trimmedPaths,
+      clipInputs,
       audioPath,
       scriptPath,
       finalVideoLabel,
@@ -274,7 +420,9 @@ async function processRenderJob(job) {
     await job.updateProgress(85);
 
     // ── Upload output ─────────────────────────────────────────────────────
-    if (output_upload_url) {
+    if (payload.is_chunk) {
+      logger.info({ jobId, outputPath }, 'Chunk render complete, leaving on disk for stitch job');
+    } else if (output_upload_url) {
       await uploadOutput(outputPath, output_upload_url, signal);
     } else {
       // Fallback: move to OUTPUT_DIR (local volume mount, single-instance only)
@@ -294,7 +442,7 @@ async function processRenderJob(job) {
     // Signal abort — distinguish timeout from other failures
     const isTimeout = signal.aborted && !err.ffmpegStderr?.includes('Killed');
     const errorMessage = isTimeout
-      ? `Job timed out after ${config.jobTimeoutSeconds}s`
+      ? `Job timed out after ${payload.is_chunk ? config.chunkTimeoutSeconds : config.jobTimeoutSeconds}s`
       : err.message;
 
     logger.error({ jobId, err: err.message, ffmpegStderr: err.ffmpegStderr }, 'Render job failed');
@@ -310,73 +458,20 @@ async function processRenderJob(job) {
     throw err; // Re-throw so BullMQ marks the job as failed
   } finally {
     clearTimeout(timeoutHandle);
-    // Always clean up temp files
-    try {
-      await fsp.rm(tempDir, { recursive: true, force: true });
-      logger.debug({ jobId, tempDir }, 'Temp directory cleaned up');
-    } catch (cleanupErr) {
-      logger.warn({ jobId, cleanupErr: cleanupErr.message }, 'Temp cleanup warning');
+    // Always clean up temp files (unless it's a chunk, then stitch job cleans it up)
+    if (!payload.is_chunk) {
+      try {
+        await fsp.rm(tempDir, { recursive: true, force: true });
+        logger.debug({ jobId, tempDir }, 'Temp directory cleaned up');
+      } catch (cleanupErr) {
+        logger.warn({ jobId, cleanupErr: cleanupErr.message }, 'Temp cleanup warning');
+      }
     }
   }
 }
 
-/**
- * Trims each clip to [start, end] using a fast FFmpeg copy-stream pass,
- * producing a trimmed file that the main filter graph then processes.
- * This is cleaner than chaining trim inside the already-complex filter graph.
- *
- * @param {object} params
- * @param {Array<{start:number, end:number}>} params.clips
- * @param {string[]} params.clipPaths
- * @param {string}   params.tempDir
- * @param {number}   params.fps    - (unused, trimming only)
- * @param {AbortSignal} params.signal
- * @returns {Promise<string[]>}    - Paths to the trimmed clip files
- */
-async function trimClips({ clips, clipPaths, tempDir, signal }) {
-  const trimmedPaths = [];
-
-  for (let i = 0; i < clips.length; i++) {
-    const { start, end } = clips[i];
-    const src = clipPaths[i];
-    const dest = path.join(tempDir, `trimmed_${i}.mp4`);
-
-    await new Promise((resolve, reject) => {
-      const cmd = ffmpeg(src)
-        .setStartTime(start)
-        .duration(end - start)
-        .outputOptions([
-          '-c:v', 'copy', // fast stream-copy for trim
-          '-c:a', 'copy',
-          '-avoid_negative_ts', 'make_zero',
-        ])
-        .output(dest);
-
-      let stderrLines = [];
-      cmd.on('stderr', (l) => stderrLines.push(l));
-      cmd.on('error', (err) => {
-        const enriched = new Error(`Trim failed for clip ${i}: ${err.message}`);
-        enriched.ffmpegStderr = stderrLines.join('\n').slice(-2000);
-        reject(enriched);
-      });
-      cmd.on('end', resolve);
-
-      if (signal?.aborted) {
-        reject(new Error('Aborted before trim'));
-        return;
-      }
-      signal?.addEventListener('abort', () => {
-        try { cmd.kill('SIGKILL'); } catch { /* ignore */ }
-        reject(new Error('Trim aborted by timeout'));
-      }, { once: true });
-
-      cmd.run();
-    });
-
-    trimmedPaths.push(dest);
-  }
-
-  return trimmedPaths;
-}
-
-module.exports = { processRenderJob, validatePayload };
+module.exports = {
+  validatePayload,
+  processRenderJob,
+  processStitchJob,
+};

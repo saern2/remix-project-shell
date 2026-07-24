@@ -57,15 +57,65 @@ app.post('/jobs', requireApiKey, async (req, res) => {
   }
 
   try {
-    const queue = getQueue();
+    const isChunked = payload.clips.length > config.chunkSize;
+    let isNew = false;
 
-    // BullMQ's { jobId } option makes enqueue idempotent:
-    // If a job with this ID already exists, add() returns the existing job
-    // without creating a new one.
-    const job = await queue.add('render', payload, { jobId });
+    if (!isChunked) {
+      const queue = getQueue(QUEUE_NAME);
+      const job = await queue.add('render', payload, { jobId });
+      isNew = job.timestamp > Date.now() - 2000;
+    } else {
+      const stitchQueue = getQueue(QUEUE_STITCH);
+      const activeStitches = await stitchQueue.getActive();
+      const activeProjectsCount = activeStitches.filter(j => j.data.user_id && j.data.user_id === payload.user_id).length;
+      
+      const chunks = [];
+      for (let i = 0; i < payload.clips.length; i += config.chunkSize) {
+        chunks.push(payload.clips.slice(i, i + config.chunkSize));
+      }
 
-    const isNew = job.timestamp > Date.now() - 2000; // rough new-vs-existing heuristic
-    logger.info({ jobId, isNew }, 'Job enqueued');
+      const flowProducer = getFlowProducer();
+      
+      // Calculate priority: chunk index + (active projects * 1000)
+      const basePriority = (activeProjectsCount * 1000);
+
+      const chunkJobs = chunks.map((chunk, index) => {
+        return {
+          name: 'render-chunk',
+          queueName: QUEUE_CHUNK,
+          data: {
+            ...payload,
+            clips: chunk,
+            chunk_index: index,
+            chunks_total: chunks.length,
+            is_chunk: true,
+          },
+          opts: {
+            jobId: `${jobId}-chunk-${index}`,
+            priority: basePriority + index + 1, // lower number = higher priority
+          }
+        };
+      });
+
+      const flowTree = {
+        name: 'render-stitch',
+        queueName: QUEUE_STITCH,
+        data: {
+          ...payload,
+          chunks_total: chunks.length,
+          is_stitch: true,
+        },
+        opts: {
+          jobId: `${jobId}-stitch`,
+        },
+        children: chunkJobs
+      };
+
+      const flowJob = await flowProducer.add(flowTree);
+      isNew = flowJob.job.timestamp > Date.now() - 2000;
+    }
+
+    logger.info({ jobId, isNew, isChunked }, 'Job enqueued');
 
     return res.status(isNew ? 202 : 200).json({
       job_id: jobId,

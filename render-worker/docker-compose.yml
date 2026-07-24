@@ -22,7 +22,8 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    mem_limit: 2.5GB
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -40,6 +41,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - NODE_ENV=development
+    mem_limit: 8GB
+    cpus: 6
     volumes:
       # Mount a shared output volume — only useful for single-instance local dev.
       # In production, use output_upload_url (Supabase pre-signed PUT) instead.

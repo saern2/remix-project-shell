@@ -41,9 +41,16 @@ const config = {
 
   // Resource limits
   jobTimeoutSeconds: intEnv('JOB_TIMEOUT_SECONDS', 600),
-  maxClips: intEnv('MAX_CLIPS', 20),
-  maxDurationSeconds: intEnv('MAX_DURATION_SECONDS', 600),
+  chunkTimeoutSeconds: intEnv('CHUNK_TIMEOUT_SECONDS', 300),
+  stitchTimeoutSeconds: intEnv('STITCH_TIMEOUT_SECONDS', 600),
+  chunkSize: intEnv('CHUNK_SIZE', 25),
+  workerConcurrencyChunks: intEnv('WORKER_CONCURRENCY_CHUNKS', 4),
+  workerConcurrencyStitches: intEnv('WORKER_CONCURRENCY_STITCHES', 2),
+  maxClips: intEnv('MAX_CLIPS', 5000),
+  maxDurationSeconds: intEnv('MAX_DURATION_SECONDS', 14400),
   maxDownloadBytes: intEnv('MAX_DOWNLOAD_BYTES', 2 * 1024 * 1024 * 1024), // 2 GB
+  maxStitchDownloadBytes: intEnv('MAX_STITCH_DOWNLOAD_BYTES', 10 * 1024 * 1024 * 1024), // 10 GB
+  globalCdnConcurrency: intEnv('GLOBAL_CDN_CONCURRENCY', 15),
 
   // I/O
   downloadTimeoutSeconds: intEnv('DOWNLOAD_TIMEOUT_SECONDS', 60),

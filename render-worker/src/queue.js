@@ -18,13 +18,15 @@
  *   This satisfies the "kill worker mid-render" requirement.
  */
 
-const { Queue, Worker, QueueEvents } = require('bullmq');
+const { Queue, Worker, QueueEvents, FlowProducer } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('./config');
 const logger = require('./logger');
-const { processRenderJob } = require('./renderJob');
+const { processRenderJob, processStitchJob } = require('./renderJob');
 
 const QUEUE_NAME = 'render';
+const QUEUE_CHUNK = 'render-chunk';
+const QUEUE_STITCH = 'render-stitch';
 
 // ─── Redis connection ─────────────────────────────────────────────────────────
 
@@ -50,70 +52,86 @@ function getRedisConnection() {
 
 // ─── Queue ────────────────────────────────────────────────────────────────────
 
-let _queue = null;
+const _queues = {};
+let _flowProducer = null;
 
-function getQueue() {
-  if (!_queue) {
-    _queue = new Queue(QUEUE_NAME, {
+function getQueue(name = QUEUE_NAME) {
+  if (!_queues[name]) {
+    _queues[name] = new Queue(name, {
       connection: createRedisConnection(),
       defaultJobOptions: {
         attempts: config.jobAttempts,
-        backoff: {
-          type: 'exponential',
-          delay: config.jobBackoffDelayMs,
-        },
-        removeOnComplete: { count: 500, age: 86400 }, // keep last 500 / 24h
-        removeOnFail: { count: 200, age: 86400 * 7 }, // keep failures for 7 days
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: 100,
+        removeOnFail: 500,
       },
     });
   }
-  return _queue;
+  return _queues[name];
+}
+
+function getFlowProducer() {
+  if (!_flowProducer) {
+    _flowProducer = new FlowProducer({
+      connection: createRedisConnection(),
+    });
+  }
+  return _flowProducer;
 }
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
 
-let _worker = null;
+let _workers = [];
 
-function startWorker() {
-  if (_worker) return _worker;
-
-  _worker = new Worker(
-    QUEUE_NAME,
+function createWorker(queueName, processor, concurrency, timeoutMs) {
+  const worker = new Worker(
+    queueName,
     async (job) => {
-      logger.info({ jobId: job.id }, 'Worker picked up job');
-      return processRenderJob(job);
+      logger.info({ jobId: job.id, queue: queueName }, 'Worker picked up job');
+      return processor(job);
     },
     {
       connection: createRedisConnection(),
-      concurrency: config.workerConcurrency,
+      concurrency,
       stalledInterval: config.bullStalledIntervalMs,
-      lockDuration: config.jobTimeoutSeconds * 1000 + 30_000, // slightly longer than job timeout
-      lockRenewTime: Math.floor(config.jobTimeoutSeconds * 1000 / 2),
+      lockDuration: timeoutMs + 30_000,
+      lockRenewTime: Math.floor(timeoutMs / 2),
     }
   );
 
-  _worker.on('completed', (job, result) => {
-    logger.info({ jobId: job.id, result }, 'Job completed');
+  worker.on('completed', (job, result) => {
+    logger.info({ jobId: job.id, result, queue: queueName }, 'Job completed');
   });
 
-  _worker.on('failed', (job, err) => {
-    logger.error({ jobId: job?.id, err: err.message }, 'Job failed');
+  worker.on('failed', (job, err) => {
+    logger.error({ jobId: job?.id, err: err.message, queue: queueName }, 'Job failed');
   });
 
-  _worker.on('stalled', (jobId) => {
-    logger.warn({ jobId }, 'Job stalled — will be retried or failed by BullMQ');
+  worker.on('stalled', (jobId) => {
+    logger.warn({ jobId, queue: queueName }, 'Job stalled — will be retried or failed by BullMQ');
   });
 
-  _worker.on('error', (err) => {
-    logger.error({ err: err.message }, 'Worker error');
+  worker.on('error', (err) => {
+    logger.error({ err: err.message, queue: queueName }, 'Worker error');
   });
 
-  logger.info(
-    { concurrency: config.workerConcurrency, queue: QUEUE_NAME },
-    'BullMQ worker started'
-  );
+  logger.info({ concurrency, queue: queueName }, 'BullMQ worker started');
+  return worker;
+}
 
-  return _worker;
+function startWorker() {
+  if (_workers.length > 0) return _workers;
+
+  // Legacy/small-project queue
+  _workers.push(createWorker(QUEUE_NAME, processRenderJob, config.workerConcurrency, config.jobTimeoutSeconds * 1000));
+  
+  // Chunk queue
+  _workers.push(createWorker(QUEUE_CHUNK, processRenderJob, config.workerConcurrencyChunks, config.chunkTimeoutSeconds * 1000));
+  
+  // Stitch queue
+  _workers.push(createWorker(QUEUE_STITCH, processStitchJob, config.workerConcurrencyStitches, config.stitchTimeoutSeconds * 1000));
+
+  return _workers;
 }
 
 // ─── Job status helper ────────────────────────────────────────────────────────
@@ -151,8 +169,11 @@ async function getJobStatus(job) {
 
 module.exports = {
   getQueue,
+  getFlowProducer,
   startWorker,
   getRedisConnection,
   getJobStatus,
   QUEUE_NAME,
+  QUEUE_CHUNK,
+  QUEUE_STITCH,
 };

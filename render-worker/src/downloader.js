@@ -26,6 +26,46 @@ const { URL } = require('url');
 const config = require('./config');
 const logger = require('./logger');
 
+// ─── Global CDN Concurrency Limiter ───────────────────────────────────────────
+
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.active = 0;
+    this.waiting = [];
+  }
+
+  async acquire() {
+    if (this.active < this.max) {
+      this.active++;
+      return;
+    }
+    return new Promise(resolve => {
+      this.waiting.push(resolve);
+    });
+  }
+
+  release() {
+    if (this.waiting.length > 0) {
+      const next = this.waiting.shift();
+      next();
+    } else {
+      this.active--;
+    }
+  }
+}
+
+const cdnSemaphore = new Semaphore(config.globalCdnConcurrency || 15);
+
+function isCdnUrl(urlStr) {
+  try {
+    const host = new URL(urlStr).hostname.toLowerCase();
+    return host.includes('pexels.com') || host.includes('pixabay.com');
+  } catch {
+    return false;
+  }
+}
+
 // ─── SSRF Guard ───────────────────────────────────────────────────────────────
 
 /**
@@ -94,10 +134,16 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
   // ── HTTP/HTTPS download ───────────────────────────────────────────────────
   logger.debug({ url, destPath }, 'Downloading file');
 
-  return new Promise((resolve, reject) => {
-    let bytesWritten = 0;
-    let finished = false;
-    const timeoutMs = config.downloadTimeoutSeconds * 1000;
+  const requiresSemaphore = isCdnUrl(url);
+  if (requiresSemaphore) {
+    await cdnSemaphore.acquire();
+  }
+
+  try {
+    return await new Promise((resolve, reject) => {
+      let bytesWritten = 0;
+      let finished = false;
+      const timeoutMs = config.downloadTimeoutSeconds * 1000;
 
     // Track abort signal
     if (signal?.aborted) {
@@ -188,59 +234,162 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
 
     doRequest(url);
   });
+  } finally {
+    if (requiresSemaphore) {
+      cdnSemaphore.release();
+    }
+  }
 }
 
 /**
- * Downloads all clips and the audio track for a job into a temp directory.
+ * Executes tasks concurrently up to a given limit.
+ * @param {number} concurrency
+ * @param {Array<T>} items
+ * @param {(item: T) => Promise<R>} iteratorFn
+ * @returns {Promise<R[]>}
+ */
+async function asyncPool(concurrency, items, iteratorFn) {
+  const results = [];
+  const executing = new Set();
+  for (const item of items) {
+    const p = Promise.resolve().then(() => iteratorFn(item));
+    results.push(p);
+    executing.add(p);
+    const clean = () => executing.delete(p);
+    p.then(clean, clean);
+    if (executing.size >= concurrency) {
+      await Promise.race(executing);
+    }
+  }
+  return Promise.all(results);
+}
+
+/**
+ * Checks if a URL is reachable and supports HTTP Range requests.
+ * Resolves to true if supported, false otherwise.
+ * @param {string} url
+ * @param {object} opts
+ * @param {AbortSignal} [opts.signal]
+ * @returns {Promise<boolean>}
+ */
+async function preFlightCheckUrl(url, { signal } = {}) {
+  try {
+    assertAllowedUrl(url);
+    const parsed = new URL(url);
+    // Send file:// URLs to the fallback downloader so they are copied to tempDir
+    if (parsed.protocol === 'file:') return false;
+  } catch {
+    return false;
+  }
+
+  return new Promise((resolve) => {
+    let finished = false;
+    const timeoutMs = 5000; // fast fail for pre-flight
+
+    if (signal?.aborted) return resolve(false);
+
+    function doCheck(requestUrl, redirectCount = 0) {
+      if (redirectCount > 5) return resolve(false);
+
+      const parsedReq = new URL(requestUrl);
+      const mod = parsedReq.protocol === 'https:' ? https : http;
+
+      const req = mod.get(requestUrl, {
+        headers: { 'Range': 'bytes=0-1' },
+        signal
+      }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const redirectUrl = new URL(res.headers.location, requestUrl).href;
+          res.resume();
+          return doCheck(redirectUrl, redirectCount + 1);
+        }
+
+        res.destroy(); // we only care about the headers
+        if (res.statusCode === 206) {
+          resolve(true);
+        } else {
+          // If 200, range is not supported (it sent the whole file). Any other code is an error.
+          resolve(false);
+        }
+      });
+
+      const timer = setTimeout(() => {
+        req.destroy();
+        if (!finished) resolve(false);
+      }, timeoutMs);
+
+      req.on('error', () => {
+        clearTimeout(timer);
+        if (!finished) resolve(false);
+      });
+
+      req.on('close', () => clearTimeout(timer));
+
+      signal?.addEventListener('abort', () => {
+        req.destroy();
+      }, { once: true });
+    }
+
+    doCheck(url);
+  });
+}
+
+/**
+ * Downloads audio and specifically requested fallback clips into a temp directory.
  * Accumulates total bytes and rejects if the total exceeds maxDownloadBytes.
+ * Uses bounded concurrency.
  *
  * @param {object} params
  * @param {Array<{clip_url:string, start:number, end:number}>} params.clips
+ * @param {number[]} params.fallbackIndices
  * @param {string} params.audioUrl
  * @param {string} params.tempDir
  * @param {AbortSignal} [params.signal]
- * @returns {Promise<{clipPaths: string[], audioPath: string}>}
+ * @returns {Promise<{clipPaths: Map<number, string>, audioPath: string|null}>}
  */
-async function downloadAll({ clips, audioUrl, tempDir, signal }) {
+async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, signal }) {
   let totalBytes = 0;
-  const clipPaths = [];
+  const clipPaths = new Map();
 
-  for (let i = 0; i < clips.length; i++) {
-    const { clip_url } = clips[i];
-    let ext = '.mp4';
-    try {
-      ext = path.extname(new URL(clip_url).pathname) || '.mp4';
-    } catch { /* file:// or malformed — default */ }
-
-    const destPath = path.join(tempDir, `clip_${i}${ext}`);
-    const bytes = await downloadFile(clip_url, destPath, { signal });
+  const downloadTask = async (url, destPath) => {
+    const bytes = await downloadFile(url, destPath, { signal });
     totalBytes += bytes;
-
     if (totalBytes > config.maxDownloadBytes) {
-      throw new Error(
-        `Total download size ${totalBytes} bytes exceeds limit of ${config.maxDownloadBytes} bytes`
-      );
+      throw new Error(`Total download size exceeds limit of ${config.maxDownloadBytes} bytes`);
     }
-    clipPaths.push(destPath);
+  };
+
+  const tasks = [];
+
+  // Audio task
+  let audioPath = null;
+  if (audioUrl) {
+    tasks.push(async () => {
+      let audioExt = '.mp3';
+      try { audioExt = path.extname(new URL(audioUrl).pathname) || '.mp3'; } catch {}
+      audioPath = path.join(tempDir, `audio${audioExt}`);
+      await downloadTask(audioUrl, audioPath);
+    });
   }
 
-  let audioExt = '.mp3';
-  try {
-    audioExt = path.extname(new URL(audioUrl).pathname) || '.mp3';
-  } catch { /* default */ }
-
-  const audioPath = path.join(tempDir, `audio${audioExt}`);
-  const audioBytes = await downloadFile(audioUrl, audioPath, { signal });
-  totalBytes += audioBytes;
-
-  if (totalBytes > config.maxDownloadBytes) {
-    throw new Error(
-      `Total download size ${totalBytes} bytes exceeds limit of ${config.maxDownloadBytes} bytes`
-    );
+  // Fallback clips tasks
+  for (const i of fallbackIndices) {
+    tasks.push(async () => {
+      const { clip_url } = clips[i];
+      let ext = '.mp4';
+      try { ext = path.extname(new URL(clip_url).pathname) || '.mp4'; } catch {}
+      const destPath = path.join(tempDir, `clip_${i}${ext}`);
+      
+      await downloadTask(clip_url, destPath);
+      clipPaths.set(i, destPath);
+    });
   }
 
-  logger.info({ totalBytes, clipCount: clips.length }, 'All assets downloaded');
+  // Execute concurrently with max 8 parallel downloads
+  await asyncPool(8, tasks, (t) => t());
+
+  logger.info({ totalBytes, fallbackCount: fallbackIndices.length }, 'Required assets downloaded');
   return { clipPaths, audioPath };
 }
 
-module.exports = { downloadFile, downloadAll, assertAllowedUrl };
+module.exports = { downloadFile, downloadAll, preFlightCheckUrl, assertAllowedUrl, asyncPool };
