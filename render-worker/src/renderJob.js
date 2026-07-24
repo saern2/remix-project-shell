@@ -94,28 +94,36 @@ function runFfmpeg({ clipInputs, audioPath, scriptPath, finalVideoLabel, outputP
       ]);
     });
 
-    // Add audio input last
-    cmd.input(audioPath);
-
-    const audioInputIndex = clipInputs.length;
+    // Add audio input only if provided
+    let audioInputIndex = -1;
+    if (audioPath) {
+      cmd.input(audioPath);
+      audioInputIndex = clipInputs.length;
+    }
 
     // Use the filter_complex_script file
     cmd.addOption('-filter_complex_script', scriptPath);
 
-    // Map the final video label and the audio input
-    cmd.outputOptions([
+    // Map the final video label
+    const outOptions = [
       `-map`, `${finalVideoLabel}`,
-      `-map`, `${audioInputIndex}:a`,
       `-c:v`, `libx264`,
       `-pix_fmt`, `yuv420p`,
       `-preset`, `veryfast`,
       `-crf`, `23`,
-      `-c:a`, `aac`,
-      `-b:a`, `192k`,
       `-movflags`, `+faststart`,
-      `-shortest`, // end when the shorter stream ends
-    ]);
+    ];
 
+    if (audioPath) {
+      outOptions.push(
+        `-map`, `${audioInputIndex}:a`,
+        `-c:a`, `aac`,
+        `-b:a`, `192k`,
+        `-shortest` // end when the shorter stream ends
+      );
+    }
+
+    cmd.outputOptions(outOptions);
     cmd.output(outputPath);
 
     // Capture stderr
@@ -371,7 +379,7 @@ async function processRenderJob(job) {
     const { clipPaths, audioPath } = await downloadAll({
       clips,
       fallbackIndices,
-      audioUrl: audio_url,
+      audioUrl: payload.is_chunk ? null : audio_url,
       tempDir,
       signal,
     });

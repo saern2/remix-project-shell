@@ -79,12 +79,14 @@ app.post('/jobs', requireApiKey, async (req, res) => {
       // Calculate priority: chunk index + (active projects * 1000)
       const basePriority = (activeProjectsCount * 1000);
 
+      const { audio_url, ...chunkPayloadBase } = payload;
+
       const chunkJobs = chunks.map((chunk, index) => {
         return {
           name: 'render-chunk',
           queueName: QUEUE_CHUNK,
           data: {
-            ...payload,
+            ...chunkPayloadBase,
             clips: chunk,
             chunk_index: index,
             chunks_total: chunks.length,
