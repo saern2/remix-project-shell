@@ -155,7 +155,7 @@ async function getJobStatus(job) {
   if (state === 'active' && !data._status) status = 'rendering';
   if (state === 'waiting' || state === 'delayed') status = 'waiting';
 
-  return {
+  const result = {
     job_id: job.id,
     status,
     progress_pct: typeof job.progress === 'number' ? job.progress : 0,
@@ -165,6 +165,21 @@ async function getJobStatus(job) {
     attempts_made: job.attemptsMade,
     created_at: new Date(job.timestamp).toISOString(),
   };
+
+  // If this is a stitch job, calculate chunk progress
+  if (data.is_stitch && typeof job.getDependenciesCount === 'function') {
+    result.chunks_total = data.chunks_total || 0;
+    try {
+      const counts = await job.getDependenciesCount();
+      // "processed" means children that have successfully finished
+      result.chunks_completed = counts.processed || 0;
+    } catch (err) {
+      // Fallback if counting fails
+      result.chunks_completed = 0;
+    }
+  }
+
+  return result;
 }
 
 module.exports = {
