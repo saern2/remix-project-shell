@@ -4,13 +4,24 @@ import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
-import { submitRenderJob, pollRenderJob } from "@/lib/render.functions";
+import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
+import { deleteProject } from "@/lib/deleteProject";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
-import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2 } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2, X, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/projects/$projectId")({
@@ -57,7 +68,7 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_footage"]);
-const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering"]);
+const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching", "uploading"]);
 
 
 function ProjectDetail() {
@@ -155,10 +166,47 @@ function ProjectDetail() {
     }
   };
 
+  // ---- Delete project ----
+  const runDeleteProject = useServerFn(deleteProject);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deletingProject, setDeletingProject] = useState(false);
+
+  const handleDeleteProject = async () => {
+    setDeletingProject(true);
+    try {
+      await runDeleteProject({ data: { projectId } });
+      navigate({ to: "/dashboard", replace: true });
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setDeletingProject(false);
+      setShowDeleteConfirm(false);
+    }
+  };
+
   // ---- Render job ----
   const runSubmitRender = useServerFn(submitRenderJob);
   const runPollRender = useServerFn(pollRenderJob);
   const [submittingRender, setSubmittingRender] = useState(false);
+
+  const runCancelRender = useServerFn(cancelRenderJob);
+  const [cancellingRender, setCancellingRender] = useState(false);
+
+  const handleCancelRender = async () => {
+    if (!renderJob) return;
+    setCancellingRender(true);
+    try {
+      await runCancelRender({ data: { jobId: renderJob.id } });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["render-job", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+      ]);
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setCancellingRender(false);
+    }
+  };
 
   const renderJobQuery = useQuery({
     enabled: !!project,
@@ -286,9 +334,20 @@ function ProjectDetail() {
             </h1>
           </div>
           {project ? (
-            <Badge variant={project.status === "failed" ? "destructive" : "secondary"}>
-              {STATUS_LABELS[project.status] ?? project.status}
-            </Badge>
+            <div className="flex items-center gap-2">
+              <Badge variant={project.status === "failed" ? "destructive" : "secondary"}>
+                {STATUS_LABELS[project.status] ?? project.status}
+              </Badge>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="text-muted-foreground hover:text-destructive"
+                onClick={() => setShowDeleteConfirm(true)}
+              >
+                <Trash2 className="h-4 w-4" />
+                <span className="sr-only">Delete project</span>
+              </Button>
+            </div>
           ) : null}
         </div>
       </header>
@@ -321,7 +380,7 @@ function ProjectDetail() {
                 <CardTitle className="text-base">Progress</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <Progress value={progressPct} />
+                <Progress value={progressPct} aria-label="Pipeline progress" />
                 <ul className="grid gap-2 text-sm sm:grid-cols-2">
                   {STATUS_STEPS.map((step) => {
                     const done = progressPct >= step.pct;
@@ -446,16 +505,33 @@ function ProjectDetail() {
                             : `${renderJob.progress_pct}%`}
                         </span>
                       </div>
-                      <Progress
-                        value={
-                          (renderJob.chunks_total ?? 0) > 0
-                            ? Math.max(
-                                renderJob.progress_pct,
-                                Math.round(((renderJob.chunks_completed ?? 0) / (renderJob.chunks_total ?? 1)) * 100)
-                              )
-                            : renderJob.progress_pct
-                        }
-                      />
+                      <div className="flex items-center justify-between gap-2">
+                        <Progress
+                          value={
+                            (renderJob.chunks_total ?? 0) > 0
+                              ? Math.max(
+                                  renderJob.progress_pct,
+                                  Math.round(((renderJob.chunks_completed ?? 0) / (renderJob.chunks_total ?? 1)) * 100)
+                                )
+                              : renderJob.progress_pct
+                          }
+                          aria-label="Render progress"
+                        />
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={cancellingRender}
+                          onClick={handleCancelRender}
+                          className="shrink-0"
+                        >
+                          {cancellingRender ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <X className="h-4 w-4" />
+                          )}
+                          <span className="ml-1">Cancel</span>
+                        </Button>
+                      </div>
                     </>
                   ) : null}
 
@@ -540,6 +616,28 @@ function ProjectDetail() {
           </div>
         )}
       </main>
+
+      <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete "{project?.name}"?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete the project and all its associated files. This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleDeleteProject}
+              disabled={deletingProject}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deletingProject ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

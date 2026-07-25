@@ -26,6 +26,7 @@ const config = require('./config');
 const logger = require('./logger');
 const { getQueue, getJobStatus, getRedisConnection, startWorker, getFlowProducer, QUEUE_NAME, QUEUE_CHUNK, QUEUE_STITCH } = require('./queue');
 const { validatePayload } = require('./renderJob');
+const { buildChunkOpts, writeCancelFlag } = require('./pipelineReliability');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -95,6 +96,7 @@ app.post('/jobs', requireApiKey, async (req, res) => {
           opts: {
             jobId: `${jobId}-chunk-${index}`,
             priority: basePriority + index + 1, // lower number = higher priority
+            ...buildChunkOpts(chunk, config),
           }
         };
       });
@@ -152,6 +154,67 @@ app.get('/jobs/:id', requireApiKey, async (req, res) => {
   } catch (err) {
     logger.error({ err: err.message, jobId }, 'Failed to get job status');
     return res.status(500).json({ error: 'Failed to get job status', detail: err.message });
+  }
+});
+
+// ─── POST /jobs/:id/cancel ────────────────────────────────────────────────────
+
+app.post('/jobs/:id/cancel', requireApiKey, async (req, res) => {
+  const jobId = req.params.id;
+
+  try {
+    const redis = getRedisConnection();
+    const queues = [
+      getQueue(QUEUE_NAME),
+      getQueue(QUEUE_CHUNK),
+      getQueue(QUEUE_STITCH),
+    ];
+
+    // Collect all jobs across all queues whose ID starts with the parent jobId
+    const matchingJobs = [];
+    for (const queue of queues) {
+      // Fetch jobs in all relevant states
+      const [waiting, delayed, waitingChildren, active] = await Promise.all([
+        queue.getWaiting(),
+        queue.getDelayed(),
+        queue.getWaitingChildren(),
+        queue.getActive(),
+      ]);
+
+      const allJobs = [...waiting, ...delayed, ...waitingChildren, ...active];
+      for (const job of allJobs) {
+        if (job.id && job.id.startsWith(jobId)) {
+          matchingJobs.push(job);
+        }
+      }
+    }
+
+    if (matchingJobs.length === 0) {
+      return res.status(404).json({ error: 'Job not found', job_id: jobId });
+    }
+
+    for (const job of matchingJobs) {
+      const state = await job.getState();
+
+      if (state === 'active') {
+        try {
+          await writeCancelFlag(redis, job.id);
+        } catch (err) {
+          logger.error({ err: err.message, jobId: job.id }, 'Failed to write cancel flag');
+        }
+      } else if (state === 'waiting' || state === 'delayed' || state === 'waiting-children') {
+        try {
+          await job.remove();
+        } catch (err) {
+          logger.error({ err: err.message, jobId: job.id }, 'Failed to remove job from queue');
+        }
+      }
+    }
+
+    return res.status(200).json({ cancelled: true, job_id: jobId });
+  } catch (err) {
+    logger.error({ err: err.message, jobId }, 'Failed to cancel job');
+    return res.status(500).json({ error: 'Failed to cancel job', detail: err.message });
   }
 });
 

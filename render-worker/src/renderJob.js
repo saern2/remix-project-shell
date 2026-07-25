@@ -14,8 +14,9 @@
  *  6. Upload output to the pre-signed Supabase Storage URL
  *  7. Cleanup temp dir (always, in finally block)
  *
- * Hard timeout: an AbortController fires after JOB_TIMEOUT_SECONDS and
- * kills the FFmpeg child process; the job is then marked failed.
+ * AbortControllers: scoped per phase (dlController for downloads,
+ * ffController for FFmpeg). A cancellation poll loop races alongside
+ * the pipeline and aborts all scoped controllers when detected.
  */
 
 const fs = require('fs');
@@ -23,13 +24,67 @@ const fsp = require('fs/promises');
 const path = require('path');
 const os = require('os');
 const { promisify } = require('util');
+const IORedis = require('ioredis');
 const ffmpeg = require('fluent-ffmpeg');
 const config = require('./config');
 const logger = require('./logger');
 const { downloadAll, preFlightCheckUrl, asyncPool } = require('./downloader');
 const { buildFilterGraph, SUPPORTED_TRANSITIONS } = require('./ffmpegBuilder');
+const { createScopedAbortController, checkCancellation } = require('./pipelineReliability');
+
+// ─── Redis client (cancel polling only) ───────────────────────────────────────
+// Separate connection from queue.js to avoid circular dependency.
+let _cancelRedis = null;
+function getCancelRedis() {
+  if (!_cancelRedis) {
+    _cancelRedis = new IORedis(config.redisUrl, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false,
+      lazyConnect: false,
+    });
+    _cancelRedis.on('error', (err) =>
+      logger.warn({ err: err.message }, 'Cancel-poll Redis error'),
+    );
+  }
+  return _cancelRedis;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const CANCEL_POLL_INTERVAL_MS = 4000; // ≤ 5 s per REQ-3.4
+
+/**
+ * Simple sleep utility.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Polls Redis for a cancellation flag on the given jobId at
+ * CANCEL_POLL_INTERVAL_MS intervals. When detected, aborts all provided
+ * AbortControllers and returns true. Exits immediately (returns false) once
+ * done.value becomes true (signalling the pipeline has finished normally).
+ *
+ * @param {object} redis         - ioredis client instance
+ * @param {string} jobId         - BullMQ job ID
+ * @param {AbortController[]} abortControllers - controllers to abort on cancellation
+ * @param {{ value: boolean }} done  - mutable box; set to true when pipeline completes
+ * @returns {Promise<boolean>}   - true if cancellation was detected, false if done first
+ */
+async function pollCancellationUntilDone(redis, jobId, abortControllers, done) {
+  while (!done.value) {
+    const cancelled = await checkCancellation(redis, jobId);
+    if (cancelled) {
+      for (const ac of abortControllers) ac.abort();
+      return true;
+    }
+    await sleep(CANCEL_POLL_INTERVAL_MS);
+  }
+  return false;
+}
 
 /**
  * Validates the job payload at enqueue time.
@@ -204,13 +259,35 @@ async function processStitchJob(job) {
   await fsp.mkdir(tempDir, { recursive: true });
   logger.info({ jobId: parentJobId, tempDir }, 'Stitch job started');
 
-  const abortController = new AbortController();
-  const timeoutHandle = setTimeout(() => {
-    logger.warn({ jobId: parentJobId }, 'Stitch job timeout — aborting');
-    abortController.abort();
-  }, config.stitchTimeoutSeconds * 1000);
+  // ── Scoped AbortControllers (one per phase) ───────────────────────────────
+  const dlController = createScopedAbortController();
+  const ffController = createScopedAbortController();
 
-  const { signal } = abortController;
+  // ── Hard timeout — aborts both controllers after STITCH_TIMEOUT_SECONDS ──
+  // Single mechanism for enforcing the stitch wall-clock limit. The application-
+  // level setTimeout actively kills FFmpeg via SIGKILL. The BullMQ worker
+  // lockDuration (stitchTimeoutSeconds + 30 s grace) remains as the stall-
+  // detection backstop for the case where the Node process hangs entirely.
+  // No BullMQ-native `timeout` opt is set on the stitch job to avoid the race
+  // where both mechanisms fire at the same threshold and the signal-aborted
+  // state causes the catch block to misclassify a timeout as user cancellation.
+  const hardTimeoutMs = config.stitchTimeoutSeconds * 1000;
+  let timedOut = false;
+  const hardTimeoutHandle = setTimeout(() => {
+    timedOut = true;
+    logger.warn({ jobId: parentJobId, hardTimeoutMs }, 'Stitch hard timeout — aborting');
+    dlController.abort();
+    ffController.abort();
+  }, hardTimeoutMs);
+
+  // ── Cancellation poll loop ────────────────────────────────────────────────
+  const done = { value: false };
+  const cancelPollPromise = pollCancellationUntilDone(
+    getCancelRedis(),
+    jobId,
+    [dlController, ffController],
+    done,
+  );
 
   try {
     await job.updateData({ ...payload, _status: 'stitching' });
@@ -243,7 +320,7 @@ async function processStitchJob(job) {
       fallbackIndices: [],
       audioUrl: payload.audio_url,
       tempDir,
-      signal,
+      signal: dlController.signal,
     });
 
     const outputPath = path.join(tempDir, 'final_output.mp4');
@@ -256,12 +333,12 @@ async function processStitchJob(job) {
 
       const cmd = ffmpeg()
         .input(concatFilePath)
-        .inputOptions(['-f concat', '-safe 0'])
+        .inputOptions(['-f', 'concat', '-safe', '0'])
         .input(audioPath)
         .outputOptions([
-          '-map 0:v',
-          '-map 1:a',
-          '-c copy',
+          '-map', '0:v',
+          '-map', '1:a',
+          '-c', 'copy',
           '-shortest',
         ])
         .output(outputPath);
@@ -281,8 +358,8 @@ async function processStitchJob(job) {
 
       cmd.on('end', () => resolve());
 
-      if (signal) {
-        signal.addEventListener('abort', () => {
+      if (ffController.signal) {
+        ffController.signal.addEventListener('abort', () => {
           killed = true;
           try { cmd.kill('SIGKILL'); } catch {}
         }, { once: true });
@@ -296,7 +373,7 @@ async function processStitchJob(job) {
     // Upload
     if (payload.output_upload_url) {
       await job.updateData({ ...payload, _status: 'uploading' });
-      await uploadOutput(outputPath, payload.output_upload_url, signal);
+      await uploadOutput(outputPath, payload.output_upload_url, ffController.signal);
     } else {
       logger.info({ jobId: parentJobId }, 'No output_upload_url provided, skipping upload');
     }
@@ -306,10 +383,49 @@ async function processStitchJob(job) {
     return { success: true, uploaded: !!payload.output_upload_url };
 
   } catch (err) {
-    await job.updateData({ ...payload, _status: 'failed', _error: err.message, _ffmpegStderr: err.ffmpegStderr });
+    // ── Cancellation vs timeout detection ────────────────────────────────
+    // timedOut is set only by the hard setTimeout above — never by the Redis
+    // cancel-flag poll. This is the sole discriminator. Checking signal.aborted
+    // alone is insufficient because the hard timeout also aborts the controllers,
+    // which would misclassify a timeout as a user cancellation.
+    if (timedOut) {
+      logger.warn({ jobId: parentJobId }, 'Stitch job timed out');
+      await job.updateData({
+        ...payload,
+        _status: 'failed',
+        _error: `Stitch timed out after ${config.stitchTimeoutSeconds}s`,
+        _ffmpegStderr: err.ffmpegStderr ?? null,
+      });
+      throw new Error(`Stitch timed out after ${config.stitchTimeoutSeconds}s`);
+    }
+
+    const cancelledByUser =
+      dlController.signal.aborted || ffController.signal.aborted;
+
+    if (cancelledByUser) {
+      logger.warn({ jobId: parentJobId }, 'Stitch job cancelled by user request');
+      await job.updateData({
+        ...payload,
+        _status: 'cancelled',
+        _error: 'CANCELLED: user requested',
+      });
+      throw new Error('CANCELLED: user requested');
+    }
+
+    await job.updateData({
+      ...payload,
+      _status: 'failed',
+      _error: err.ffmpegStderr
+        ? `${err.message}\n\nFFmpeg stderr (last 500 chars):\n${err.ffmpegStderr.slice(-500)}`
+        : err.message,
+      _ffmpegStderr: err.ffmpegStderr ?? null,
+    });
     throw err;
   } finally {
-    clearTimeout(timeoutHandle);
+    // Stop the cancellation poll loop and clear the hard timeout
+    done.value = true;
+    clearTimeout(hardTimeoutHandle);
+    await cancelPollPromise;
     
     // Cleanup chunk temp dirs and stitch temp dir
     try {
@@ -355,14 +471,23 @@ async function processRenderJob(job) {
   await fsp.mkdir(tempDir, { recursive: true });
   logger.info({ jobId, tempDir }, 'Render job started');
 
-  // ── Hard timeout ─────────────────────────────────────────────────────────
-  const abortController = new AbortController();
-  const timeoutHandle = setTimeout(() => {
-    logger.warn({ jobId }, 'Job timeout — aborting');
-    abortController.abort();
-  }, config.jobTimeoutSeconds * 1000);
+  // ── Scoped AbortControllers (one per phase) ───────────────────────────────
+  // dlController: scoped to the download phase only
+  // ffController: scoped to the FFmpeg encode phase only
+  // Neither is shared across phases — structural listener-count safety (REQ-2.3).
+  const dlController = createScopedAbortController();
+  const ffController = createScopedAbortController();
 
-  const { signal } = abortController;
+  // ── Cancellation poll loop ────────────────────────────────────────────────
+  // Races alongside the pipeline; aborts both controllers when a cancel flag
+  // is detected in Redis, then resolves. Set done.value = true to stop polling.
+  const done = { value: false };
+  const cancelPollPromise = pollCancellationUntilDone(
+    getCancelRedis(),
+    jobId,
+    [dlController, ffController],
+    done,
+  );
 
   try {
     // ── Status: pre-flight ────────────────────────────────────────────────
@@ -381,7 +506,7 @@ async function processRenderJob(job) {
       fallbackIndices,
       audioUrl: payload.is_chunk ? null : audio_url,
       tempDir,
-      signal,
+      signal: dlController.signal,
     });
 
     await job.updateProgress(30);
@@ -422,7 +547,7 @@ async function processRenderJob(job) {
       finalVideoLabel,
       outputPath,
       fps,
-      signal,
+      signal: ffController.signal,
     });
 
     await job.updateProgress(85);
@@ -431,7 +556,7 @@ async function processRenderJob(job) {
     if (payload.is_chunk) {
       logger.info({ jobId, outputPath }, 'Chunk render complete, leaving on disk for stitch job');
     } else if (output_upload_url) {
-      await uploadOutput(outputPath, output_upload_url, signal);
+      await uploadOutput(outputPath, output_upload_url, ffController.signal);
     } else {
       // Fallback: move to OUTPUT_DIR (local volume mount, single-instance only)
       await fsp.mkdir(config.outputDir, { recursive: true });
@@ -447,11 +572,23 @@ async function processRenderJob(job) {
     return { status: 'completed', outputUploadUrl: output_upload_url ?? null };
 
   } catch (err) {
-    // Signal abort — distinguish timeout from other failures
-    const isTimeout = signal.aborted && !err.ffmpegStderr?.includes('Killed');
-    const errorMessage = isTimeout
-      ? `Job timed out after ${payload.is_chunk ? config.chunkTimeoutSeconds : config.jobTimeoutSeconds}s`
-      : err.message;
+    // ── Cancellation detection ────────────────────────────────────────────
+    // If a controller was aborted by the poll loop (not by a hard timeout),
+    // treat this as a user-requested cancellation (REQ-3.5).
+    const cancelledByUser =
+      (dlController.signal.aborted || ffController.signal.aborted) &&
+      err.message !== 'Job timed out' &&
+      !err.message?.startsWith('Job timed out');
+
+    if (cancelledByUser) {
+      logger.warn({ jobId }, 'Render job cancelled by user request');
+      await job.updateData({
+        ...payload,
+        _status: 'cancelled',
+        _error: 'CANCELLED: user requested',
+      });
+      throw new Error('CANCELLED: user requested');
+    }
 
     logger.error({ jobId, err: err.message, ffmpegStderr: err.ffmpegStderr }, 'Render job failed');
 
@@ -459,13 +596,16 @@ async function processRenderJob(job) {
     await job.updateData({
       ...payload,
       _status: 'failed',
-      _error: errorMessage,
+      _error: err.message,
       _ffmpegStderr: err.ffmpegStderr ? err.ffmpegStderr.slice(-2000) : null,
     });
 
     throw err; // Re-throw so BullMQ marks the job as failed
   } finally {
-    clearTimeout(timeoutHandle);
+    // Stop the cancellation poll loop
+    done.value = true;
+    await cancelPollPromise;
+
     // Always clean up temp files (unless it's a chunk, then stitch job cleans it up)
     if (!payload.is_chunk) {
       try {

@@ -139,6 +139,7 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
     await cdnSemaphore.acquire();
   }
 
+  let abortHandler;
   try {
     return await new Promise((resolve, reject) => {
       let bytesWritten = 0;
@@ -226,15 +227,17 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
 
       req.on('close', () => clearTimeout(timer));
 
-      // Wire abort signal
-      signal?.addEventListener('abort', () => {
-        req.destroy(new Error('Download aborted'));
-      }, { once: true });
+      // Wire abort signal — handler captured in outer scope for cleanup in finally
+      abortHandler = () => req.destroy(new Error('Download aborted'));
+      signal?.addEventListener('abort', abortHandler);
     }
 
     doRequest(url);
   });
   } finally {
+    if (abortHandler && signal) {
+      signal.removeEventListener('abort', abortHandler);
+    }
     if (requiresSemaphore) {
       cdnSemaphore.release();
     }

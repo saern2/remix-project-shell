@@ -18,6 +18,7 @@
  *   This satisfies the "kill worker mid-render" requirement.
  */
 
+const os = require('os');
 const { Queue, Worker, QueueEvents, FlowProducer } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('./config');
@@ -122,12 +123,17 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
 function startWorker() {
   if (_workers.length > 0) return _workers;
 
+  // Compute effective concurrency for the chunk worker once at startup.
+  // Caps the configured value to the number of available CPU cores so that
+  // simultaneous FFmpeg processes never exceed hardware capacity.
+  const effectiveConcurrency = Math.min(config.workerConcurrencyChunks, os.cpus().length);
+
   // Legacy/small-project queue
   _workers.push(createWorker(QUEUE_NAME, processRenderJob, config.workerConcurrency, config.jobTimeoutSeconds * 1000));
-  
-  // Chunk queue
-  _workers.push(createWorker(QUEUE_CHUNK, processRenderJob, config.workerConcurrencyChunks, config.chunkTimeoutSeconds * 1000));
-  
+
+  // Chunk queue — uses bounded effectiveConcurrency
+  _workers.push(createWorker(QUEUE_CHUNK, processRenderJob, effectiveConcurrency, config.chunkTimeoutSeconds * 1000));
+
   // Stitch queue
   _workers.push(createWorker(QUEUE_STITCH, processStitchJob, config.workerConcurrencyStitches, config.stitchTimeoutSeconds * 1000));
 

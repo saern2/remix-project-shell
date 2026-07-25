@@ -297,3 +297,57 @@ export const pollRenderJob = createServerFn({ method: "POST" })
 
 // Silence unused ttl warning if compiler flags it.
 void OUTPUT_UPLOAD_TTL;
+
+const ACTIVE_RENDER_STATUSES = ["queued", "downloading", "rendering", "stitching", "uploading"] as const;
+
+/**
+ * Cancel a queued or active render job.
+ * - Verifies ownership via render_jobs → projects join
+ * - Calls POST /jobs/:id/cancel on the render worker
+ * - Updates render_jobs.status = 'cancelled' (only if still active)
+ * - Updates projects.status = 'failed', error_message = 'Render was cancelled.'
+ */
+export const cancelRenderJob = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => JobIdInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+
+    // Verify ownership
+    const { data: job, error: jobErr } = await supabase
+      .from("render_jobs")
+      .select("id, project_id, status, projects!inner(user_id)")
+      .eq("id", data.jobId)
+      .maybeSingle();
+    if (jobErr) throw new Error(jobErr.message);
+    if (!job) throw new Error("Render job not found.");
+    const ownerUserId = (job as unknown as { projects: { user_id: string } }).projects.user_id;
+    if (ownerUserId !== userId) throw new Error("Forbidden.");
+
+    // Call worker cancel endpoint
+    const res = await fetch(`${workerBase()}/jobs/${job.id}/cancel`, {
+      method: "POST",
+      headers: { "X-Api-Key": workerKey() },
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Worker cancel failed (${res.status}): ${text.slice(0, 200)}`);
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const now = new Date().toISOString();
+
+    // Only update if still in an active status (race: job may have completed)
+    await supabaseAdmin
+      .from("render_jobs")
+      .update({ status: "cancelled", completed_at: now })
+      .eq("id", job.id)
+      .in("status", ACTIVE_RENDER_STATUSES);
+
+    await supabaseAdmin
+      .from("projects")
+      .update({ status: "failed", error_message: "Render was cancelled." })
+      .eq("id", job.project_id);
+
+    return { ok: true as const, jobId: job.id };
+  });
