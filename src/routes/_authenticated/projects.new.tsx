@@ -19,10 +19,13 @@ export const Route = createFileRoute("/_authenticated/projects/new")({
 const ACCEPTED = "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/ogg,audio/mp4,audio/m4a,audio/aac,audio/flac";
 const MAX_BYTES = 500 * 1024 * 1024; // 500 MB
 
+type CategoryValue = "none" | "war" | "crime";
+
 function NewProject() {
   const navigate = useNavigate();
   const runStartPipeline = useServerFn(startPipeline);
   const [name, setName] = useState("");
+  const [category, setCategory] = useState<CategoryValue>("none");
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
