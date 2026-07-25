@@ -286,8 +286,18 @@ async function advanceFromGeneratingScenes(projectId: string) {
       return { status: "ready", error_message: null };
     }
 
+    const { data: projectRow } = await supabaseAdmin
+      .from("projects")
+      .select("category")
+      .eq("id", projectId)
+      .maybeSingle();
+    const category = (projectRow?.category ?? null) as "war" | "crime" | null;
+
     const { generateVisualQueries } = await import("@/lib/visual-queries.server");
-    const queries = await generateVisualQueries(scenes.map((s) => s.text));
+    const queries = await generateVisualQueries(
+      scenes.map((s) => s.text),
+      category,
+    );
 
     for (let i = 0; i < scenes.length; i++) {
       const { error: uErr } = await supabaseAdmin
