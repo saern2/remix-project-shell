@@ -263,6 +263,23 @@ async function processStitchJob(job) {
   const dlController = createScopedAbortController();
   const ffController = createScopedAbortController();
 
+  // ── Hard timeout — aborts both controllers after STITCH_TIMEOUT_SECONDS ──
+  // Single mechanism for enforcing the stitch wall-clock limit. The application-
+  // level setTimeout actively kills FFmpeg via SIGKILL. The BullMQ worker
+  // lockDuration (stitchTimeoutSeconds + 30 s grace) remains as the stall-
+  // detection backstop for the case where the Node process hangs entirely.
+  // No BullMQ-native `timeout` opt is set on the stitch job to avoid the race
+  // where both mechanisms fire at the same threshold and the signal-aborted
+  // state causes the catch block to misclassify a timeout as user cancellation.
+  const hardTimeoutMs = config.stitchTimeoutSeconds * 1000;
+  let timedOut = false;
+  const hardTimeoutHandle = setTimeout(() => {
+    timedOut = true;
+    logger.warn({ jobId: parentJobId, hardTimeoutMs }, 'Stitch hard timeout — aborting');
+    dlController.abort();
+    ffController.abort();
+  }, hardTimeoutMs);
+
   // ── Cancellation poll loop ────────────────────────────────────────────────
   const done = { value: false };
   const cancelPollPromise = pollCancellationUntilDone(
@@ -316,12 +333,12 @@ async function processStitchJob(job) {
 
       const cmd = ffmpeg()
         .input(concatFilePath)
-        .inputOptions(['-f concat', '-safe 0'])
+        .inputOptions(['-f', 'concat', '-safe', '0'])
         .input(audioPath)
         .outputOptions([
-          '-map 0:v',
-          '-map 1:a',
-          '-c copy',
+          '-map', '0:v',
+          '-map', '1:a',
+          '-c', 'copy',
           '-shortest',
         ])
         .output(outputPath);
@@ -366,7 +383,22 @@ async function processStitchJob(job) {
     return { success: true, uploaded: !!payload.output_upload_url };
 
   } catch (err) {
-    // ── Cancellation detection ────────────────────────────────────────────
+    // ── Cancellation vs timeout detection ────────────────────────────────
+    // timedOut is set only by the hard setTimeout above — never by the Redis
+    // cancel-flag poll. This is the sole discriminator. Checking signal.aborted
+    // alone is insufficient because the hard timeout also aborts the controllers,
+    // which would misclassify a timeout as a user cancellation.
+    if (timedOut) {
+      logger.warn({ jobId: parentJobId }, 'Stitch job timed out');
+      await job.updateData({
+        ...payload,
+        _status: 'failed',
+        _error: `Stitch timed out after ${config.stitchTimeoutSeconds}s`,
+        _ffmpegStderr: err.ffmpegStderr ?? null,
+      });
+      throw new Error(`Stitch timed out after ${config.stitchTimeoutSeconds}s`);
+    }
+
     const cancelledByUser =
       dlController.signal.aborted || ffController.signal.aborted;
 
@@ -380,11 +412,19 @@ async function processStitchJob(job) {
       throw new Error('CANCELLED: user requested');
     }
 
-    await job.updateData({ ...payload, _status: 'failed', _error: err.message, _ffmpegStderr: err.ffmpegStderr });
+    await job.updateData({
+      ...payload,
+      _status: 'failed',
+      _error: err.ffmpegStderr
+        ? `${err.message}\n\nFFmpeg stderr (last 500 chars):\n${err.ffmpegStderr.slice(-500)}`
+        : err.message,
+      _ffmpegStderr: err.ffmpegStderr ?? null,
+    });
     throw err;
   } finally {
-    // Stop the cancellation poll loop
+    // Stop the cancellation poll loop and clear the hard timeout
     done.value = true;
+    clearTimeout(hardTimeoutHandle);
     await cancelPollPromise;
     
     // Cleanup chunk temp dirs and stitch temp dir
