@@ -153,12 +153,15 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     }
 
     // Aspect ratio -> dimensions.
-    const ratio = project.aspect_ratio ?? "9:16";
-    const dims = ratio === "16:9"
-      ? { width: 1920, height: 1080 }
-      : ratio === "1:1"
-        ? { width: 1080, height: 1080 }
-        : { width: 1080, height: 1920 };
+    // DB stores 'landscape' | 'portrait' | 'square' (human-readable).
+    // Legacy fallback: accept old '16:9' / '9:16' / '1:1' values too.
+    const ratio = project.aspect_ratio ?? "portrait";
+    const dims =
+      ratio === "landscape" || ratio === "16:9"
+        ? { width: 1920, height: 1080 }
+        : ratio === "square" || ratio === "1:1"
+          ? { width: 1080, height: 1080 }
+          : { width: 1080, height: 1920 }; // 'portrait' | '9:16' | anything else
 
     // Load admin client for privileged writes (render_jobs insert + signed upload URL).
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");

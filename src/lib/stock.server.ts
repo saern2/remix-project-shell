@@ -109,15 +109,15 @@ export function getStockProvider(): StockProvider {
 }
 
 export function orientationForAspect(aspect: string): Orientation {
-  if (aspect === "9:16") return "portrait";
-  if (aspect === "1:1") return "square";
-  return "landscape"; // 16:9
+  if (aspect === "portrait" || aspect === "9:16") return "portrait";
+  if (aspect === "square" || aspect === "1:1") return "square";
+  return "landscape"; // 'landscape' | '16:9' | anything else
 }
 
 export function targetWidthForAspect(aspect: string): number {
-  if (aspect === "9:16") return 1080;
-  if (aspect === "1:1") return 1080;
-  return 1920; // 16:9
+  if (aspect === "portrait" || aspect === "9:16") return 1080;
+  if (aspect === "square" || aspect === "1:1") return 1080;
+  return 1920; // 'landscape' | '16:9' | anything else
 }
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
