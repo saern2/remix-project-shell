@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Progress } from "@/components/ui/progress";
 import { ArrowLeft, Upload } from "lucide-react";
 import { toast } from "sonner";
@@ -19,10 +20,13 @@ export const Route = createFileRoute("/_authenticated/projects/new")({
 const ACCEPTED = "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/ogg,audio/mp4,audio/m4a,audio/aac,audio/flac";
 const MAX_BYTES = 500 * 1024 * 1024; // 500 MB
 
+type CategoryValue = "none" | "war" | "crime";
+
 function NewProject() {
   const navigate = useNavigate();
   const runStartPipeline = useServerFn(startPipeline);
   const [name, setName] = useState("");
+  const [category, setCategory] = useState<CategoryValue>("none");
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -53,7 +57,12 @@ function NewProject() {
     }
     const { data: project, error: projectError } = await supabase
       .from("projects")
-      .insert({ name: name.trim() || "Untitled project", status: "uploading", user_id: userData.user.id })
+      .insert({
+        name: name.trim() || "Untitled project",
+        status: "uploading",
+        user_id: userData.user.id,
+        category: category === "none" ? null : category,
+      })
       .select("id")
       .single();
 
@@ -187,6 +196,29 @@ function NewProject() {
                   )}
                 </div>
               </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="category">Visual theme</Label>
+                <Select
+                  value={category}
+                  onValueChange={(v) => setCategory(v as CategoryValue)}
+                  disabled={busy}
+                >
+                  <SelectTrigger id="category">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">None (no thematic bias)</SelectItem>
+                    <SelectItem value="war">War / military conflict</SelectItem>
+                    <SelectItem value="crime">Crime / law enforcement</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Biases every generated footage search toward this theme. Leave as None to keep queries literal.
+                </p>
+              </div>
+
+
 
               {busy ? (
                 <div className="space-y-2">
