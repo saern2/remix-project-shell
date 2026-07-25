@@ -35,7 +35,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
 
     const { data: project, error: projErr } = await supabase
       .from("projects")
-      .select("id, status, user_id, aspect_ratio")
+      .select("id, status, user_id, aspect_ratio, clip_duration_seconds")
       .eq("id", projectId)
       .maybeSingle();
     if (projErr) throw new Error(projErr.message);
@@ -49,7 +49,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     const { data: scenes, error: scenesErr } = await supabase
       .from("scenes")
       .select(
-        "id, idx, selected_clips!inner(in_point, out_point, clip_candidates!inner(url))",
+        "id, idx, start_ts, end_ts, visual_query, selected_clips!inner(in_point, out_point, clip_candidates!inner(url, provider_clip_id))",
       )
       .eq("project_id", projectId)
       .order("idx", { ascending: true });
@@ -58,17 +58,81 @@ export const submitRenderJob = createServerFn({ method: "POST" })
 
     type SceneRow = {
       idx: number;
+      start_ts: number | string | null;
+      end_ts: number | string | null;
+      visual_query: string | null;
       selected_clips: {
         in_point: number;
         out_point: number;
-        clip_candidates: { url: string };
+        clip_candidates: { url: string; provider_clip_id: string };
       };
     };
-    const clips = (scenes as unknown as SceneRow[]).map((s) => ({
-      clip_url: s.selected_clips.clip_candidates.url,
-      start: Number(s.selected_clips.in_point),
-      end: Number(s.selected_clips.out_point),
-    }));
+    const sceneRows = scenes as unknown as SceneRow[];
+
+    const fixedDuration = project.clip_duration_seconds != null
+      ? Number(project.clip_duration_seconds)
+      : null;
+
+    let clips: Array<{ clip_url: string; start: number; end: number }>;
+
+    if (fixedDuration == null || !(fixedDuration > 0)) {
+      // Default behavior: exactly one clip per scene, natural sentence length.
+      clips = sceneRows.map((s) => ({
+        clip_url: s.selected_clips.clip_candidates.url,
+        start: Number(s.selected_clips.in_point),
+        end: Number(s.selected_clips.out_point),
+      }));
+    } else {
+      const { searchStockFootage, orientationForAspect, targetWidthForAspect } = await import(
+        "@/lib/stock.server"
+      );
+      const orientation = orientationForAspect(project.aspect_ratio ?? "9:16");
+      const targetWidth = targetWidthForAspect(project.aspect_ratio ?? "9:16");
+
+      // Project-wide dedup set, seeded with the clips already selected.
+      const usedIds = new Set<string>(
+        sceneRows.map((s) => s.selected_clips.clip_candidates.provider_clip_id).filter(Boolean),
+      );
+
+      clips = [];
+      for (const scene of sceneRows) {
+        const sceneStart = Number(scene.start_ts ?? 0);
+        const sceneEnd = Number(scene.end_ts ?? 0);
+        const total = Math.max(0, sceneEnd - sceneStart);
+        if (total <= 0) continue;
+
+        // Consecutive sub-segments of exactly fixedDuration; the last slice
+        // keeps the true remainder (no padding / stretching).
+        const lengths: number[] = [];
+        let remaining = total;
+        while (remaining > 0.01) {
+          const len = Math.min(fixedDuration, remaining);
+          lengths.push(len);
+          remaining -= len;
+        }
+
+        for (const len of lengths) {
+          let url: string | null = null;
+          if (scene.visual_query) {
+            const result = await searchStockFootage({
+              query: scene.visual_query,
+              orientation,
+              minDurationSec: Math.max(1, Math.ceil(len)),
+              targetWidth,
+              usedIds: [...usedIds],
+            });
+            if (result) {
+              url = result.chosenFile.url;
+              usedIds.add(result.pick.provider_clip_id);
+            }
+          }
+          // Fall back to the scene's already-selected clip if no new candidate.
+          if (!url) url = scene.selected_clips.clip_candidates.url;
+          clips.push({ clip_url: url, start: 0, end: Number(len.toFixed(3)) });
+        }
+      }
+      if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
+    }
 
     // Signed audio URL.
     const { data: asset, error: assetErr } = await supabase
