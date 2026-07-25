@@ -1,12 +1,26 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
+import { useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
+import { deleteProject } from "@/lib/projects.functions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Plus, LogOut, Video } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Plus, LogOut, Video, Trash2, Loader2 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
+import { toast } from "sonner";
 
 type Project = {
   id: string;
@@ -47,6 +61,11 @@ export const Route = createFileRoute("/_authenticated/dashboard")({
 
 function Dashboard() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const runDelete = useServerFn(deleteProject);
+
+  const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const { data: projects, isLoading, error } = useQuery({
     queryKey: ["projects"],
@@ -63,6 +82,22 @@ function Dashboard() {
   const handleSignOut = async () => {
     await supabase.auth.signOut();
     navigate({ to: "/auth", replace: true });
+  };
+
+  const confirmDelete = async () => {
+    if (!pendingDelete) return;
+    const id = pendingDelete.id;
+    setDeletingId(id);
+    try {
+      await runDelete({ data: { projectId: id } });
+      toast.success(`Deleted "${pendingDelete.name}"`);
+      setPendingDelete(null);
+      await queryClient.invalidateQueries({ queryKey: ["projects"] });
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setDeletingId(null);
+    }
   };
 
   return (
@@ -122,37 +157,91 @@ function Dashboard() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {projects.map((p) => (
-              <Link
-                key={p.id}
-                to="/projects/$projectId"
-                params={{ projectId: p.id }}
-                className="block"
-              >
-                <Card className="h-full transition-colors hover:bg-accent/40">
-                  <CardHeader className="pb-3">
-                    <div className="flex items-start justify-between gap-2">
-                      <CardTitle className="text-base">{p.name}</CardTitle>
-                      <Badge variant={STATUS_VARIANTS[p.status] ?? "outline"}>
-                        {STATUS_LABELS[p.status] ?? p.status}
-                      </Badge>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <p className="text-xs text-muted-foreground">
-                      Updated {formatDistanceToNow(new Date(p.updated_at), { addSuffix: true })}
-                    </p>
-                    {p.error_message ? (
-                      <p className="mt-2 text-xs text-destructive">{p.error_message}</p>
-                    ) : null}
-                  </CardContent>
-                </Card>
-              </Link>
+              <div key={p.id} className="relative group">
+                <Link
+                  to="/projects/$projectId"
+                  params={{ projectId: p.id }}
+                  className="block"
+                >
+                  <Card className="h-full transition-colors hover:bg-accent/40">
+                    <CardHeader className="pb-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <CardTitle className="text-base pr-8">{p.name}</CardTitle>
+                        <Badge variant={STATUS_VARIANTS[p.status] ?? "outline"}>
+                          {STATUS_LABELS[p.status] ?? p.status}
+                        </Badge>
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <p className="text-xs text-muted-foreground">
+                        Updated {formatDistanceToNow(new Date(p.updated_at), { addSuffix: true })}
+                      </p>
+                      {p.error_message ? (
+                        <p className="mt-2 text-xs text-destructive">{p.error_message}</p>
+                      ) : null}
+                    </CardContent>
+                  </Card>
+                </Link>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  aria-label={`Delete ${p.name}`}
+                  disabled={deletingId === p.id}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setPendingDelete(p);
+                  }}
+                  className="absolute right-2 top-2 h-8 w-8 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100 focus:opacity-100"
+                >
+                  {deletingId === p.id ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                </Button>
+              </div>
             ))}
-
           </div>
         )}
       </main>
+
+      <AlertDialog
+        open={!!pendingDelete}
+        onOpenChange={(open) => {
+          if (!open && !deletingId) setPendingDelete(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes <span className="font-medium">{pendingDelete?.name}</span>,
+              including its uploaded audio and any rendered videos. This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={!!deletingId}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={!!deletingId}
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmDelete();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deletingId ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Deleting…
+                </>
+              ) : (
+                "Delete project"
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
-
