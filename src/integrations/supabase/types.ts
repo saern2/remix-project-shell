@@ -108,6 +108,7 @@ export type Database = {
       projects: {
         Row: {
           aspect_ratio: string
+          category: string | null
           created_at: string
           error_message: string | null
           id: string
@@ -119,6 +120,7 @@ export type Database = {
         }
         Insert: {
           aspect_ratio?: string
+          category?: string | null
           created_at?: string
           error_message?: string | null
           id?: string
@@ -130,6 +132,7 @@ export type Database = {
         }
         Update: {
           aspect_ratio?: string
+          category?: string | null
           created_at?: string
           error_message?: string | null
           id?: string

@@ -9,8 +9,10 @@
  *
  * 1. Per-clip normalisation BEFORE concat (the v1 bug fix):
  *    Every input clip — regardless of source resolution or fps — is passed
- *    through: scale → pad → setsar → fps.  Only after all streams are
- *    uniform is concat invoked.
+ *    through: scale (increase) → crop → setsar → fps.  Only after all
+ *    streams are uniform is concat invoked.  Using
+ *    force_original_aspect_ratio=increase + crop fills the target canvas
+ *    completely with no black bars (cover behaviour, not letterbox).
  *
  * 2. -filter_complex_script <file> (the large-graph fix):
  *    For 50+ clip projects, the filter graph string would exceed OS

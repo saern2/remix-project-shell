@@ -30,9 +30,26 @@ Output: STRICT JSON matching {"results": [{"idx": number, "query": string}, ...]
 
 type SceneInput = { idx: number; text: string };
 
-async function callGateway(items: SceneInput[]): Promise<Map<number, string>> {
+export type VisualCategory = "war" | "crime";
+
+const CATEGORY_THEMES: Record<VisualCategory, string> = {
+  war: "war/military conflict",
+  crime: "crime/law enforcement",
+};
+
+function categoryInstruction(category: VisualCategory): string {
+  return `\n\nEvery visual query you generate MUST stay within the ${CATEGORY_THEMES[category]} visual theme, even when the narration sentence itself is unrelated or neutral — find the closest on-theme concrete visual interpretation rather than a literal one.`;
+}
+
+async function callGateway(
+  items: SceneInput[],
+  category: VisualCategory | null,
+): Promise<Map<number, string>> {
   const key = process.env.LOVABLE_API_KEY;
   if (!key) throw new Error("LOVABLE_API_KEY is not configured.");
+
+  const systemPrompt =
+    category === null ? SYSTEM_PROMPT : SYSTEM_PROMPT + categoryInstruction(category);
 
   const userPrompt = `Convert each of the following ${items.length} narration sentences into a concrete visual stock-footage phrase. Return one entry per input idx.\n\nInput:\n${JSON.stringify(items)}`;
 
@@ -45,7 +62,7 @@ async function callGateway(items: SceneInput[]): Promise<Map<number, string>> {
     body: JSON.stringify({
       model: MODEL,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
       response_format: { type: "json_object" },
@@ -97,7 +114,10 @@ async function callGateway(items: SceneInput[]): Promise<Map<number, string>> {
   return map;
 }
 
-export async function generateVisualQueries(sentences: string[]): Promise<string[]> {
+export async function generateVisualQueries(
+  sentences: string[],
+  category: VisualCategory | null = null,
+): Promise<string[]> {
   if (sentences.length === 0) return [];
 
   const items: SceneInput[] = sentences.map((s, idx) => ({
@@ -105,13 +125,13 @@ export async function generateVisualQueries(sentences: string[]): Promise<string
     text: s.replace(/\s+/g, " ").trim(),
   }));
 
-  const map = await callGateway(items);
+  const map = await callGateway(items, category);
 
   // Retry only missing idx values, in one follow-up call.
   const missing = items.filter((i) => !map.has(i.idx));
   if (missing.length > 0) {
     try {
-      const retryMap = await callGateway(missing);
+      const retryMap = await callGateway(missing, category);
       for (const [idx, q] of retryMap) map.set(idx, q);
     } catch {
       // Swallow retry error; the check below produces a clearer message.
