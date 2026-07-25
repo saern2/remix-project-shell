@@ -196,6 +196,29 @@ function NewProject() {
                 </div>
               </div>
 
+              <div className="space-y-2">
+                <Label htmlFor="category">Visual theme</Label>
+                <Select
+                  value={category}
+                  onValueChange={(v) => setCategory(v as CategoryValue)}
+                  disabled={busy}
+                >
+                  <SelectTrigger id="category">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">None (no thematic bias)</SelectItem>
+                    <SelectItem value="war">War / military conflict</SelectItem>
+                    <SelectItem value="crime">Crime / law enforcement</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Biases every generated footage search toward this theme. Leave as None to keep queries literal.
+                </p>
+              </div>
+
+
+
               {busy ? (
                 <div className="space-y-2">
                   <Progress value={progress} />
