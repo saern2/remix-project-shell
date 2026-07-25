@@ -36,8 +36,8 @@ function buildNormFilter(inputIndex, outLabel, width, height, fps) {
   // Note: stream specifier [N:v] selects the video stream of the Nth input.
   return (
     `[${inputIndex}:v]setpts=PTS-STARTPTS,` +
-    `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
-    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,` +
+    `scale=${width}:${height}:force_original_aspect_ratio=increase,` +
+    `crop=${width}:${height},` +
     `setsar=1,` +
     `fps=${fps}` +
     `${outLabel}`
