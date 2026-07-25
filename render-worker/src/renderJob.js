@@ -53,7 +53,7 @@ function validatePayload(payload) {
     return `total duration ${totalDuration.toFixed(1)}s exceeds MAX_DURATION_SECONDS=${config.maxDurationSeconds}`;
   }
 
-  if (!audio_url) return 'audio_url is required';
+  if (!payload.is_chunk && !audio_url) return 'audio_url is required';
   if (!width || !height || !fps) return 'width, height, and fps are required';
   if (!SUPPORTED_TRANSITIONS.has(transition)) {
     return `transition must be one of: ${[...SUPPORTED_TRANSITIONS].join(', ')}`;
