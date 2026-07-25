@@ -56,7 +56,12 @@ function NewProject() {
     }
     const { data: project, error: projectError } = await supabase
       .from("projects")
-      .insert({ name: name.trim() || "Untitled project", status: "uploading", user_id: userData.user.id })
+      .insert({
+        name: name.trim() || "Untitled project",
+        status: "uploading",
+        user_id: userData.user.id,
+        category: category === "none" ? null : category,
+      })
       .select("id")
       .single();
 
