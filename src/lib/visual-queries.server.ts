@@ -30,9 +30,26 @@ Output: STRICT JSON matching {"results": [{"idx": number, "query": string}, ...]
 
 type SceneInput = { idx: number; text: string };
 
-async function callGateway(items: SceneInput[]): Promise<Map<number, string>> {
+export type VisualCategory = "war" | "crime";
+
+const CATEGORY_THEMES: Record<VisualCategory, string> = {
+  war: "war/military conflict",
+  crime: "crime/law enforcement",
+};
+
+function categoryInstruction(category: VisualCategory): string {
+  return `\n\nEvery visual query you generate MUST stay within the ${CATEGORY_THEMES[category]} visual theme, even when the narration sentence itself is unrelated or neutral — find the closest on-theme concrete visual interpretation rather than a literal one.`;
+}
+
+async function callGateway(
+  items: SceneInput[],
+  category: VisualCategory | null,
+): Promise<Map<number, string>> {
   const key = process.env.LOVABLE_API_KEY;
   if (!key) throw new Error("LOVABLE_API_KEY is not configured.");
+
+  const systemPrompt =
+    category === null ? SYSTEM_PROMPT : SYSTEM_PROMPT + categoryInstruction(category);
 
   const userPrompt = `Convert each of the following ${items.length} narration sentences into a concrete visual stock-footage phrase. Return one entry per input idx.\n\nInput:\n${JSON.stringify(items)}`;
 
