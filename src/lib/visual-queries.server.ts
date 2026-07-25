@@ -114,7 +114,10 @@ async function callGateway(
   return map;
 }
 
-export async function generateVisualQueries(sentences: string[]): Promise<string[]> {
+export async function generateVisualQueries(
+  sentences: string[],
+  category: VisualCategory | null = null,
+): Promise<string[]> {
   if (sentences.length === 0) return [];
 
   const items: SceneInput[] = sentences.map((s, idx) => ({
@@ -122,13 +125,13 @@ export async function generateVisualQueries(sentences: string[]): Promise<string
     text: s.replace(/\s+/g, " ").trim(),
   }));
 
-  const map = await callGateway(items);
+  const map = await callGateway(items, category);
 
   // Retry only missing idx values, in one follow-up call.
   const missing = items.filter((i) => !map.has(i.idx));
   if (missing.length > 0) {
     try {
-      const retryMap = await callGateway(missing);
+      const retryMap = await callGateway(missing, category);
       for (const [idx, q] of retryMap) map.set(idx, q);
     } catch {
       // Swallow retry error; the check below produces a clearer message.
