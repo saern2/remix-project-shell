@@ -31,7 +31,7 @@ process.env.MAX_DURATION_SECONDS = '600';
 process.env.MAX_DOWNLOAD_BYTES = String(2 * 1024 * 1024 * 1024);
 process.env.DOWNLOAD_TIMEOUT_SECONDS = '60';
 process.env.JOB_ATTEMPTS = '1';
-process.env.JOB_BACKOFF_DELAY_MS = '0';
+process.env.JOB_BACKOFF_DELAY_MS = '1'; // > 0 required by config validation
 
 const STRESS_DIR = path.resolve(__dirname, '../fixtures/clips/stress_50');
 const TARGET_WIDTH = 1280;

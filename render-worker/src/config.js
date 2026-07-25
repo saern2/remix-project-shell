@@ -43,7 +43,7 @@ const config = {
   jobTimeoutSeconds: intEnv('JOB_TIMEOUT_SECONDS', 600),
   chunkTimeoutSeconds: intEnv('CHUNK_TIMEOUT_SECONDS', 300),
   stitchTimeoutSeconds: intEnv('STITCH_TIMEOUT_SECONDS', 600),
-  chunkSize: intEnv('CHUNK_SIZE', 25),
+  chunkSize: intEnv('CHUNK_SIZE', 12),
   workerConcurrencyChunks: intEnv('WORKER_CONCURRENCY_CHUNKS', 4),
   workerConcurrencyStitches: intEnv('WORKER_CONCURRENCY_STITCHES', 2),
   maxClips: intEnv('MAX_CLIPS', 5000),
@@ -63,5 +63,8 @@ const config = {
     .map((h) => h.trim().toLowerCase())
     .filter(Boolean),
 };
+
+if (config.jobAttempts <= 0) throw new Error('JOB_ATTEMPTS must be > 0, got: ' + config.jobAttempts);
+if (config.jobBackoffDelayMs <= 0) throw new Error('JOB_BACKOFF_DELAY_MS must be > 0, got: ' + config.jobBackoffDelayMs);
 
 module.exports = config;
