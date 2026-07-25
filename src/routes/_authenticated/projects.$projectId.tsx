@@ -166,7 +166,7 @@ function ProjectDetail() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("render_jobs")
-        .select("id, status, progress_pct, output_url, error, created_at")
+        .select("id, status, progress_pct, output_url, error, chunks_total, chunks_completed, created_at")
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
         .limit(1)
@@ -440,9 +440,22 @@ function ProjectDetail() {
                           : renderJob.status === "downloading"
                             ? "Downloading source clips…"
                             : "Rendering video…"}
-                        <span className="ml-auto font-mono text-xs">{renderJob.progress_pct}%</span>
+                        <span className="ml-auto font-mono text-xs">
+                          {(renderJob.chunks_total ?? 0) > 0
+                            ? `${renderJob.chunks_completed ?? 0} of ${renderJob.chunks_total} segments rendered`
+                            : `${renderJob.progress_pct}%`}
+                        </span>
                       </div>
-                      <Progress value={renderJob.progress_pct} />
+                      <Progress
+                        value={
+                          (renderJob.chunks_total ?? 0) > 0
+                            ? Math.max(
+                                renderJob.progress_pct,
+                                Math.round(((renderJob.chunks_completed ?? 0) / (renderJob.chunks_total ?? 1)) * 100)
+                              )
+                            : renderJob.progress_pct
+                        }
+                      />
                     </>
                   ) : null}
 

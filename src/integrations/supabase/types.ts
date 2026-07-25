@@ -178,6 +178,8 @@ export type Database = {
       }
       render_jobs: {
         Row: {
+          chunks_completed: number | null
+          chunks_total: number | null
           completed_at: string | null
           created_at: string
           error: string | null
@@ -191,6 +193,8 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          chunks_completed?: number | null
+          chunks_total?: number | null
           completed_at?: string | null
           created_at?: string
           error?: string | null
@@ -204,6 +208,8 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          chunks_completed?: number | null
+          chunks_total?: number | null
           completed_at?: string | null
           created_at?: string
           error?: string | null

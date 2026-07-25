@@ -182,7 +182,7 @@ export const pollRenderJob = createServerFn({ method: "POST" })
 
     const { data: job, error: jobErr } = await supabase
       .from("render_jobs")
-      .select("id, project_id, status, progress_pct, output_url, error, projects!inner(user_id)")
+      .select("id, project_id, status, progress_pct, output_url, error, chunks_total, chunks_completed, projects!inner(user_id)")
       .eq("id", data.jobId)
       .maybeSingle();
     if (jobErr) throw new Error(jobErr.message);
@@ -197,6 +197,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
         progress_pct: job.progress_pct,
         output_url: job.output_url,
         error: job.error,
+        chunks_total: job.chunks_total ?? null,
+        chunks_completed: job.chunks_completed ?? null,
       };
     }
 
@@ -213,6 +215,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       progress_pct?: number;
       output_url?: string | null;
       error?: string | null;
+      chunks_total?: number | null;
+      chunks_completed?: number | null;
     };
 
     const rawStatus = (payload.status ?? "queued").toLowerCase();
@@ -221,6 +225,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
     const progress = Math.max(0, Math.min(100, Math.round(payload.progress_pct ?? 0)));
     const outputUrl = payload.output_url ?? null;
     const error = payload.error ?? null;
+    const chunksTotal = payload.chunks_total ?? null;
+    const chunksCompleted = payload.chunks_completed ?? null;
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -230,10 +236,19 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       error: string | null;
       completed_at?: string;
       output_url?: string | null;
-    } = { status, progress_pct: progress, error };
+      chunks_total?: number | null;
+      chunks_completed?: number | null;
+    } = {
+      status,
+      progress_pct: progress,
+      error,
+      chunks_total: chunksTotal,
+      chunks_completed: chunksCompleted,
+    };
     if (status === "completed") {
       jobUpdate.completed_at = new Date().toISOString();
       jobUpdate.progress_pct = 100;
+      if (chunksTotal != null) jobUpdate.chunks_completed = chunksTotal;
     }
     if (status === "failed") {
       jobUpdate.completed_at = new Date().toISOString();
@@ -270,7 +285,14 @@ export const pollRenderJob = createServerFn({ method: "POST" })
         .eq("id", job.project_id);
     }
 
-    return { status, progress_pct: progress, output_url: playbackUrl, error };
+    return {
+      status,
+      progress_pct: progress,
+      output_url: playbackUrl,
+      error,
+      chunks_total: chunksTotal,
+      chunks_completed: status === "completed" && chunksTotal != null ? chunksTotal : chunksCompleted,
+    };
   });
 
 // Silence unused ttl warning if compiler flags it.
