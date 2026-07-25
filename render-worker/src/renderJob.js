@@ -338,7 +338,9 @@ async function processStitchJob(job) {
         .outputOptions([
           '-map', '0:v',
           '-map', '1:a',
-          '-c', 'copy',
+          '-c:v', 'copy',   // stream-copy the already-encoded H.264 chunks — no re-encode
+          '-c:a', 'aac',    // transcode audio to AAC (matches runFfmpeg's output codec)
+          '-b:a', '192k',   // same bitrate as the non-chunked render path
           '-shortest',
         ])
         .output(outputPath);
