@@ -101,15 +101,12 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         const total = Math.max(0, sceneEnd - sceneStart);
         if (total <= 0) continue;
 
-        // Consecutive sub-segments of exactly fixedDuration; the last slice
-        // keeps the true remainder (no padding / stretching).
-        const lengths: number[] = [];
-        let remaining = total;
-        while (remaining > 0.01) {
-          const len = Math.min(fixedDuration, remaining);
-          lengths.push(len);
-          remaining -= len;
-        }
+        // Every slot is exactly fixedDuration seconds — even if the scene voiceover
+        // is shorter. The video plays the full fixedDuration; audio continues into
+        // the next scene while this visual is still showing. This is intentional
+        // (Option A): uniform clip length takes priority over voiceover-visual sync.
+        const slots = Math.max(1, Math.ceil(total / fixedDuration));
+        const lengths: number[] = Array(slots).fill(fixedDuration);
 
         for (const len of lengths) {
           let url: string | null = null;
@@ -117,7 +114,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             const result = await searchStockFootage({
               query: scene.visual_query,
               orientation,
-              minDurationSec: Math.max(1, Math.ceil(len)),
+              minDurationSec: fixedDuration,   // always request full fixedDuration
               targetWidth,
               usedIds: [...usedIds],
             });
@@ -128,6 +125,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           }
           // Fall back to the scene's already-selected clip if no new candidate.
           if (!url) url = scene.selected_clips.clip_candidates.url;
+          // Always use the full fixedDuration — never a sub-duration remainder.
+          // len is always fixedDuration here (see slot calculation above).
           clips.push({ clip_url: url, start: 0, end: Number(len.toFixed(3)) });
         }
       }
