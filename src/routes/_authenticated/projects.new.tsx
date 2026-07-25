@@ -9,6 +9,8 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Progress } from "@/components/ui/progress";
+import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { ArrowLeft, Upload } from "lucide-react";
 import { toast } from "sonner";
 
@@ -27,6 +29,8 @@ function NewProject() {
   const runStartPipeline = useServerFn(startPipeline);
   const [name, setName] = useState("");
   const [category, setCategory] = useState<CategoryValue>("none");
+  const [fixedClips, setFixedClips] = useState(false);
+  const [clipDuration, setClipDuration] = useState(4);
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -62,6 +66,7 @@ function NewProject() {
         status: "uploading",
         user_id: userData.user.id,
         category: category === "none" ? null : category,
+        clip_duration_seconds: fixedClips ? clipDuration : null,
       })
       .select("id")
       .single();
@@ -219,6 +224,40 @@ function NewProject() {
               </div>
 
 
+
+              <div className="space-y-3 rounded-md border p-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="space-y-0.5">
+                    <Label htmlFor="fixed-clips">Fixed clip length</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Off: one clip per sentence, natural length. On: each scene is split into clips of this length.
+                    </p>
+                  </div>
+                  <Switch
+                    id="fixed-clips"
+                    checked={fixedClips}
+                    onCheckedChange={setFixedClips}
+                    disabled={busy}
+                  />
+                </div>
+                {fixedClips ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-sm">
+                      <Label htmlFor="clip-duration">Clip duration</Label>
+                      <span className="font-medium tabular-nums">{clipDuration}s</span>
+                    </div>
+                    <Slider
+                      id="clip-duration"
+                      min={3}
+                      max={6}
+                      step={1}
+                      value={[clipDuration]}
+                      onValueChange={(v) => setClipDuration(v[0])}
+                      disabled={busy}
+                    />
+                  </div>
+                ) : null}
+              </div>
 
               {busy ? (
                 <div className="space-y-2">
