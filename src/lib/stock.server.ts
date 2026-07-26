@@ -40,15 +40,23 @@ function parsePexelsKeys(): string[] {
   return keys;
 }
 
-async function pexelsFetch(query: string, orientation: Orientation, page: number): Promise<Response> {
-  const keys = parsePexelsKeys();
+function buildPexelsUrl(query: string, orientation: Orientation, page: number): string {
   const params = new URLSearchParams({
     query,
     orientation,
     per_page: "20",
     page: String(page),
   });
-  const url = `${PEXELS_URL}?${params.toString()}`;
+  return `${PEXELS_URL}?${params.toString()}`;
+}
+
+/**
+ * Legacy env-var key path. UNCHANGED behaviour — this is the fallback used
+ * whenever the pexels_api_keys pool is empty (e.g. before any CSV upload).
+ */
+async function pexelsFetchFromEnv(query: string, orientation: Orientation, page: number): Promise<Response> {
+  const keys = parsePexelsKeys();
+  const url = buildPexelsUrl(query, orientation, page);
 
   const firstIdx = Math.floor(Math.random() * keys.length);
   const firstKey = keys[firstIdx];
@@ -71,6 +79,75 @@ async function pexelsFetch(query: string, orientation: Orientation, page: number
     `Pexels search failed (401) after trying 1 of ${keys.length} keys: ${detail.slice(0, 200)}`,
   );
 }
+
+type PoolKey = { id: string; api_key: string };
+
+async function loadActivePoolKeys(): Promise<PoolKey[]> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data, error } = await supabaseAdmin
+      .from("pexels_api_keys")
+      .select("id, api_key")
+      .eq("is_active", true);
+    if (error) {
+      console.error("[pexels-pool] failed to load keys, falling back to env:", error.message);
+      return [];
+    }
+    const keys = (data ?? []) as PoolKey[];
+    // Random order.
+    for (let i = keys.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
+    return keys;
+  } catch (e) {
+    console.error("[pexels-pool] pool lookup threw, falling back to env:", e);
+    return [];
+  }
+}
+
+async function markKeyUsed(id: string) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  await supabaseAdmin.rpc("increment_pexels_key_usage", { p_id: id });
+}
+
+async function markKeyDead(id: string, message: string) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  await supabaseAdmin
+    .from("pexels_api_keys")
+    .update({
+      is_active: false,
+      last_error: message.slice(0, 500),
+      last_error_at: new Date().toISOString(),
+    })
+    .eq("id", id);
+}
+
+async function pexelsFetch(query: string, orientation: Orientation, page: number): Promise<Response> {
+  const pool = await loadActivePoolKeys();
+  // CRITICAL: empty pool -> behave exactly as before, using env-var keys.
+  if (pool.length === 0) return pexelsFetchFromEnv(query, orientation, page);
+
+  const url = buildPexelsUrl(query, orientation, page);
+  let lastAuthError = "";
+
+  // Try up to 2 pool keys (initial + one retry) on 401/403.
+  for (const key of pool.slice(0, 2)) {
+    const res = await fetch(url, { headers: { authorization: key.api_key } });
+    if (res.status === 401 || res.status === 403) {
+      lastAuthError = `Pexels rejected key (HTTP ${res.status})`;
+      await markKeyDead(key.id, lastAuthError);
+      continue;
+    }
+    if (res.ok) await markKeyUsed(key.id);
+    return res;
+  }
+
+  // Every attempted pool key was rejected — last resort: env keys.
+  console.error(`[pexels-pool] ${lastAuthError}; falling back to env keys`);
+  return pexelsFetchFromEnv(query, orientation, page);
+}
+
 
 export const pexelsProvider: StockProvider = {
   name: "pexels",

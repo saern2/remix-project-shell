@@ -522,10 +522,12 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      increment_pexels_key_usage: { Args: { p_id: string }; Returns: undefined }
       increment_provider_usage: {
         Args: { p_cache_hit: boolean; p_date: string; p_provider: string }
         Returns: undefined
       }
+      is_admin: { Args: { _user_id: string }; Returns: boolean }
     }
     Enums: {
       [_ in never]: never

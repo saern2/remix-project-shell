@@ -18,7 +18,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Plus, LogOut, Video, Trash2, Loader2 } from "lucide-react";
+import { Plus, LogOut, Video, Trash2, Loader2, Shield } from "lucide-react";
+import { amIAdmin } from "@/lib/admin.functions";
+
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
 
@@ -63,6 +65,15 @@ function Dashboard() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const runDelete = useServerFn(deleteProject);
+  const checkAdmin = useServerFn(amIAdmin);
+
+
+  const { data: isAdmin } = useQuery({
+    queryKey: ["am-i-admin"],
+    queryFn: () => checkAdmin({}),
+    retry: false,
+  });
+
 
   const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -108,10 +119,21 @@ function Dashboard() {
             <Video className="h-5 w-5" />
             <h1 className="text-lg font-semibold">Auto Video Creator</h1>
           </div>
-          <Button variant="ghost" size="sm" onClick={handleSignOut}>
-            <LogOut className="mr-2 h-4 w-4" />
-            Sign out
-          </Button>
+          <div className="flex items-center gap-1">
+            {isAdmin?.isAdmin && (
+              <Button variant="ghost" size="sm" asChild>
+                <Link to="/admin">
+                  <Shield className="mr-2 h-4 w-4" />
+                  Admin
+                </Link>
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={handleSignOut}>
+              <LogOut className="mr-2 h-4 w-4" />
+              Sign out
+            </Button>
+          </div>
+
         </div>
       </header>
 
