@@ -4,7 +4,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
-import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
+import { submitRenderJob, pollRenderJob, cancelRenderJob, regenerateAndRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,7 +21,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2, X, Trash2 } from "lucide-react";
+import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2, X, Trash2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/projects/$projectId")({
@@ -280,6 +280,31 @@ function ProjectDetail() {
       toast.error((err as Error).message);
     } finally {
       setSubmittingRender(false);
+    }
+  };
+
+  const runRegenerateRender = useServerFn(regenerateAndRenderJob);
+  const [regenerating, setRegenerating] = useState(false);
+
+  const handleRegenerateAndRender = async () => {
+    setRegenerating(true);
+    try {
+      // Step 1: bust the slice cache (deletes render_clip_slices for this project)
+      await runRegenerateRender({ data: { projectId } });
+      // Step 2: invalidate the clip-slices cache in React Query so the Timeline
+      // shows a loading state while the new render is being prepared
+      await queryClient.invalidateQueries({ queryKey: ["clip-slices", projectId] });
+      // Step 3: submit a fresh render job — submitRenderJob will find no cached
+      // slices and run fresh stock footage searches for every slot
+      await runSubmitRender({ data: { projectId } });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+        queryClient.invalidateQueries({ queryKey: ["render-job", projectId] }),
+      ]);
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setRegenerating(false);
     }
   };
 
@@ -575,14 +600,29 @@ function ProjectDetail() {
                   <div className="flex items-center justify-between gap-4">
                     <CardTitle className="text-base">Final video</CardTitle>
                     {isReady && (!renderJob || !RENDER_ACTIVE.has(renderJob.status)) ? (
-                      <Button size="sm" onClick={handleRender} disabled={submittingRender}>
-                        {submittingRender ? (
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        ) : (
-                          <Film className="mr-2 h-4 w-4" />
-                        )}
-                        {renderJob?.status === "completed" ? "Re-render" : "Render video"}
-                      </Button>
+                      <div className="flex items-center gap-2">
+                        {/* Re-render: reuses cached footage — fast recovery for failed renders */}
+                        <Button size="sm" onClick={handleRender} disabled={submittingRender || regenerating} variant="outline">
+                          {submittingRender ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Film className="mr-2 h-4 w-4" />
+                          )}
+                          {renderJob?.status === "completed" ? "Re-render" : "Render video"}
+                        </Button>
+                        {/* Regenerate footage: only shown for fixed-duration projects.
+                            Busts the clip cache and searches for entirely new footage. */}
+                        {project.clip_duration_seconds ? (
+                          <Button size="sm" onClick={handleRegenerateAndRender} disabled={submittingRender || regenerating}>
+                            {regenerating ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <Sparkles className="mr-2 h-4 w-4" />
+                            )}
+                            Regenerate footage
+                          </Button>
+                        ) : null}
+                      </div>
                     ) : null}
                   </div>
                 </CardHeader>
