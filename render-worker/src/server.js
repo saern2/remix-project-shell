@@ -329,7 +329,7 @@ async function sweepOrphanedTempDirs() {
       'Temp sweep complete',
     );
   } else {
-    logger.debug({ baseDir }, 'Temp sweep: no orphaned directories found');
+    logger.info({ baseDir, dirCount: entries.length }, 'Temp sweep: no orphaned directories found');
   }
 }
 
