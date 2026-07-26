@@ -13,6 +13,7 @@ import {
   uploadPexelsKeys,
   deactivatePexelsKey,
 } from "@/lib/admin.functions";
+import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -33,8 +34,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { toast } from "sonner";
-import { ArrowLeft, Loader2, Upload } from "lucide-react";
+import { ArrowLeft, Loader2, Upload, ShieldCheck } from "lucide-react";
 
 export const Route = createFileRoute("/_authenticated/admin")({
   head: () => ({
@@ -228,6 +235,12 @@ function UsersTab() {
   const [filter, setFilter] = useState<string>("all");
   const [busy, setBusy] = useState<string | null>(null);
 
+  // Get the currently logged-in user's ID for the self-action guard.
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => setCurrentUserId(data.user?.id ?? null));
+  }, []);
+
   const { data, isPending, error } = useQuery({
     queryKey: ["admin-users"],
     queryFn: () => fetchUsers({}),
@@ -253,127 +266,188 @@ function UsersTab() {
   const rows = data.filter((u) => filter === "all" || u.approval_status === filter);
 
   return (
-    <Card>
-      <CardHeader className="flex-row items-center justify-between gap-4 space-y-0">
-        <CardTitle className="text-base">Users</CardTitle>
-        <Select value={filter} onValueChange={setFilter}>
-          <SelectTrigger className="w-44">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
-            <SelectItem value="pending">Pending</SelectItem>
-            <SelectItem value="approved">Approved</SelectItem>
-            <SelectItem value="rejected">Rejected</SelectItem>
-          </SelectContent>
-        </Select>
-      </CardHeader>
-      <CardContent className="overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Email</TableHead>
-              <TableHead>Role</TableHead>
-              <TableHead>Approval</TableHead>
-              <TableHead>Plan</TableHead>
-              <TableHead>Joined</TableHead>
-              <TableHead className="text-right">Renders</TableHead>
-              <TableHead className="text-right">Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((u) => (
-              <TableRow key={u.id}>
-                <TableCell className="font-medium">{u.email}</TableCell>
-                <TableCell>
-                  <Badge variant={u.role === "admin" ? "default" : "outline"}>{u.role}</Badge>
-                </TableCell>
-                <TableCell>
-                  <Badge
-                    variant={
-                      u.approval_status === "approved"
-                        ? "default"
-                        : u.approval_status === "rejected"
-                          ? "destructive"
-                          : "secondary"
-                    }
-                  >
-                    {u.approval_status}
-                  </Badge>
-                </TableCell>
-                <TableCell>{u.plan_tier}</TableCell>
-                <TableCell>{new Date(u.created_at).toLocaleDateString()}</TableCell>
-                <TableCell className="text-right">{u.renderCount}</TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap justify-end gap-2">
-                    {busy === u.id && <Loader2 className="h-4 w-4 animate-spin" />}
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={busy === u.id || u.approval_status === "approved"}
-                      onClick={() =>
-                        run(
-                          u.id,
-                          () => approvalFn({ data: { userId: u.id, approvalStatus: "approved" } }),
-                          "User approved",
-                        )
-                      }
-                    >
-                      Approve
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={busy === u.id || u.approval_status === "rejected"}
-                      onClick={() =>
-                        run(
-                          u.id,
-                          () => approvalFn({ data: { userId: u.id, approvalStatus: "rejected" } }),
-                          "User rejected",
-                        )
-                      }
-                    >
-                      Reject
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={busy === u.id || u.plan_tier === "free"}
-                      onClick={() =>
-                        run(
-                          u.id,
-                          () => planFn({ data: { userId: u.id, planTier: "free" } }),
-                          "Downgraded to free",
-                        )
-                      }
-                    >
-                      Downgrade to free
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={busy === u.id}
-                      onClick={() =>
-                        run(
-                          u.id,
-                          () =>
-                            roleFn({
-                              data: { userId: u.id, role: u.role === "admin" ? "user" : "admin" },
-                            }),
-                          u.role === "admin" ? "Admin removed" : "Admin granted",
-                        )
-                      }
-                    >
-                      {u.role === "admin" ? "Remove admin" : "Make admin"}
-                    </Button>
-                  </div>
-                </TableCell>
+    <TooltipProvider delayDuration={200}>
+      <Card>
+        <CardHeader className="flex-row items-center justify-between gap-4 space-y-0">
+          <CardTitle className="text-base">Users</CardTitle>
+          <Select value={filter} onValueChange={setFilter}>
+            <SelectTrigger className="w-44">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All statuses</SelectItem>
+              <SelectItem value="pending">Pending</SelectItem>
+              <SelectItem value="approved">Approved</SelectItem>
+              <SelectItem value="rejected">Rejected</SelectItem>
+            </SelectContent>
+          </Select>
+        </CardHeader>
+        <CardContent className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Email</TableHead>
+                <TableHead>Role</TableHead>
+                <TableHead>Approval</TableHead>
+                <TableHead>Plan</TableHead>
+                <TableHead>Joined</TableHead>
+                <TableHead className="text-right">Renders</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </CardContent>
-    </Card>
+            </TableHeader>
+            <TableBody>
+              {rows.map((u) => {
+                // Determine why destructive actions are blocked for this row.
+                const isPrimaryAdmin = !!u.is_primary_admin;
+                const isSelf = u.id === currentUserId;
+                const rejectBlockReason = isPrimaryAdmin
+                  ? "Protected: primary admin account cannot be modified"
+                  : isSelf
+                    ? "You cannot reject your own account"
+                    : null;
+                const removeAdminBlockReason = isPrimaryAdmin
+                  ? "Protected: primary admin account cannot be modified"
+                  : isSelf
+                    ? "You cannot remove your own admin role"
+                    : null;
+
+                return (
+                  <TableRow key={u.id}>
+                    <TableCell className="font-medium">
+                      <span className="flex items-center gap-1.5">
+                        {u.email}
+                        {isPrimaryAdmin && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+                            </TooltipTrigger>
+                            <TooltipContent>Primary admin — protected account</TooltipContent>
+                          </Tooltip>
+                        )}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={u.role === "admin" ? "default" : "outline"}>{u.role}</Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={
+                          u.approval_status === "approved"
+                            ? "default"
+                            : u.approval_status === "rejected"
+                              ? "destructive"
+                              : "secondary"
+                        }
+                      >
+                        {u.approval_status}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>{u.plan_tier}</TableCell>
+                    <TableCell>{new Date(u.created_at).toLocaleDateString()}</TableCell>
+                    <TableCell className="text-right">{u.renderCount}</TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap justify-end gap-2">
+                        {busy === u.id && <Loader2 className="h-4 w-4 animate-spin" />}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={busy === u.id || u.approval_status === "approved"}
+                          onClick={() =>
+                            run(
+                              u.id,
+                              () => approvalFn({ data: { userId: u.id, approvalStatus: "approved" } }),
+                              "User approved",
+                            )
+                          }
+                        >
+                          Approve
+                        </Button>
+
+                        {/* Reject — disabled with tooltip when protected */}
+                        {rejectBlockReason ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span>
+                                <Button size="sm" variant="outline" disabled>
+                                  Reject
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>{rejectBlockReason}</TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busy === u.id || u.approval_status === "rejected"}
+                            onClick={() =>
+                              run(
+                                u.id,
+                                () => approvalFn({ data: { userId: u.id, approvalStatus: "rejected" } }),
+                                "User rejected",
+                              )
+                            }
+                          >
+                            Reject
+                          </Button>
+                        )}
+
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={busy === u.id || u.plan_tier === "free"}
+                          onClick={() =>
+                            run(
+                              u.id,
+                              () => planFn({ data: { userId: u.id, planTier: "free" } }),
+                              "Downgraded to free",
+                            )
+                          }
+                        >
+                          Downgrade to free
+                        </Button>
+
+                        {/* Remove admin — disabled with tooltip when protected */}
+                        {u.role === "admin" && removeAdminBlockReason ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span>
+                                <Button size="sm" variant="secondary" disabled>
+                                  Remove admin
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>{removeAdminBlockReason}</TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            disabled={busy === u.id}
+                            onClick={() =>
+                              run(
+                                u.id,
+                                () =>
+                                  roleFn({
+                                    data: { userId: u.id, role: u.role === "admin" ? "user" : "admin" },
+                                  }),
+                                u.role === "admin" ? "Admin removed" : "Admin granted",
+                              )
+                            }
+                          >
+                            {u.role === "admin" ? "Remove admin" : "Make admin"}
+                          </Button>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </TooltipProvider>
   );
 }
 

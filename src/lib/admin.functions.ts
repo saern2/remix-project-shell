@@ -8,6 +8,23 @@ async function assertAdmin(context: { supabase: any; userId: string }) {
   if (!data) throw new Error("Forbidden.");
 }
 
+/**
+ * Guard: throws if the target user is the primary admin.
+ * Called server-side before any reject/demote action regardless of who is calling.
+ */
+async function assertNotPrimaryAdmin(targetUserId: string) {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data, error } = await supabaseAdmin
+    .from("users")
+    .select("is_primary_admin")
+    .eq("id", targetUserId)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (data?.is_primary_admin) {
+    throw new Error("Cannot modify the primary admin account.");
+  }
+}
+
 /** Cheap self-check used by the UI-level route gate. */
 export const amIAdmin = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -108,7 +125,7 @@ export const listAdminUsers = createServerFn({ method: "GET" })
     const [usersRes, jobsRes, projectsRes] = await Promise.all([
       supabaseAdmin
         .from("users")
-        .select("id, email, role, approval_status, plan_tier, created_at")
+        .select("id, email, role, approval_status, plan_tier, created_at, is_primary_admin")
         .order("created_at", { ascending: false }),
       supabaseAdmin.from("render_jobs").select("id, status, project_id"),
       supabaseAdmin.from("projects").select("id, user_id"),
@@ -140,6 +157,14 @@ export const setUserApprovalStatus = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
+    // Self-action guard: no admin can reject their own account mid-session.
+    if (data.userId === context.userId && data.approvalStatus === "rejected") {
+      throw new Error("You cannot reject your own account.");
+    }
+    // Primary admin guard: the primary admin account cannot be rejected.
+    if (data.approvalStatus === "rejected") {
+      await assertNotPrimaryAdmin(data.userId);
+    }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { error } = await supabaseAdmin
       .from("users")
@@ -173,8 +198,13 @@ export const setUserRole = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
+    // Self-action guard: no admin can remove their own admin role mid-session.
     if (data.userId === context.userId && data.role === "user") {
       throw new Error("You cannot remove your own admin role.");
+    }
+    // Primary admin guard: the primary admin's role can never be changed.
+    if (data.role === "user") {
+      await assertNotPrimaryAdmin(data.userId);
     }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { error } = await supabaseAdmin.from("users").update({ role: data.role }).eq("id", data.userId);
