@@ -108,10 +108,21 @@ function Dashboard() {
             <Video className="h-5 w-5" />
             <h1 className="text-lg font-semibold">Auto Video Creator</h1>
           </div>
-          <Button variant="ghost" size="sm" onClick={handleSignOut}>
-            <LogOut className="mr-2 h-4 w-4" />
-            Sign out
-          </Button>
+          <div className="flex items-center gap-1">
+            {isAdmin?.isAdmin && (
+              <Button variant="ghost" size="sm" asChild>
+                <Link to="/admin">
+                  <Shield className="mr-2 h-4 w-4" />
+                  Admin
+                </Link>
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={handleSignOut}>
+              <LogOut className="mr-2 h-4 w-4" />
+              Sign out
+            </Button>
+          </div>
+
         </div>
       </header>
 
