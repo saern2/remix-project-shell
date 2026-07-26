@@ -64,7 +64,14 @@ export const Route = createFileRoute("/_authenticated/dashboard")({
 function Dashboard() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const runDelete = useServerFn(deleteProject);
+  const checkAdmin = useServerFn(amIAdmin);
+
+  const { data: isAdmin } = useQuery({
+    queryKey: ["am-i-admin"],
+    queryFn: () => checkAdmin({}),
+    retry: false,
+  });
+
 
   const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
