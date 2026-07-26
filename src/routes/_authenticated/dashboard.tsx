@@ -18,7 +18,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Plus, LogOut, Video, Trash2, Loader2 } from "lucide-react";
+import { Plus, LogOut, Video, Trash2, Loader2, Shield } from "lucide-react";
+import { amIAdmin } from "@/lib/admin.functions";
+
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
 
