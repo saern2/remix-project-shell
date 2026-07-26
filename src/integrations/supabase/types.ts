@@ -105,6 +105,39 @@ export type Database = {
           },
         ]
       }
+      pexels_api_keys: {
+        Row: {
+          added_at: string
+          api_key: string
+          id: string
+          is_active: boolean
+          last_error: string | null
+          last_error_at: string | null
+          last_used_at: string | null
+          request_count: number
+        }
+        Insert: {
+          added_at?: string
+          api_key: string
+          id?: string
+          is_active?: boolean
+          last_error?: string | null
+          last_error_at?: string | null
+          last_used_at?: string | null
+          request_count?: number
+        }
+        Update: {
+          added_at?: string
+          api_key?: string
+          id?: string
+          is_active?: boolean
+          last_error?: string | null
+          last_error_at?: string | null
+          last_used_at?: string | null
+          request_count?: number
+        }
+        Relationships: []
+      }
       projects: {
         Row: {
           aspect_ratio: string
@@ -459,22 +492,28 @@ export type Database = {
       }
       users: {
         Row: {
+          approval_status: string
           created_at: string
           email: string
           id: string
           plan_tier: string
+          role: string
         }
         Insert: {
+          approval_status?: string
           created_at?: string
           email: string
           id: string
           plan_tier?: string
+          role?: string
         }
         Update: {
+          approval_status?: string
           created_at?: string
           email?: string
           id?: string
           plan_tier?: string
+          role?: string
         }
         Relationships: []
       }
