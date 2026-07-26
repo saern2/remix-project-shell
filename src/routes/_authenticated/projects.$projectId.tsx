@@ -144,9 +144,10 @@ function ProjectDetail() {
       const { data, error } = await supabase
         .from("render_clip_slices")
         .select("id, scene_id, slice_index, clip_url, duration_seconds")
-        .eq("project_id", projectId)
-        .order("scene_id", { ascending: true })
-        .order("slice_index", { ascending: true });
+        .eq("project_id", projectId);
+      // NOTE: ordering by scene_id (UUID) is removed here — UUIDs are not sequential
+      // and produce an effectively random scene order. Sorting is done client-side
+      // in sortedClipSlices using the scene idx values from scenesQuery.
       if (error) throw error;
       return data ?? [];
     },
@@ -167,6 +168,25 @@ function ProjectDetail() {
     }
     return map;
   }, [clipsQuery.data]);
+
+  // Sort clip slices by scene idx (from scenesQuery) then slice_index.
+  // render_clip_slices has no idx column — scene_id is a UUID, not a sequence,
+  // so server-side ordering by scene_id produces a random scene order.
+  const sortedClipSlices = useMemo(() => {
+    const slices = clipSlicesQuery.data ?? [];
+    if (slices.length === 0) return slices;
+    // Build a scene_id -> idx map from the already-loaded scenesQuery
+    const sceneIdxMap = new Map<string, number>();
+    for (const s of scenesQuery.data ?? []) {
+      sceneIdxMap.set(s.id, s.idx);
+    }
+    return [...slices].sort((a, b) => {
+      const aIdx = sceneIdxMap.get(a.scene_id) ?? 0;
+      const bIdx = sceneIdxMap.get(b.scene_id) ?? 0;
+      if (aIdx !== bIdx) return aIdx - bIdx;
+      return a.slice_index - b.slice_index;
+    });
+  }, [clipSlicesQuery.data, scenesQuery.data]);
 
   const runSwap = useServerFn(swapSceneClip);
   const [swappingId, setSwappingId] = useState<string | null>(null);
@@ -436,8 +456,8 @@ function ProjectDetail() {
                 <CardContent>
                   <div className="flex gap-3 overflow-x-auto pb-2">
                     {project.clip_duration_seconds && (clipSlicesQuery.data?.length ?? 0) > 0 ? (
-                      // Fixed-duration path: render persisted clip slices
-                      clipSlicesQuery.data!.map((slice) => (
+                      // Fixed-duration path: render persisted clip slices in correct scene order
+                      sortedClipSlices.map((slice) => (
                         <div
                           key={slice.id}
                           className="relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
