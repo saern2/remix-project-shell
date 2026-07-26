@@ -35,6 +35,7 @@ type Project = {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+  clip_duration_seconds: number | null;
 };
 
 type Scene = {
@@ -83,7 +84,7 @@ function ProjectDetail() {
     queryFn: async (): Promise<Project> => {
       const { data, error } = await supabase
         .from("projects")
-        .select("id, name, status, error_message, created_at, updated_at")
+        .select("id, name, status, error_message, created_at, updated_at, clip_duration_seconds")
         .eq("id", projectId)
         .single();
       if (error) throw error;
@@ -136,6 +137,21 @@ function ProjectDetail() {
     },
     refetchInterval: (query) => (project?.status === "matching_footage" ? 3000 : false),
   });
+  const clipSlicesQuery = useQuery({
+    enabled: !!project && !!project.clip_duration_seconds,
+    queryKey: ["clip-slices", projectId],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("render_clip_slices")
+        .select("id, scene_id, slice_index, clip_url, duration_seconds")
+        .eq("project_id", projectId)
+        .order("scene_id", { ascending: true })
+        .order("slice_index", { ascending: true });
+      if (error) throw error;
+      return data ?? [];
+    },
+  });
+
   const clipsByScene = useMemo(() => {
     const map = new Map<string, { thumb: string | null; url: string; duration: number }>();
     for (const row of clipsQuery.data ?? []) {
@@ -419,51 +435,78 @@ function ProjectDetail() {
                 </CardHeader>
                 <CardContent>
                   <div className="flex gap-3 overflow-x-auto pb-2">
-                    {scenesQuery.data.map((s) => {
-                      const clip = clipsByScene.get(s.id);
-                      const sceneDur = Number(s.end_ts) - Number(s.start_ts);
-                      const isSwapping = swappingId === s.id;
-                      return (
+                    {project.clip_duration_seconds && (clipSlicesQuery.data?.length ?? 0) > 0 ? (
+                      // Fixed-duration path: render persisted clip slices
+                      clipSlicesQuery.data!.map((slice) => (
                         <div
-                          key={s.id}
-                          className="group relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
+                          key={slice.id}
+                          className="relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
                         >
                           <div className="relative aspect-video w-full bg-muted-foreground/10">
-                            {clip?.thumb ? (
-                              <img
-                                src={clip.thumb}
-                                alt={s.visual_query ?? ""}
-                                className="h-full w-full object-cover"
-                                loading="lazy"
-                              />
-                            ) : (
-                              <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
-                                {project.status === "matching_footage" ? "Matching…" : "No clip"}
-                              </div>
-                            )}
-                            {clip && isReady ? (
-                              <Button
-                                size="sm"
-                                variant="secondary"
-                                disabled={isSwapping}
-                                onClick={() => handleSwap(s.id)}
-                                className="absolute right-1 top-1 h-7 px-2 opacity-0 shadow transition-opacity group-hover:opacity-100"
-                              >
-                                <Shuffle className="mr-1 h-3 w-3" />
-                                {isSwapping ? "…" : "Swap"}
-                              </Button>
-                            ) : null}
+                            <video
+                              src={slice.clip_url}
+                              muted
+                              playsInline
+                              preload="metadata"
+                              className="h-full w-full object-cover"
+                            />
                           </div>
                           <div className="p-2 text-xs">
                             <div className="flex items-center justify-between text-muted-foreground">
-                              <span>Scene {s.idx + 1}</span>
-                              <span>{sceneDur.toFixed(1)}s</span>
+                              <span>Slice {slice.slice_index + 1}</span>
+                              <span>{slice.duration_seconds}s</span>
                             </div>
-                            <p className="mt-1 line-clamp-2 text-foreground/90">{s.text}</p>
                           </div>
                         </div>
-                      );
-                    })}
+                      ))
+                    ) : (
+                      // Default path: scene-based timeline
+                      scenesQuery.data.map((s) => {
+                        const clip = clipsByScene.get(s.id);
+                        const sceneDur = Number(s.end_ts) - Number(s.start_ts);
+                        const isSwapping = swappingId === s.id;
+                        return (
+                          <div
+                            key={s.id}
+                            className="group relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
+                          >
+                            <div className="relative aspect-video w-full bg-muted-foreground/10">
+                              {clip?.thumb ? (
+                                <img
+                                  src={clip.thumb}
+                                  alt={s.visual_query ?? ""}
+                                  className="h-full w-full object-cover"
+                                  loading="lazy"
+                                />
+                              ) : (
+                                <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+                                  {project.status === "matching_footage" ? "Matching…" : "No clip"}
+                                </div>
+                              )}
+                              {clip && isReady ? (
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  disabled={isSwapping}
+                                  onClick={() => handleSwap(s.id)}
+                                  className="absolute right-1 top-1 h-7 px-2 opacity-0 shadow transition-opacity group-hover:opacity-100"
+                                >
+                                  <Shuffle className="mr-1 h-3 w-3" />
+                                  {isSwapping ? "…" : "Swap"}
+                                </Button>
+                              ) : null}
+                            </div>
+                            <div className="p-2 text-xs">
+                              <div className="flex items-center justify-between text-muted-foreground">
+                                <span>Scene {s.idx + 1}</span>
+                                <span>{sceneDur.toFixed(1)}s</span>
+                              </div>
+                              <p className="mt-1 line-clamp-2 text-foreground/90">{s.text}</p>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
                   </div>
                 </CardContent>
               </Card>

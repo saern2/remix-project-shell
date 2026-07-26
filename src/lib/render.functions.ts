@@ -57,6 +57,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     if (!scenes || scenes.length === 0) throw new Error("No scenes with clips selected.");
 
     type SceneRow = {
+      id: string;
       idx: number;
       start_ts: number | string | null;
       end_ts: number | string | null;
@@ -83,16 +84,45 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         end: Number(s.selected_clips.out_point),
       }));
     } else {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+      // Load any previously persisted slices for this project
+      const { data: existingSlices } = await supabaseAdmin
+        .from("render_clip_slices")
+        .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
+        .eq("project_id", projectId);
+
+      // Build a lookup map: `${scene_id}:${slice_index}` -> slice row
+      const sliceCache = new Map<string, { clip_url: string; provider_clip_id: string | null; duration_seconds: number }>();
+      for (const row of existingSlices ?? []) {
+        sliceCache.set(`${row.scene_id}:${row.slice_index}`, {
+          clip_url: row.clip_url,
+          provider_clip_id: row.provider_clip_id ?? null,
+          duration_seconds: Number(row.duration_seconds),
+        });
+      }
+
       const { searchStockFootage, orientationForAspect, targetWidthForAspect } = await import(
         "@/lib/stock.server"
       );
       const orientation = orientationForAspect(project.aspect_ratio ?? "9:16");
       const targetWidth = targetWidthForAspect(project.aspect_ratio ?? "9:16");
 
-      // Project-wide dedup set, seeded with the clips already selected.
-      const usedIds = new Set<string>(
-        sceneRows.map((s) => s.selected_clips.clip_candidates.provider_clip_id).filter(Boolean),
-      );
+      // Project-wide dedup set, seeded with the clips already selected AND existing slice rows.
+      const usedIds = new Set<string>([
+        ...sceneRows.map((s) => s.selected_clips.clip_candidates.provider_clip_id).filter(Boolean),
+        ...(existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
+      ]);
+
+      // Build new slice rows to insert (only for slots not already cached)
+      const newSliceRows: Array<{
+        project_id: string;
+        scene_id: string;
+        slice_index: number;
+        clip_url: string;
+        provider_clip_id: string | null;
+        duration_seconds: number;
+      }> = [];
 
       clips = [];
       for (const scene of sceneRows) {
@@ -106,31 +136,85 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         // the next scene while this visual is still showing. This is intentional
         // (Option A): uniform clip length takes priority over voiceover-visual sync.
         const slots = Math.max(1, Math.ceil(total / fixedDuration));
-        const lengths: number[] = Array(slots).fill(fixedDuration);
 
-        for (const len of lengths) {
-          let url: string | null = null;
-          if (scene.visual_query) {
-            const result = await searchStockFootage({
-              query: scene.visual_query,
-              orientation,
-              minDurationSec: fixedDuration,   // always request full fixedDuration
-              targetWidth,
-              usedIds: [...usedIds],
-            });
-            if (result) {
-              url = result.chosenFile.url;
-              usedIds.add(result.pick.provider_clip_id);
+        for (let slotIdx = 0; slotIdx < slots; slotIdx++) {
+          const cacheKey = `${scene.id}:${slotIdx}`;
+          const cached = sliceCache.get(cacheKey);
+
+          let url: string;
+          let providerClipId: string | null = null;
+
+          if (cached) {
+            // Reuse persisted assignment — no API call needed
+            url = cached.clip_url;
+            providerClipId = cached.provider_clip_id;
+          } else {
+            // Search for a new clip
+            let found: string | null = null;
+            if (scene.visual_query) {
+              const result = await searchStockFootage({
+                query: scene.visual_query,
+                orientation,
+                minDurationSec: fixedDuration,   // always request full fixedDuration
+                targetWidth,
+                usedIds: [...usedIds],
+              });
+              if (result) {
+                found = result.chosenFile.url;
+                providerClipId = result.pick.provider_clip_id;
+                usedIds.add(result.pick.provider_clip_id);
+              }
             }
+            url = found ?? scene.selected_clips.clip_candidates.url;
+
+            // Queue this new assignment for persistence
+            newSliceRows.push({
+              project_id: projectId,
+              scene_id: scene.id as string,
+              slice_index: slotIdx,
+              clip_url: url,
+              provider_clip_id: providerClipId,
+              duration_seconds: fixedDuration,
+            });
           }
-          // Fall back to the scene's already-selected clip if no new candidate.
-          if (!url) url = scene.selected_clips.clip_candidates.url;
+
           // Always use the full fixedDuration — never a sub-duration remainder.
-          // len is always fixedDuration here (see slot calculation above).
-          clips.push({ clip_url: url, start: 0, end: Number(len.toFixed(3)) });
+          clips.push({ clip_url: url, start: 0, end: fixedDuration });
         }
       }
       if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
+
+      // Persist new slice assignments (delete-all-for-project + re-insert pattern,
+      // since there is no unique constraint to drive upsert).
+      if (newSliceRows.length > 0) {
+        // Delete all existing slices for this project
+        await supabaseAdmin
+          .from("render_clip_slices")
+          .delete()
+          .eq("project_id", projectId);
+
+        // Re-insert: cached rows + new rows
+        const allRows = [
+          ...[...sliceCache.entries()].map(([key, v]) => {
+            const colonIdx = key.indexOf(":");
+            const scene_id = key.slice(0, colonIdx);
+            const slice_index = Number(key.slice(colonIdx + 1));
+            return {
+              project_id: projectId,
+              scene_id,
+              slice_index,
+              clip_url: v.clip_url,
+              provider_clip_id: v.provider_clip_id,
+              duration_seconds: v.duration_seconds,
+            };
+          }),
+          ...newSliceRows,
+        ];
+
+        if (allRows.length > 0) {
+          await supabaseAdmin.from("render_clip_slices").insert(allRows);
+        }
+      }
     }
 
     // Signed audio URL.

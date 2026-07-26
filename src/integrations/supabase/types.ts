@@ -182,6 +182,54 @@ export type Database = {
         }
         Relationships: []
       }
+      render_clip_slices: {
+        Row: {
+          id: string
+          project_id: string
+          scene_id: string
+          slice_index: number
+          clip_url: string
+          provider_clip_id: string | null
+          duration_seconds: number
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          project_id: string
+          scene_id: string
+          slice_index: number
+          clip_url: string
+          provider_clip_id?: string | null
+          duration_seconds: number
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          project_id?: string
+          scene_id?: string
+          slice_index?: number
+          clip_url?: string
+          provider_clip_id?: string | null
+          duration_seconds?: number
+          created_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "render_clip_slices_project_id_fkey"
+            columns: ["project_id"]
+            isOneToOne: false
+            referencedRelation: "projects"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "render_clip_slices_scene_id_fkey"
+            columns: ["scene_id"]
+            isOneToOne: false
+            referencedRelation: "scenes"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       render_jobs: {
         Row: {
           chunks_completed: number | null
