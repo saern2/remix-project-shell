@@ -64,7 +64,9 @@ export const Route = createFileRoute("/_authenticated/dashboard")({
 function Dashboard() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const runDelete = useServerFn(deleteProject);
   const checkAdmin = useServerFn(amIAdmin);
+
 
   const { data: isAdmin } = useQuery({
     queryKey: ["am-i-admin"],
