@@ -184,34 +184,34 @@ export type Database = {
       }
       render_clip_slices: {
         Row: {
+          clip_url: string
+          created_at: string
+          duration_seconds: number
           id: string
           project_id: string
+          provider_clip_id: string | null
           scene_id: string
           slice_index: number
-          clip_url: string
-          provider_clip_id: string | null
-          duration_seconds: number
-          created_at: string
         }
         Insert: {
+          clip_url: string
+          created_at?: string
+          duration_seconds: number
           id?: string
           project_id: string
+          provider_clip_id?: string | null
           scene_id: string
           slice_index: number
-          clip_url: string
-          provider_clip_id?: string | null
-          duration_seconds: number
-          created_at?: string
         }
         Update: {
+          clip_url?: string
+          created_at?: string
+          duration_seconds?: number
           id?: string
           project_id?: string
+          provider_clip_id?: string | null
           scene_id?: string
           slice_index?: number
-          clip_url?: string
-          provider_clip_id?: string | null
-          duration_seconds?: number
-          created_at?: string
         }
         Relationships: [
           {
