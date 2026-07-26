@@ -139,7 +139,12 @@ function ProjectDetail() {
   });
   const clipSlicesQuery = useQuery({
     enabled: !!project && !!project.clip_duration_seconds,
-    queryKey: ["clip-slices", projectId],
+    // Include project.status in the key so slices are re-fetched when a new
+    // render completes (status: rendering -> completed) but NOT on every
+    // focus event or poll cycle. staleTime: Infinity prevents background
+    // refetches entirely — slices only change when submitRenderJob writes new
+    // rows, which always triggers a status transition that changes this key.
+    queryKey: ["clip-slices", projectId, project?.status],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("render_clip_slices")
@@ -151,6 +156,7 @@ function ProjectDetail() {
       if (error) throw error;
       return data ?? [];
     },
+    staleTime: Infinity,   // never auto-stale; key change (status transition) forces a new fetch
   });
 
   const clipsByScene = useMemo(() => {
