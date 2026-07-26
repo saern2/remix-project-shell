@@ -21,6 +21,8 @@
  */
 
 const express = require('express');
+const fsp = require('fs/promises');
+const path = require('path');
 const { Queue, Job } = require('bullmq');
 const config = require('./config');
 const logger = require('./logger');
@@ -252,10 +254,102 @@ app.use((err, _req, res, _next) => {
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
+/**
+ * sweepOrphanedTempDirs — scans config.tempDir for directories whose mtime
+ * is older than ORPHAN_AGE_MS and deletes them, logging bytes reclaimed.
+ *
+ * Any directory older than the threshold is guaranteed to be orphaned: no
+ * legitimate job runs for 6 hours without either completing (and cleaning up)
+ * or hitting its own hard timeout. This covers chunks that exhausted retries
+ * before the per-job finally block fixes landed, plus any future edge cases.
+ */
+const ORPHAN_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;  // 1 hour
+
+async function getDirSizeBytes(dirPath) {
+  let total = 0;
+  try {
+    const entries = await fsp.readdir(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        total += await getDirSizeBytes(full);
+      } else {
+        const stat = await fsp.stat(full).catch(() => null);
+        if (stat) total += stat.size;
+      }
+    }
+  } catch {
+    // dir may have been removed concurrently
+  }
+  return total;
+}
+
+async function sweepOrphanedTempDirs() {
+  const baseDir = config.tempDir;
+  let entries;
+  try {
+    entries = await fsp.readdir(baseDir, { withFileTypes: true });
+  } catch (err) {
+    logger.warn({ err: err.message, baseDir }, 'Temp sweep: cannot read tempDir');
+    return;
+  }
+
+  const now = Date.now();
+  let sweptCount = 0;
+  let sweptBytes = 0;
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const fullPath = path.join(baseDir, entry.name);
+    let stat;
+    try {
+      stat = await fsp.stat(fullPath);
+    } catch {
+      continue;
+    }
+    const ageMs = now - stat.mtimeMs;
+    if (ageMs < ORPHAN_AGE_MS) continue;
+
+    // Directory is old enough to be orphaned — measure then delete
+    const bytes = await getDirSizeBytes(fullPath);
+    try {
+      await fsp.rm(fullPath, { recursive: true, force: true });
+      sweptCount++;
+      sweptBytes += bytes;
+      logger.info({ dir: entry.name, bytes, ageSec: Math.round(ageMs / 1000) }, 'Temp sweep: removed orphaned dir');
+    } catch (err) {
+      logger.warn({ dir: entry.name, err: err.message }, 'Temp sweep: failed to remove dir');
+    }
+  }
+
+  if (sweptCount > 0) {
+    logger.info(
+      { sweptCount, sweptBytes, sweptMB: (sweptBytes / 1024 / 1024).toFixed(1) },
+      'Temp sweep complete',
+    );
+  } else {
+    logger.debug({ baseDir }, 'Temp sweep: no orphaned directories found');
+  }
+}
+
 async function main() {
   // Start the BullMQ worker in the same process (simple deployment)
   // For separate worker processes: run `node src/worker.js` instead
   startWorker();
+
+  // Sweep orphaned temp directories on startup, then every hour.
+  // This catches chunks that failed after exhausting retries and left their
+  // tempDir behind (the per-job finally block now handles this going forward,
+  // but this sweep handles any dirs left by prior runs or edge cases).
+  sweepOrphanedTempDirs().catch((err) =>
+    logger.warn({ err: err.message }, 'Startup temp sweep error'),
+  );
+  setInterval(() => {
+    sweepOrphanedTempDirs().catch((err) =>
+      logger.warn({ err: err.message }, 'Periodic temp sweep error'),
+    );
+  }, SWEEP_INTERVAL_MS);
 
   const server = app.listen(config.port, () => {
     logger.info({ port: config.port }, 'Render worker HTTP server listening');

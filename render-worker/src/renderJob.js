@@ -608,14 +608,39 @@ async function processRenderJob(job) {
     done.value = true;
     await cancelPollPromise;
 
-    // Always clean up temp files (unless it's a chunk, then stitch job cleans it up)
-    if (!payload.is_chunk) {
-      try {
+    // Temp directory cleanup for chunk and non-chunk jobs:
+    // - Non-chunk jobs: always delete the entire tempDir.
+    // - Chunk jobs on FAILURE: delete the entire tempDir immediately — the stitch
+    //   job will never run so nothing will clean this up otherwise (this was the
+    //   disk-growth bug: failed chunks left GBs of downloaded clips behind forever).
+    // - Chunk jobs on SUCCESS: leave only output.mp4 on disk for the stitch job to
+    //   concat; delete everything else (downloaded clips, filtergraph script) to
+    //   reclaim space while the stitch is in progress.
+    try {
+      if (!payload.is_chunk) {
+        // Non-chunk: clean everything
         await fsp.rm(tempDir, { recursive: true, force: true });
         logger.debug({ jobId, tempDir }, 'Temp directory cleaned up');
-      } catch (cleanupErr) {
-        logger.warn({ jobId, cleanupErr: cleanupErr.message }, 'Temp cleanup warning');
+      } else {
+        // Chunk: always clean up downloaded source clips and intermediate files
+        // to reclaim disk space. Keep output.mp4 only if the job succeeded
+        // (i.e. the tempDir still exists and output.mp4 is present).
+        const entries = await fsp.readdir(tempDir).catch(() => []);
+        for (const entry of entries) {
+          if (entry === 'output.mp4') continue; // stitch job needs this
+          await fsp.rm(path.join(tempDir, entry), { recursive: true, force: true }).catch(() => {});
+        }
+        // If the job failed, output.mp4 won't exist — delete the whole dir
+        const outputExists = await fsp.access(path.join(tempDir, 'output.mp4')).then(() => true).catch(() => false);
+        if (!outputExists) {
+          await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+          logger.debug({ jobId, tempDir }, 'Chunk temp directory cleaned up after failure');
+        } else {
+          logger.debug({ jobId, tempDir }, 'Chunk temp directory partially cleaned (output.mp4 kept for stitch)');
+        }
       }
+    } catch (cleanupErr) {
+      logger.warn({ jobId, cleanupErr: cleanupErr.message }, 'Temp cleanup warning');
     }
   }
 }
