@@ -341,11 +341,30 @@ export const pollRenderJob = createServerFn({ method: "POST" })
     if (projectUserId !== userId) throw new Error("Forbidden.");
 
     // Short-circuit terminal states.
+    // For completed jobs, always re-sign the playback URL from the known storage
+    // path rather than returning whatever is stored — the stored value may be a
+    // pre-signed upload URL (written by the worker) or an expired playback URL.
     if (job.status === "completed" || job.status === "failed") {
+      let outputUrl = job.output_url;
+      if (job.status === "completed") {
+        const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+        const storagePath = `${job.project_id}/${job.id}.mp4`;
+        const { data: signed } = await supabaseAdmin.storage
+          .from("render-outputs")
+          .createSignedUrl(storagePath, OUTPUT_PLAYBACK_TTL);
+        if (signed?.signedUrl) {
+          outputUrl = signed.signedUrl;
+          // Persist the fresh playback URL so subsequent page loads don't need to re-sign
+          await supabaseAdmin
+            .from("render_jobs")
+            .update({ output_url: outputUrl })
+            .eq("id", job.id);
+        }
+      }
       return {
         status: job.status,
         progress_pct: job.progress_pct,
-        output_url: job.output_url,
+        output_url: outputUrl,
         error: job.error,
         chunks_total: job.chunks_total ?? null,
         chunks_completed: job.chunks_completed ?? null,

@@ -307,6 +307,34 @@ function ProjectDetail() {
     };
   }, [renderJob?.id, renderJob?.status, projectId, queryClient, runPollRender]);
 
+  // One-shot poll for completed jobs whose stored output_url is missing or is a
+  // pre-signed upload URL (not a playback URL). This happens when:
+  //   (a) the page is loaded/refreshed after a render completes, or
+  //   (b) a re-render completes and the DB still has the upload URL from the worker.
+  // pollRenderJob's short-circuit path for completed jobs now re-signs the URL,
+  // so a single call here is enough to get a fresh playback URL into the cache.
+  useEffect(() => {
+    if (!renderJob) return;
+    if (renderJob.status !== "completed") return;
+    const needsResign =
+      !renderJob.output_url ||
+      renderJob.output_url.includes("/upload/sign/");
+    if (!needsResign) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await runPollRender({ data: { jobId: renderJob.id } });
+        if (!cancelled) {
+          queryClient.invalidateQueries({ queryKey: ["render-job", projectId] });
+        }
+      } catch {
+        // Silently ignore — worst case the video element shows no src
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [renderJob?.id, renderJob?.output_url, renderJob?.status, projectId, queryClient, runPollRender]);
+
 
 
 
