@@ -246,69 +246,184 @@ export const deactivatePexelsKey = createServerFn({ method: "POST" })
 type UploadRow = {
   line: number;
   masked: string;
-  status: "inserted" | "invalid" | "duplicate" | "error";
+  status: "valid" | "inserted" | "invalid" | "duplicate" | "error";
   detail?: string;
 };
 
 /**
- * Upload a CSV of Pexels keys (one key per line, or "key,note").
- * Each key gets ONE live test call against Pexels before insertion.
+ * Parse a CSV/text blob of Pexels API keys.
+ * Accepts any combination of newlines and commas as delimiters.
+ * Returns deduplicated, trimmed, non-header tokens.
  */
-export const uploadPexelsKeys = createServerFn({ method: "POST" })
+function parsePexelsKeyCsv(csv: string): string[] {
+  const HEADER_TOKENS = new Set(["api_key", "key", "apikey", "pexels_key"]);
+  const tokens = csv
+    .split(/[\r\n,]+/)           // split on any combo of newlines and commas
+    .map((t) => t.trim().replace(/^["']|["']$/g, ""))  // strip quotes
+    .filter((t) => t.length > 0 && !HEADER_TOKENS.has(t.toLowerCase()));
+  // Dedupe within the incoming list
+  return [...new Set(tokens)];
+}
+
+/**
+ * Preview-parse a CSV of Pexels keys without hitting the Pexels API.
+ * Returns the list of parsed keys so the admin can confirm the parser
+ * read the file correctly before committing.
+ */
+export const previewPexelsKeys = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => z.object({ csv: z.string().min(1).max(200_000) }).parse(input))
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    const rows = data.csv
-      .split(/\r?\n/)
-      .map((line, i) => ({ line: i + 1, raw: line.trim() }))
-      .filter((r) => r.raw.length > 0)
-      .map((r) => ({ line: r.line, key: r.raw.split(",")[0].trim().replace(/^["']|["']$/g, "") }))
-      .filter((r) => r.key.length > 0 && r.key.toLowerCase() !== "api_key" && r.key.toLowerCase() !== "key");
+    const parsed = parsePexelsKeyCsv(data.csv);
 
+    // Load existing keys to identify duplicates in the preview
+    const { data: existing } = await supabaseAdmin
+      .from("pexels_api_keys")
+      .select("api_key");
+    const existingSet = new Set((existing ?? []).map((k) => k.api_key));
+
+    const preview = parsed.map((key, i) => ({
+      index: i + 1,
+      masked: maskKey(key),
+      isDuplicate: existingSet.has(key),
+    }));
+
+    return {
+      parsedCount: parsed.length,
+      duplicateCount: preview.filter((p) => p.isDuplicate).length,
+      preview,
+    };
+  });
+
+/**
+ * Upload a batch of Pexels keys with safe replace-on-upload behavior:
+ *
+ * 1. Parse robustly (newline + comma delimiters, dedupe, strip headers/quotes).
+ * 2. Skip keys already in the DB (deduplication).
+ * 3. Validate every new key with a real Pexels API call.
+ * 4. Count passing keys. If >= safetyThreshold:
+ *    - Mark all currently-active keys is_active=false (audit rows kept)
+ *    - Insert and activate all passing keys
+ * 5. If < safetyThreshold: do NOT touch old keys. Return a warning.
+ *
+ * The safetyThreshold is passed by the caller (shown to the admin in the UI
+ * before they confirm, defaulting to 5).
+ */
+export const uploadPexelsKeys = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({
+      csv: z.string().min(1).max(200_000),
+      safetyThreshold: z.number().int().min(1).max(100).default(5),
+    }).parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // ── Step 1: Parse ──────────────────────────────────────────────────────
+    const parsed = parsePexelsKeyCsv(data.csv);
+
+    // ── Step 2: Deduplicate against existing DB keys ───────────────────────
+    const { data: existing } = await supabaseAdmin
+      .from("pexels_api_keys")
+      .select("api_key");
+    const existingSet = new Set((existing ?? []).map((k) => k.api_key));
+    const newKeys = parsed.filter((k) => !existingSet.has(k));
+    const duplicateKeys = parsed.filter((k) => existingSet.has(k));
+
+    // ── Step 3: Validate every new key against the live Pexels API ─────────
     const results: UploadRow[] = [];
+    const validKeys: string[] = [];
 
-    for (const row of rows) {
-      const masked = maskKey(row.key);
-      // 1. Live test call.
+    for (let i = 0; i < newKeys.length; i++) {
+      const key = newKeys[i];
+      const masked = maskKey(key);
       let ok = false;
       let detail = "";
       try {
         const res = await fetch("https://api.pexels.com/videos/search?query=nature&per_page=1", {
-          headers: { authorization: row.key },
+          headers: { authorization: key },
         });
         ok = res.ok;
         if (!ok) detail = `Pexels responded HTTP ${res.status}`;
       } catch (e) {
         detail = e instanceof Error ? e.message : "Network error";
       }
-      if (!ok) {
-        results.push({ line: row.line, masked, status: "invalid", detail });
-        continue;
+      if (ok) {
+        validKeys.push(key);
+        results.push({ line: i + 1, masked, status: "valid" });
+      } else {
+        results.push({ line: i + 1, masked, status: "invalid", detail });
       }
+    }
 
-      // 2. Insert; unique constraint surfaces duplicates.
+    // Report duplicates in the results
+    for (const key of duplicateKeys) {
+      results.push({ line: -1, masked: maskKey(key), status: "duplicate", detail: "Key already in pool" });
+    }
+
+    const validCount = validKeys.length;
+    const threshold = data.safetyThreshold;
+
+    // ── Step 4: Safety check before replacing old pool ─────────────────────
+    if (validCount < threshold) {
+      // Below threshold — do NOT touch old keys
+      return {
+        committed: false,
+        safetyThresholdMet: false,
+        validCount,
+        threshold,
+        warning: `Only ${validCount} of ${newKeys.length} new keys passed validation (threshold: ${threshold}). Old pool unchanged.`,
+        total: parsed.length,
+        inserted: 0,
+        invalid: results.filter((r) => r.status === "invalid").length,
+        duplicates: duplicateKeys.length,
+        errors: 0,
+        results,
+      };
+    }
+
+    // ── Step 5: Deactivate old active keys (keep rows for audit) ───────────
+    const { error: deactivateErr } = await supabaseAdmin
+      .from("pexels_api_keys")
+      .update({
+        is_active: false,
+        last_error: "Replaced by new upload batch",
+        last_error_at: new Date().toISOString(),
+      })
+      .eq("is_active", true);
+    if (deactivateErr) throw new Error(`Failed to deactivate old keys: ${deactivateErr.message}`);
+
+    // ── Step 6: Insert all valid new keys as active ────────────────────────
+    let insertedCount = 0;
+    for (const key of validKeys) {
       const { error } = await supabaseAdmin
         .from("pexels_api_keys")
-        .insert({ api_key: row.key, is_active: true });
+        .insert({ api_key: key, is_active: true });
       if (error) {
-        if (error.code === "23505") {
-          results.push({ line: row.line, masked, status: "duplicate", detail: "Key already in pool" });
-        } else {
-          results.push({ line: row.line, masked, status: "error", detail: error.message });
-        }
-        continue;
+        const idx = results.findIndex((r) => r.masked === maskKey(key) && r.status === "valid");
+        if (idx >= 0) results[idx] = { ...results[idx], status: "error", detail: error.message };
+      } else {
+        const idx = results.findIndex((r) => r.masked === maskKey(key) && r.status === "valid");
+        if (idx >= 0) results[idx] = { ...results[idx], status: "inserted" };
+        insertedCount++;
       }
-      results.push({ line: row.line, masked, status: "inserted" });
     }
 
     return {
-      total: rows.length,
-      inserted: results.filter((r) => r.status === "inserted").length,
+      committed: true,
+      safetyThresholdMet: true,
+      validCount,
+      threshold,
+      warning: null,
+      total: parsed.length,
+      inserted: insertedCount,
       invalid: results.filter((r) => r.status === "invalid").length,
-      duplicates: results.filter((r) => r.status === "duplicate").length,
+      duplicates: duplicateKeys.length,
       errors: results.filter((r) => r.status === "error").length,
       results,
     };

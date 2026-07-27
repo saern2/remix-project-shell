@@ -7,6 +7,7 @@ import {
   getAdminOverview,
   listAdminUsers,
   listPexelsKeys,
+  previewPexelsKeys,
   setUserApprovalStatus,
   setUserPlanTier,
   setUserRole,
@@ -454,8 +455,17 @@ function UsersTab() {
 function KeysTab() {
   const qc = useQueryClient();
   const fetchKeys = useServerFn(listPexelsKeys);
+  const preview = useServerFn(previewPexelsKeys);
   const upload = useServerFn(uploadPexelsKeys);
   const deactivate = useServerFn(deactivatePexelsKey);
+
+  // Phase 1: preview state
+  const [pendingCsv, setPendingCsv] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewResult, setPreviewResult] = useState<Awaited<ReturnType<typeof preview>> | null>(null);
+  const [safetyThreshold, setSafetyThreshold] = useState(5);
+
+  // Phase 2: upload state
   const [uploading, setUploading] = useState(false);
   const [report, setReport] = useState<Awaited<ReturnType<typeof upload>> | null>(null);
 
@@ -465,17 +475,38 @@ function KeysTab() {
   });
 
   async function handleFile(file: File) {
-    setUploading(true);
+    setPreviewing(true);
+    setPreviewResult(null);
     setReport(null);
     try {
       const csv = await file.text();
-      const res = await upload({ data: { csv } });
+      setPendingCsv(csv);
+      const res = await preview({ data: { csv } });
+      setPreviewResult(res);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Preview failed");
+      setPendingCsv(null);
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
+  async function handleCommit() {
+    if (!pendingCsv) return;
+    setUploading(true);
+    setReport(null);
+    try {
+      const res = await upload({ data: { csv: pendingCsv, safetyThreshold } });
       setReport(res);
+      setPreviewResult(null);
+      setPendingCsv(null);
       await qc.invalidateQueries({ queryKey: ["admin-pexels-keys"] });
       await qc.invalidateQueries({ queryKey: ["admin-overview"] });
-      toast.success(
-        `${res.inserted} added, ${res.invalid} invalid, ${res.duplicates} duplicates, ${res.errors} errors`,
-      );
+      if (res.committed) {
+        toast.success(`${res.inserted} keys added, old pool deactivated`);
+      } else {
+        toast.warning(res.warning ?? "Upload did not meet safety threshold");
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Upload failed");
     } finally {
@@ -489,51 +520,150 @@ function KeysTab() {
         <CardHeader>
           <CardTitle className="text-base">Upload keys (CSV)</CardTitle>
           <CardDescription>
-            One key per line, or <code>key,note</code>. Each key is tested against Pexels before it is added.
+            Accepts newline-separated, comma-separated, or mixed format. Each key is tested
+            against the live Pexels API. Old active keys are only deactivated if the new batch
+            meets the safety threshold.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm">
-            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-            {uploading ? "Validating keys…" : "Choose CSV file"}
-            <input
-              type="file"
-              accept=".csv,text/csv,text/plain"
-              className="hidden"
-              disabled={uploading}
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                e.target.value = "";
-                if (f) void handleFile(f);
-              }}
-            />
-          </label>
+          <div className="flex flex-wrap items-center gap-4">
+            <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm">
+              {previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+              {previewing ? "Parsing…" : "Choose CSV file"}
+              <input
+                type="file"
+                accept=".csv,text/csv,text/plain"
+                className="hidden"
+                disabled={previewing || uploading}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (f) void handleFile(f);
+                }}
+              />
+            </label>
+            <div className="flex items-center gap-2 text-sm">
+              <label htmlFor="threshold" className="text-muted-foreground whitespace-nowrap">
+                Safety threshold (min valid keys before replacing pool):
+              </label>
+              <input
+                id="threshold"
+                type="number"
+                min={1}
+                max={100}
+                value={safetyThreshold}
+                onChange={(e) => setSafetyThreshold(Math.max(1, parseInt(e.target.value) || 1))}
+                className="w-16 rounded-md border px-2 py-1 text-sm"
+                disabled={uploading}
+              />
+            </div>
+          </div>
 
+          {/* Phase 1: Parse preview — admin confirms before committing */}
+          {previewResult && !report && (
+            <div className="space-y-3 rounded-md border p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-medium">
+                  Parsed {previewResult.parsedCount} key{previewResult.parsedCount !== 1 ? "s" : ""}
+                  {previewResult.duplicateCount > 0 && (
+                    <span className="ml-2 text-muted-foreground">
+                      ({previewResult.duplicateCount} already in pool — will be skipped)
+                    </span>
+                  )}
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => { setPreviewResult(null); setPendingCsv(null); }}
+                    disabled={uploading}
+                  >
+                    Cancel
+                  </Button>
+                  <Button size="sm" onClick={handleCommit} disabled={uploading}>
+                    {uploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                    Validate &amp; upload (threshold: {safetyThreshold})
+                  </Button>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                If ≥ {safetyThreshold} key{safetyThreshold !== 1 ? "s" : ""} pass Pexels validation,
+                all currently-active keys will be deactivated and the new ones activated.
+                If fewer pass, the old pool stays untouched.
+              </p>
+              <div className="max-h-48 overflow-y-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>#</TableHead>
+                      <TableHead>Key (masked)</TableHead>
+                      <TableHead>Status</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {previewResult.preview.map((p) => (
+                      <TableRow key={p.index}>
+                        <TableCell>{p.index}</TableCell>
+                        <TableCell className="font-mono">{p.masked}</TableCell>
+                        <TableCell>
+                          {p.isDuplicate
+                            ? <Badge variant="secondary">duplicate</Badge>
+                            : <Badge variant="default">new</Badge>}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+          )}
+
+          {/* Phase 2: Upload result */}
           {report && (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Line</TableHead>
-                  <TableHead>Key</TableHead>
-                  <TableHead>Result</TableHead>
-                  <TableHead>Detail</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {report.results.map((r) => (
-                  <TableRow key={`${r.line}-${r.masked}`}>
-                    <TableCell>{r.line}</TableCell>
-                    <TableCell className="font-mono">{r.masked}</TableCell>
-                    <TableCell>
-                      <Badge variant={r.status === "inserted" ? "default" : r.status === "duplicate" ? "secondary" : "destructive"}>
-                        {r.status}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">{r.detail ?? "—"}</TableCell>
+            <div className="space-y-3 rounded-md border p-4">
+              {report.committed ? (
+                <div className="flex items-center gap-2 text-sm font-medium text-green-600">
+                  ✓ Pool replaced: {report.inserted} keys activated, old keys deactivated
+                </div>
+              ) : (
+                <div className="rounded-md bg-amber-50 p-3 text-sm text-amber-800 border border-amber-200">
+                  ⚠ {report.warning}
+                </div>
+              )}
+              <div className="flex gap-4 text-sm text-muted-foreground">
+                <span>Valid: {report.validCount}</span>
+                <span>Invalid: {report.invalid}</span>
+                <span>Duplicates: {report.duplicates}</span>
+                {report.errors > 0 && <span className="text-destructive">Errors: {report.errors}</span>}
+              </div>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Key</TableHead>
+                    <TableHead>Result</TableHead>
+                    <TableHead>Detail</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {report.results.map((r, i) => (
+                    <TableRow key={i}>
+                      <TableCell className="font-mono">{r.masked}</TableCell>
+                      <TableCell>
+                        <Badge variant={
+                          r.status === "inserted" ? "default"
+                          : r.status === "valid" ? "default"
+                          : r.status === "duplicate" ? "secondary"
+                          : "destructive"
+                        }>
+                          {r.status}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">{r.detail ?? "—"}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
           )}
         </CardContent>
       </Card>
