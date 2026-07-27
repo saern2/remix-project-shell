@@ -38,9 +38,7 @@ async function assertNotPrimaryAdmin(targetUserId: string) {
 export const amIAdmin = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
-    const { data, error } = await context.supabase.rpc("is_admin", { _user_id: context.userId });
-    if (error) throw new Error(error.message);
-    return { isAdmin: !!data };
+    return { isAdmin: await isCallerAdmin(context) };
   });
 
 export const getAdminOverview = createServerFn({ method: "GET" })
