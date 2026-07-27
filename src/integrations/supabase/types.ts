@@ -496,6 +496,7 @@ export type Database = {
           created_at: string
           email: string
           id: string
+          is_primary_admin: boolean
           plan_tier: string
           role: string
         }
@@ -504,6 +505,7 @@ export type Database = {
           created_at?: string
           email: string
           id: string
+          is_primary_admin?: boolean
           plan_tier?: string
           role?: string
         }
@@ -512,6 +514,7 @@ export type Database = {
           created_at?: string
           email?: string
           id?: string
+          is_primary_admin?: boolean
           plan_tier?: string
           role?: string
         }
