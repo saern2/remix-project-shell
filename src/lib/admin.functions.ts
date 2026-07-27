@@ -2,10 +2,19 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-async function assertAdmin(context: { supabase: any; userId: string }) {
-  const { data, error } = await context.supabase.rpc("is_admin", { _user_id: context.userId });
+/** Reads the caller's own role row through their RLS-scoped client (own-profile policy). */
+async function isCallerAdmin(context: { supabase: any; userId: string }) {
+  const { data, error } = await context.supabase
+    .from("users")
+    .select("role")
+    .eq("id", context.userId)
+    .maybeSingle();
   if (error) throw new Error(error.message);
-  if (!data) throw new Error("Forbidden.");
+  return data?.role === "admin";
+}
+
+async function assertAdmin(context: { supabase: any; userId: string }) {
+  if (!(await isCallerAdmin(context))) throw new Error("Forbidden.");
 }
 
 /**
