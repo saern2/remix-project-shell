@@ -270,6 +270,7 @@ function ProjectDetail() {
 
   const handleRender = async () => {
     setSubmittingRender(true);
+    setFootageRegenerated(false); // clear the "footage updated" cue on render
     try {
       await runSubmitRender({ data: { projectId } });
       await Promise.all([
@@ -285,22 +286,22 @@ function ProjectDetail() {
 
   const runRegenerateRender = useServerFn(regenerateAndRenderJob);
   const [regenerating, setRegenerating] = useState(false);
+  // footageRegenerated tracks whether slices were just refreshed — lets us
+  // show a "footage updated" cue so the user knows to review before rendering.
+  const [footageRegenerated, setFootageRegenerated] = useState(false);
 
-  const handleRegenerateAndRender = async () => {
+  const handleRegenerateFootage = async () => {
     setRegenerating(true);
+    setFootageRegenerated(false);
     try {
-      // Step 1: bust the slice cache (deletes render_clip_slices for this project)
+      // Step 1: bust the slice cache (deletes render_clip_slices, runs fresh
+      // stock footage search, writes new slice rows server-side)
       await runRegenerateRender({ data: { projectId } });
-      // Step 2: invalidate the clip-slices cache in React Query so the Timeline
-      // shows a loading state while the new render is being prepared
+      // Step 2: invalidate clip-slices cache so the Timeline re-fetches and
+      // shows the newly chosen clips — user reviews before deciding to render
       await queryClient.invalidateQueries({ queryKey: ["clip-slices", projectId] });
-      // Step 3: submit a fresh render job — submitRenderJob will find no cached
-      // slices and run fresh stock footage searches for every slot
-      await runSubmitRender({ data: { projectId } });
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
-        queryClient.invalidateQueries({ queryKey: ["render-job", projectId] }),
-      ]);
+      setFootageRegenerated(true);
+      // No render job is submitted here. The user explicitly clicks Render video.
     } catch (err) {
       toast.error((err as Error).message);
     } finally {
@@ -600,8 +601,8 @@ function ProjectDetail() {
                   <div className="flex items-center justify-between gap-4">
                     <CardTitle className="text-base">Final video</CardTitle>
                     {isReady && (!renderJob || !RENDER_ACTIVE.has(renderJob.status)) ? (
-                      <div className="flex items-center gap-2">
-                        {/* Re-render: reuses cached footage — fast recovery for failed renders */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        {/* Render video / Re-render: encodes current footage as-is */}
                         <Button size="sm" onClick={handleRender} disabled={submittingRender || regenerating} variant="outline">
                           {submittingRender ? (
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -610,17 +611,24 @@ function ProjectDetail() {
                           )}
                           {renderJob?.status === "completed" ? "Re-render" : "Render video"}
                         </Button>
-                        {/* Regenerate footage: only shown for fixed-duration projects.
-                            Busts the clip cache and searches for entirely new footage. */}
+                        {/* Regenerate footage: fixed-duration projects only.
+                            Deletes slice cache, runs fresh search, updates Timeline.
+                            Does NOT submit a render job — user reviews first. */}
                         {project.clip_duration_seconds ? (
-                          <Button size="sm" onClick={handleRegenerateAndRender} disabled={submittingRender || regenerating}>
+                          <Button size="sm" onClick={handleRegenerateFootage} disabled={submittingRender || regenerating} variant="outline">
                             {regenerating ? (
                               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                             ) : (
                               <Sparkles className="mr-2 h-4 w-4" />
                             )}
-                            Regenerate footage
+                            {regenerating ? "Finding footage…" : "Regenerate footage"}
                           </Button>
+                        ) : null}
+                        {/* Feedback cue after regeneration completes */}
+                        {footageRegenerated && !regenerating ? (
+                          <span className="text-xs text-muted-foreground">
+                            ✓ Footage updated — review the Timeline, then click Render video.
+                          </span>
                         ) : null}
                       </div>
                     ) : null}
