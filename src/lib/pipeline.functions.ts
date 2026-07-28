@@ -327,7 +327,7 @@ async function advanceFromMatchingFootage(projectId: string) {
   try {
     const { data: project, error: pErr } = await supabaseAdmin
       .from("projects")
-      .select("id, aspect_ratio")
+      .select("id, aspect_ratio, clip_duration_seconds")
       .eq("id", projectId)
       .single();
     if (pErr || !project) throw new Error(pErr?.message ?? "Project not found.");
@@ -343,6 +343,176 @@ async function advanceFromMatchingFootage(projectId: string) {
       return { status: "ready", error_message: null };
     }
 
+    const { searchStockFootage, orientationForAspect, targetWidthForAspect } = await import(
+      "@/lib/stock.server"
+    );
+    const orientation = orientationForAspect(project.aspect_ratio);
+    const targetWidth = targetWidthForAspect(project.aspect_ratio);
+
+    const fixedDuration = project.clip_duration_seconds != null
+      ? Number(project.clip_duration_seconds)
+      : null;
+
+    if (fixedDuration != null && fixedDuration > 0) {
+      // ── Fixed-duration path ───────────────────────────────────────────────
+      // Run the slot-slicing search loop and write directly into
+      // render_clip_slices so the Timeline shows the real render footage
+      // from the moment matching_footage completes — no second search at
+      // render-submission time.
+
+      // Load any existing slices (idempotent re-runs).
+      const { data: existingSlices } = await supabaseAdmin
+        .from("render_clip_slices")
+        .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
+        .eq("project_id", projectId);
+
+      const sliceCache = new Map<string, { clip_url: string; provider_clip_id: string | null }>();
+      for (const row of existingSlices ?? []) {
+        sliceCache.set(`${row.scene_id}:${row.slice_index}`, {
+          clip_url: row.clip_url,
+          provider_clip_id: row.provider_clip_id ?? null,
+        });
+      }
+
+      // Seed dedup set from existing slices.
+      const usedIds = new Set<string>(
+        (existingSlices ?? [])
+          .map((r) => r.provider_clip_id)
+          .filter((x): x is string => !!x),
+      );
+
+      const newSliceRows: Array<{
+        project_id: string;
+        scene_id: string;
+        slice_index: number;
+        clip_url: string;
+        provider_clip_id: string | null;
+        duration_seconds: number;
+      }> = [];
+
+      for (const scene of scenes) {
+        const sceneStart = Number(scene.start_ts ?? 0);
+        const sceneEnd = Number(scene.end_ts ?? 0);
+        const total = Math.max(0, sceneEnd - sceneStart);
+        if (total <= 0) continue;
+
+        const slots = Math.max(1, Math.ceil(total / fixedDuration));
+
+        for (let slotIdx = 0; slotIdx < slots; slotIdx++) {
+          const cacheKey = `${scene.id}:${slotIdx}`;
+          if (sliceCache.has(cacheKey)) continue; // already matched
+
+          let url: string | null = null;
+          let providerClipId: string | null = null;
+
+          if (scene.visual_query) {
+            const result = await searchStockFootage({
+              query: scene.visual_query,
+              orientation,
+              minDurationSec: fixedDuration,
+              targetWidth,
+              usedIds: [...usedIds],
+            });
+            if (result) {
+              url = result.chosenFile.url;
+              providerClipId = result.pick.provider_clip_id;
+              usedIds.add(result.pick.provider_clip_id);
+            }
+          }
+
+          // Fallback: if no clip found, leave this slot empty for now.
+          // submitRenderJob will fill it from selected_clips if needed.
+          if (url) {
+            newSliceRows.push({
+              project_id: projectId,
+              scene_id: scene.id,
+              slice_index: slotIdx,
+              clip_url: url,
+              provider_clip_id: providerClipId,
+              duration_seconds: fixedDuration,
+            });
+          }
+        }
+
+        // Also write a generic selected_clip for this scene so the scenes
+        // table stays consistent (some UI paths read selected_clips).
+        const alreadyHasClip = (existingSlices ?? []).some((r) => r.scene_id === scene.id);
+        if (!alreadyHasClip && newSliceRows.some((r) => r.scene_id === scene.id)) {
+          const firstSlot = newSliceRows.find((r) => r.scene_id === scene.id);
+          if (firstSlot) {
+            // Insert clip_candidate + selected_clip for UI consistency.
+            const { data: candidate } = await supabaseAdmin
+              .from("clip_candidates")
+              .insert({
+                scene_id: scene.id,
+                provider: "pexels",
+                provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
+                url: firstSlot.clip_url,
+                thumbnail_url: null,
+                width: targetWidth,
+                height: Math.round(targetWidth * (orientation === "portrait" ? 16 / 9 : 9 / 16)),
+                duration_sec: fixedDuration,
+              })
+              .select("id")
+              .maybeSingle();
+            if (candidate?.id) {
+              const sceneDuration = Number(scene.end_ts) - Number(scene.start_ts);
+              await supabaseAdmin.from("selected_clips").upsert(
+                {
+                  scene_id: scene.id,
+                  clip_candidate_id: candidate.id,
+                  in_point: 0,
+                  out_point: Math.min(fixedDuration, Math.max(sceneDuration, 1)),
+                },
+                { onConflict: "scene_id" },
+              );
+              await supabaseAdmin
+                .from("scenes")
+                .update({ status: "selected" })
+                .eq("id", scene.id);
+            }
+          }
+        }
+      }
+
+      // Persist new slice rows.
+      if (newSliceRows.length > 0) {
+        // Delete old slices for this project and re-insert the full set.
+        await supabaseAdmin
+          .from("render_clip_slices")
+          .delete()
+          .eq("project_id", projectId);
+
+        const allRows = [
+          ...[...sliceCache.entries()].map(([key, v]) => {
+            const colonIdx = key.indexOf(":");
+            const scene_id = key.slice(0, colonIdx);
+            const slice_index = Number(key.slice(colonIdx + 1));
+            return {
+              project_id: projectId,
+              scene_id,
+              slice_index,
+              clip_url: v.clip_url,
+              provider_clip_id: v.provider_clip_id,
+              duration_seconds: fixedDuration,
+            };
+          }),
+          ...newSliceRows,
+        ];
+
+        if (allRows.length > 0) {
+          await supabaseAdmin.from("render_clip_slices").insert(allRows);
+        }
+      }
+
+      await supabaseAdmin
+        .from("projects")
+        .update({ status: "ready", error_message: null })
+        .eq("id", projectId);
+      return { status: "ready", error_message: null };
+    }
+
+    // ── Plain path (no fixed duration) — unchanged ────────────────────────
     // Existing selections (idempotent re-runs). Skip scenes already selected.
     const { data: existingSel } = await supabaseAdmin
       .from("selected_clips")
@@ -352,12 +522,6 @@ async function advanceFromMatchingFootage(projectId: string) {
     const usedIds: string[] = (existingSel ?? [])
       .map((r) => (r as { clip_candidates: { provider_clip_id: string } | null }).clip_candidates?.provider_clip_id)
       .filter((x): x is string => !!x);
-
-    const { searchStockFootage, orientationForAspect, targetWidthForAspect } = await import(
-      "@/lib/stock.server"
-    );
-    const orientation = orientationForAspect(project.aspect_ratio);
-    const targetWidth = targetWidthForAspect(project.aspect_ratio);
 
     const CONCURRENCY = 5;
     const pending = scenes.filter((s) => !alreadySelected.has(s.id));
@@ -420,13 +584,10 @@ async function advanceFromMatchingFootage(projectId: string) {
       usedIds.push(pick.provider_clip_id);
     }
 
-    // Process all remaining scenes in this single call, with limited
-    // concurrency so a 50-scene project finishes in seconds, not minutes.
     for (let i = 0; i < pending.length; i += CONCURRENCY) {
       const batch = pending.slice(i, i + CONCURRENCY);
       await Promise.all(batch.map((s) => processScene(s)));
     }
-
 
     await supabaseAdmin
       .from("projects")
@@ -435,6 +596,7 @@ async function advanceFromMatchingFootage(projectId: string) {
     return { status: "ready", error_message: null };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Stock footage matching failed.";
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     await supabaseAdmin
       .from("projects")
       .update({ status: "failed", error_message: message })
