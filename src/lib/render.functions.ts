@@ -470,61 +470,6 @@ void OUTPUT_UPLOAD_TTL;
 const ACTIVE_RENDER_STATUSES = ["queued", "downloading", "rendering", "stitching", "uploading"] as const;
 
 /**
- * Regenerate footage for a project: deletes all cached render_clip_slices so
- * the next submitRenderJob call searches for entirely fresh footage, then
- * immediately submits a new render job.
- *
- * Only meaningful for projects with clip_duration_seconds set (fixed-duration
- * path). For those projects, submitRenderJob always reuses the slice cache when
- * unchanged — this function busts that cache so every slot gets a new clip.
- *
- * The existing "Re-render" button (submitRenderJob) is unchanged: it continues
- * to reuse cached slices for failure recovery without re-burning API quota.
- */
-export const regenerateAndRenderJob = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => ProjectIdInput.parse(input))
-  .handler(async ({ data, context }) => {
-    const { supabase, userId } = context;
-    const projectId = data.projectId;
-
-    // Verify ownership and project state
-    const { data: project, error: projErr } = await supabase
-      .from("projects")
-      .select("id, status, user_id, clip_duration_seconds")
-      .eq("id", projectId)
-      .maybeSingle();
-    if (projErr) throw new Error(projErr.message);
-    if (!project) throw new Error("Project not found.");
-    if (project.user_id !== userId) throw new Error("Forbidden.");
-    if (!["ready", "failed", "completed"].includes(project.status)) {
-      throw new Error(`Project is not ready to render (status: ${project.status}).`);
-    }
-    if (!project.clip_duration_seconds) {
-      throw new Error(
-        "Regenerate footage is only available for projects with a fixed clip duration. " +
-        "Use Re-render to resubmit with the existing footage selection."
-      );
-    }
-
-    // Bust the slice cache — delete all render_clip_slices rows for this project.
-    // submitRenderJob will find no cached rows and run fresh stock footage searches
-    // for every slot, then persist the new assignments.
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error: deleteErr } = await supabaseAdmin
-      .from("render_clip_slices")
-      .delete()
-      .eq("project_id", projectId);
-    if (deleteErr) throw new Error(`Failed to clear slice cache: ${deleteErr.message}`);
-
-    // submitRenderJob is a server function and cannot be called directly from here.
-    // Re-implement the submit logic inline by delegating: mark project ready so
-    // submitRenderJob's status guard passes, then the client calls submitRenderJob.
-    // Actually we just return ok — the UI calls submitRenderJob immediately after.
-    return { ok: true as const, projectId };
-  });
-
-/**
  * Cancel a queued or active render job.
  * - Verifies ownership via render_jobs → projects join
  * - Calls POST /jobs/:id/cancel on the render worker

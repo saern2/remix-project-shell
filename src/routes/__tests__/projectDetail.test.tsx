@@ -44,7 +44,6 @@ vi.mock("@/lib/render.functions", () => ({
   cancelRenderJob: mockCancelRenderJobFn,
   submitRenderJob: vi.fn(),
   pollRenderJob: vi.fn(),
-  regenerateAndRenderJob: vi.fn(),
 }));
 
 vi.mock("@/lib/deleteProject", () => ({

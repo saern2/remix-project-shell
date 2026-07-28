@@ -4,7 +4,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
-import { submitRenderJob, pollRenderJob, cancelRenderJob, regenerateAndRenderJob } from "@/lib/render.functions";
+import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,7 +21,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2, X, Trash2, Sparkles } from "lucide-react";
+import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2, X, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/projects/$projectId")({
@@ -121,17 +121,16 @@ function ProjectDetail() {
     enabled: !!project && (isReady || project.status === "matching_footage"),
     queryKey: ["selected-clips", projectId],
     queryFn: async () => {
+      // Single query: join selected_clips → scenes (via scene_id FK) → clip_candidates.
+      // This avoids the previous two-step pattern (fetch scene IDs first, then
+      // fetch selected_clips with an IN filter) which caused a serial round-trip
+      // and made the Timeline appear late.
       const { data, error } = await supabase
         .from("selected_clips")
         .select(
-          "scene_id, in_point, out_point, clip_candidates!inner(id, url, thumbnail_url, duration_sec, provider, provider_clip_id)",
+          "scene_id, in_point, out_point, clip_candidates!inner(id, url, thumbnail_url, duration_sec, provider, provider_clip_id), scenes!inner(project_id)",
         )
-        .in(
-          "scene_id",
-          (
-            await supabase.from("scenes").select("id").eq("project_id", projectId)
-          ).data?.map((s) => s.id) ?? [],
-        );
+        .eq("scenes.project_id", projectId);
       if (error) throw error;
       return data ?? [];
     },
@@ -193,6 +192,39 @@ function ProjectDetail() {
       return a.slice_index - b.slice_index;
     });
   }, [clipSlicesQuery.data, scenesQuery.data]);
+
+  // Compute per-scene video timestamps by accumulating slice durations in scene
+  // order. Each entry is { videoStart, videoEnd } in seconds from video position 0.
+  // Only populated when the fixed-duration path is active (clip_duration_seconds set
+  // and slices loaded). In the default (scene-based) path this map stays empty and
+  // the Transcript panel shows only narration timestamps.
+  const sceneVideoTimestamps = useMemo((): Map<string, { videoStart: number; videoEnd: number }> => {
+    const map = new Map<string, { videoStart: number; videoEnd: number }>();
+    if (!project?.clip_duration_seconds || sortedClipSlices.length === 0) return map;
+
+    // Group total duration per scene_id, preserving scene order from sortedClipSlices.
+    // sortedClipSlices is already ordered by (sceneIdx, sliceIndex), so we can walk it
+    // once and accumulate in the order slices appear.
+    const seenOrder: string[] = [];   // scene_id insertion order
+    const durationByScene = new Map<string, number>();
+    for (const slice of sortedClipSlices) {
+      const sid = slice.scene_id;
+      if (!durationByScene.has(sid)) {
+        seenOrder.push(sid);
+        durationByScene.set(sid, 0);
+      }
+      durationByScene.set(sid, (durationByScene.get(sid) ?? 0) + Number(slice.duration_seconds));
+    }
+
+    // Walk scenes in order and accumulate cumulative video position.
+    let cursor = 0;
+    for (const sid of seenOrder) {
+      const dur = durationByScene.get(sid) ?? 0;
+      map.set(sid, { videoStart: cursor, videoEnd: cursor + dur });
+      cursor += dur;
+    }
+    return map;
+  }, [sortedClipSlices, project?.clip_duration_seconds]);
 
   const runSwap = useServerFn(swapSceneClip);
   const [swappingId, setSwappingId] = useState<string | null>(null);
@@ -270,7 +302,6 @@ function ProjectDetail() {
 
   const handleRender = async () => {
     setSubmittingRender(true);
-    setFootageRegenerated(false); // clear the "footage updated" cue on render
     try {
       await runSubmitRender({ data: { projectId } });
       await Promise.all([
@@ -281,31 +312,6 @@ function ProjectDetail() {
       toast.error((err as Error).message);
     } finally {
       setSubmittingRender(false);
-    }
-  };
-
-  const runRegenerateRender = useServerFn(regenerateAndRenderJob);
-  const [regenerating, setRegenerating] = useState(false);
-  // footageRegenerated tracks whether slices were just refreshed — lets us
-  // show a "footage updated" cue so the user knows to review before rendering.
-  const [footageRegenerated, setFootageRegenerated] = useState(false);
-
-  const handleRegenerateFootage = async () => {
-    setRegenerating(true);
-    setFootageRegenerated(false);
-    try {
-      // Step 1: bust the slice cache (deletes render_clip_slices, runs fresh
-      // stock footage search, writes new slice rows server-side)
-      await runRegenerateRender({ data: { projectId } });
-      // Step 2: invalidate clip-slices cache so the Timeline re-fetches and
-      // shows the newly chosen clips — user reviews before deciding to render
-      await queryClient.invalidateQueries({ queryKey: ["clip-slices", projectId] });
-      setFootageRegenerated(true);
-      // No render job is submitted here. The user explicitly clicks Render video.
-    } catch (err) {
-      toast.error((err as Error).message);
-    } finally {
-      setRegenerating(false);
     }
   };
 
@@ -602,8 +608,7 @@ function ProjectDetail() {
                     <CardTitle className="text-base">Final video</CardTitle>
                     {isReady && (!renderJob || !RENDER_ACTIVE.has(renderJob.status)) ? (
                       <div className="flex flex-wrap items-center gap-2">
-                        {/* Render video / Re-render: encodes current footage as-is */}
-                        <Button size="sm" onClick={handleRender} disabled={submittingRender || regenerating} variant="outline">
+                        <Button size="sm" onClick={handleRender} disabled={submittingRender} variant="outline">
                           {submittingRender ? (
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                           ) : (
@@ -611,25 +616,6 @@ function ProjectDetail() {
                           )}
                           {renderJob?.status === "completed" ? "Re-render" : "Render video"}
                         </Button>
-                        {/* Regenerate footage: fixed-duration projects only.
-                            Deletes slice cache, runs fresh search, updates Timeline.
-                            Does NOT submit a render job — user reviews first. */}
-                        {project.clip_duration_seconds ? (
-                          <Button size="sm" onClick={handleRegenerateFootage} disabled={submittingRender || regenerating} variant="outline">
-                            {regenerating ? (
-                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                            ) : (
-                              <Sparkles className="mr-2 h-4 w-4" />
-                            )}
-                            {regenerating ? "Finding footage…" : "Regenerate footage"}
-                          </Button>
-                        ) : null}
-                        {/* Feedback cue after regeneration completes */}
-                        {footageRegenerated && !regenerating ? (
-                          <span className="text-xs text-muted-foreground">
-                            ✓ Footage updated — review the Timeline, then click Render video.
-                          </span>
-                        ) : null}
                       </div>
                     ) : null}
                   </div>
@@ -730,13 +716,38 @@ function ProjectDetail() {
                     <p className="text-sm text-muted-foreground">No scenes yet.</p>
                   ) : (
                     <ol className="space-y-4">
-                      {scenesQuery.data.map((s) => (
+                      {scenesQuery.data.map((s) => {
+                        const videoTs = sceneVideoTimestamps.get(s.id);
+                        // Show the dual-timestamp row only when:
+                        //   (a) we have video position data for this scene, AND
+                        //   (b) the video timestamps differ from narration by >0.5s
+                        //       (avoid noise from rounding on perfectly-matched clips)
+                        const hasDrift =
+                          videoTs != null &&
+                          (Math.abs(videoTs.videoStart - s.start_ts) > 0.5 ||
+                            Math.abs(videoTs.videoEnd - s.end_ts) > 0.5);
+                        return (
                         <li key={s.id} className="rounded-md border p-4">
-                          <div className="mb-2 flex items-center justify-between gap-4 text-xs text-muted-foreground">
+                          <div className="mb-2 flex items-start justify-between gap-4 text-xs text-muted-foreground">
                             <span>Scene {s.idx + 1}</span>
-                            <span>
-                              {formatTs(s.start_ts)} – {formatTs(s.end_ts)}
-                            </span>
+                            {hasDrift ? (
+                              <div className="flex flex-col items-end gap-0.5 text-right">
+                                <span>
+                                  <span className="text-muted-foreground/60">Narration</span>{" "}
+                                  {formatTs(s.start_ts)}–{formatTs(s.end_ts)}
+                                </span>
+                                <span>
+                                  <span className="text-muted-foreground/60">Video</span>{" "}
+                                  <span className="text-foreground/80">
+                                    {formatTs(videoTs!.videoStart)}–{formatTs(videoTs!.videoEnd)}
+                                  </span>
+                                </span>
+                              </div>
+                            ) : (
+                              <span>
+                                {formatTs(s.start_ts)}–{formatTs(s.end_ts)}
+                              </span>
+                            )}
                           </div>
                           <p className="text-sm leading-relaxed">{s.text}</p>
                           <div className="mt-3">
@@ -751,7 +762,8 @@ function ProjectDetail() {
                             )}
                           </div>
                         </li>
-                      ))}
+                        );
+                      })}
                     </ol>
                   )}
                 </CardContent>
