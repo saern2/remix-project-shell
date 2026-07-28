@@ -343,44 +343,50 @@ async function advanceFromMatchingFootage(projectId: string) {
       return { status: "ready", error_message: null };
     }
 
-    const { searchStockFootage, orientationForAspect, targetWidthForAspect } = await import(
-      "@/lib/stock.server"
-    );
+    const { searchStockFootage, orientationForAspect, targetWidthForAspect } =
+      await import("@/lib/stock.server");
     const orientation = orientationForAspect(project.aspect_ratio);
     const targetWidth = targetWidthForAspect(project.aspect_ratio);
 
-    const fixedDuration = project.clip_duration_seconds != null
-      ? Number(project.clip_duration_seconds)
-      : null;
+    const fixedDuration =
+      project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
     if (fixedDuration != null && fixedDuration > 0) {
-      // ── Fixed-duration path ───────────────────────────────────────────────
-      // Run the slot-slicing search loop and write directly into
-      // render_clip_slices so the Timeline shows the real render footage
-      // from the moment matching_footage completes — no second search at
-      // render-submission time.
+      const {
+        asyncPool,
+        buildExpectedSliceSlots,
+        describeMissingSlots,
+        fixedSceneDuration,
+        sliceKey,
+        summarizeSliceCoverage,
+      } = await import("@/lib/clip-slices.server");
 
-      // Load any existing slices (idempotent re-runs).
       const { data: existingSlices } = await supabaseAdmin
         .from("render_clip_slices")
         .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
         .eq("project_id", projectId);
 
-      const sliceCache = new Map<string, { clip_url: string; provider_clip_id: string | null }>();
+      const startedAt = Date.now();
+      const expectedSlots = buildExpectedSliceSlots(scenes, fixedDuration);
+      const sliceCache = new Map<
+        string,
+        { clip_url: string; provider_clip_id: string | null; duration_seconds: number }
+      >();
       for (const row of existingSlices ?? []) {
-        sliceCache.set(`${row.scene_id}:${row.slice_index}`, {
+        sliceCache.set(sliceKey(row.scene_id, row.slice_index), {
           clip_url: row.clip_url,
           provider_clip_id: row.provider_clip_id ?? null,
+          duration_seconds: Number(row.duration_seconds),
         });
       }
 
-      // Seed dedup set from existing slices.
       const usedIds = new Set<string>(
-        (existingSlices ?? [])
-          .map((r) => r.provider_clip_id)
-          .filter((x): x is string => !!x),
+        (existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
       );
-
+      const sceneById = new Map(scenes.map((scene) => [scene.id, scene]));
+      const pendingSlots = expectedSlots.filter(
+        (slot) => !sliceCache.has(sliceKey(slot.sceneId, slot.sliceIndex)),
+      );
       const newSliceRows: Array<{
         project_id: string;
         scene_id: string;
@@ -389,121 +395,140 @@ async function advanceFromMatchingFootage(projectId: string) {
         provider_clip_id: string | null;
         duration_seconds: number;
       }> = [];
+      const unmatchedSlots: typeof pendingSlots = [];
+      const FIXED_DURATION_CONCURRENCY = 4;
+
+      await asyncPool(pendingSlots, FIXED_DURATION_CONCURRENCY, async (slot) => {
+        const scene = sceneById.get(slot.sceneId);
+        if (!scene?.visual_query) {
+          unmatchedSlots.push(slot);
+          return;
+        }
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const result = await searchStockFootage({
+            query: scene.visual_query,
+            orientation,
+            minDurationSec: fixedDuration,
+            targetWidth,
+            usedIds: [...usedIds],
+          });
+          if (!result) {
+            unmatchedSlots.push(slot);
+            return;
+          }
+
+          const providerClipId = result.pick.provider_clip_id;
+          if (usedIds.has(providerClipId) && attempt === 0) continue;
+
+          usedIds.add(providerClipId);
+          newSliceRows.push({
+            project_id: projectId,
+            scene_id: slot.sceneId,
+            slice_index: slot.sliceIndex,
+            clip_url: result.chosenFile.url,
+            provider_clip_id: providerClipId,
+            duration_seconds: fixedDuration,
+          });
+          return;
+        }
+
+        unmatchedSlots.push(slot);
+      });
+
+      if (unmatchedSlots.length > 0) {
+        throw new Error(
+          `Could not match stock footage for ${unmatchedSlots.length} fixed-duration slot(s): ${describeMissingSlots(unmatchedSlots)}. Try a different category or clip duration, then retry matching.`,
+        );
+      }
+
+      const allRows = [
+        ...[...sliceCache.entries()].map(([key, v]) => {
+          const colonIdx = key.indexOf(":");
+          const scene_id = key.slice(0, colonIdx);
+          const slice_index = Number(key.slice(colonIdx + 1));
+          return {
+            project_id: projectId,
+            scene_id,
+            slice_index,
+            clip_url: v.clip_url,
+            provider_clip_id: v.provider_clip_id,
+            duration_seconds: fixedDuration,
+          };
+        }),
+        ...newSliceRows,
+      ];
+      const coverage = summarizeSliceCoverage(scenes, fixedDuration, allRows);
+      if (coverage.missingSlots.length > 0 || coverage.actualCount !== coverage.expectedCount) {
+        throw new Error(
+          `Fixed-duration footage matching incomplete: expected ${coverage.expectedCount} slices, prepared ${coverage.actualCount}. Missing ${describeMissingSlots(coverage.missingSlots)}.`,
+        );
+      }
+
+      if (newSliceRows.length > 0) {
+        await supabaseAdmin.from("render_clip_slices").upsert(allRows, {
+          onConflict: "project_id,scene_id,slice_index",
+        });
+      }
+
+      const { data: selectedRows } = await supabaseAdmin
+        .from("selected_clips")
+        .select("scene_id")
+        .in(
+          "scene_id",
+          scenes.map((s) => s.id),
+        );
+      const selectedSceneIds = new Set((selectedRows ?? []).map((row) => row.scene_id));
 
       for (const scene of scenes) {
-        const sceneStart = Number(scene.start_ts ?? 0);
-        const sceneEnd = Number(scene.end_ts ?? 0);
-        const total = Math.max(0, sceneEnd - sceneStart);
-        if (total <= 0) continue;
+        if (selectedSceneIds.has(scene.id)) {
+          await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
+          continue;
+        }
 
-        const slots = Math.max(1, Math.ceil(total / fixedDuration));
+        const firstSlot = allRows
+          .filter((row) => row.scene_id === scene.id)
+          .sort((a, b) => a.slice_index - b.slice_index)[0];
+        if (!firstSlot) continue;
 
-        for (let slotIdx = 0; slotIdx < slots; slotIdx++) {
-          const cacheKey = `${scene.id}:${slotIdx}`;
-          if (sliceCache.has(cacheKey)) continue; // already matched
+        const { data: candidate } = await supabaseAdmin
+          .from("clip_candidates")
+          .insert({
+            scene_id: scene.id,
+            provider: "pexels",
+            provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
+            url: firstSlot.clip_url,
+            thumbnail_url: null,
+            width: targetWidth,
+            height: Math.round(targetWidth * (orientation === "portrait" ? 16 / 9 : 9 / 16)),
+            duration_sec: fixedDuration,
+          })
+          .select("id")
+          .maybeSingle();
 
-          let url: string | null = null;
-          let providerClipId: string | null = null;
-
-          if (scene.visual_query) {
-            const result = await searchStockFootage({
-              query: scene.visual_query,
-              orientation,
-              minDurationSec: fixedDuration,
-              targetWidth,
-              usedIds: [...usedIds],
-            });
-            if (result) {
-              url = result.chosenFile.url;
-              providerClipId = result.pick.provider_clip_id;
-              usedIds.add(result.pick.provider_clip_id);
-            }
-          }
-
-          // Fallback: if no clip found, leave this slot empty for now.
-          // submitRenderJob will fill it from selected_clips if needed.
-          if (url) {
-            newSliceRows.push({
-              project_id: projectId,
+        if (candidate?.id) {
+          await supabaseAdmin.from("selected_clips").upsert(
+            {
               scene_id: scene.id,
-              slice_index: slotIdx,
-              clip_url: url,
-              provider_clip_id: providerClipId,
-              duration_seconds: fixedDuration,
-            });
-          }
-        }
-
-        // Also write a generic selected_clip for this scene so the scenes
-        // table stays consistent (some UI paths read selected_clips).
-        const alreadyHasClip = (existingSlices ?? []).some((r) => r.scene_id === scene.id);
-        if (!alreadyHasClip && newSliceRows.some((r) => r.scene_id === scene.id)) {
-          const firstSlot = newSliceRows.find((r) => r.scene_id === scene.id);
-          if (firstSlot) {
-            // Insert clip_candidate + selected_clip for UI consistency.
-            const { data: candidate } = await supabaseAdmin
-              .from("clip_candidates")
-              .insert({
-                scene_id: scene.id,
-                provider: "pexels",
-                provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
-                url: firstSlot.clip_url,
-                thumbnail_url: null,
-                width: targetWidth,
-                height: Math.round(targetWidth * (orientation === "portrait" ? 16 / 9 : 9 / 16)),
-                duration_sec: fixedDuration,
-              })
-              .select("id")
-              .maybeSingle();
-            if (candidate?.id) {
-              const sceneDuration = Number(scene.end_ts) - Number(scene.start_ts);
-              await supabaseAdmin.from("selected_clips").upsert(
-                {
-                  scene_id: scene.id,
-                  clip_candidate_id: candidate.id,
-                  in_point: 0,
-                  out_point: Math.min(fixedDuration, Math.max(sceneDuration, 1)),
-                },
-                { onConflict: "scene_id" },
-              );
-              await supabaseAdmin
-                .from("scenes")
-                .update({ status: "selected" })
-                .eq("id", scene.id);
-            }
-          }
+              clip_candidate_id: candidate.id,
+              in_point: 0,
+              out_point: Math.min(fixedDuration, Math.max(fixedSceneDuration(scene), 1)),
+            },
+            { onConflict: "scene_id" },
+          );
+          await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
         }
       }
 
-      // Persist new slice rows.
-      if (newSliceRows.length > 0) {
-        // Delete old slices for this project and re-insert the full set.
-        await supabaseAdmin
-          .from("render_clip_slices")
-          .delete()
-          .eq("project_id", projectId);
-
-        const allRows = [
-          ...[...sliceCache.entries()].map(([key, v]) => {
-            const colonIdx = key.indexOf(":");
-            const scene_id = key.slice(0, colonIdx);
-            const slice_index = Number(key.slice(colonIdx + 1));
-            return {
-              project_id: projectId,
-              scene_id,
-              slice_index,
-              clip_url: v.clip_url,
-              provider_clip_id: v.provider_clip_id,
-              duration_seconds: fixedDuration,
-            };
-          }),
-          ...newSliceRows,
-        ];
-
-        if (allRows.length > 0) {
-          await supabaseAdmin.from("render_clip_slices").insert(allRows);
-        }
-      }
+      console.info("[matching_footage:fixed-duration]", {
+        projectId,
+        scenes: scenes.length,
+        expectedSlices: coverage.expectedCount,
+        cachedSlices: sliceCache.size,
+        searchedSlices: newSliceRows.length,
+        concurrency: FIXED_DURATION_CONCURRENCY,
+        elapsedMs: Date.now() - startedAt,
+      });
 
       await supabaseAdmin
         .from("projects")
@@ -517,10 +542,17 @@ async function advanceFromMatchingFootage(projectId: string) {
     const { data: existingSel } = await supabaseAdmin
       .from("selected_clips")
       .select("scene_id, clip_candidates!inner(provider_clip_id)")
-      .in("scene_id", scenes.map((s) => s.id));
+      .in(
+        "scene_id",
+        scenes.map((s) => s.id),
+      );
     const alreadySelected = new Set((existingSel ?? []).map((r) => r.scene_id));
     const usedIds: string[] = (existingSel ?? [])
-      .map((r) => (r as { clip_candidates: { provider_clip_id: string } | null }).clip_candidates?.provider_clip_id)
+      .map(
+        (r) =>
+          (r as { clip_candidates: { provider_clip_id: string } | null }).clip_candidates
+            ?.provider_clip_id,
+      )
       .filter((x): x is string => !!x);
 
     const CONCURRENCY = 5;
@@ -532,10 +564,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
         return;
       }
-      const minDuration = Math.max(
-        1,
-        Math.ceil(Number(scene.end_ts) - Number(scene.start_ts)),
-      );
+      const minDuration = Math.max(1, Math.ceil(Number(scene.end_ts) - Number(scene.start_ts)));
       const result = await searchStockFootage({
         query,
         orientation,
@@ -577,10 +606,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       );
       if (sErr) throw new Error(sErr.message);
 
-      await supabaseAdmin
-        .from("scenes")
-        .update({ status: "selected" })
-        .eq("id", scene.id);
+      await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
       usedIds.push(pick.provider_clip_id);
     }
 
@@ -617,12 +643,15 @@ export const swapSceneClip = createServerFn({ method: "POST" })
     // Load scene + project (RLS scoped)
     const { data: scene, error: sErr } = await supabase
       .from("scenes")
-      .select("id, project_id, text, start_ts, end_ts, visual_query, projects!inner(user_id, aspect_ratio)")
+      .select(
+        "id, project_id, text, start_ts, end_ts, visual_query, projects!inner(user_id, aspect_ratio)",
+      )
       .eq("id", data.sceneId)
       .maybeSingle();
     if (sErr) throw new Error(sErr.message);
     if (!scene) throw new Error("Scene not found.");
-    const project = (scene as unknown as { projects: { user_id: string; aspect_ratio: string } }).projects;
+    const project = (scene as unknown as { projects: { user_id: string; aspect_ratio: string } })
+      .projects;
     if (project.user_id !== userId) throw new Error("Forbidden.");
     if (!scene.visual_query) throw new Error("Scene has no visual query.");
 
@@ -634,9 +663,8 @@ export const swapSceneClip = createServerFn({ method: "POST" })
       .eq("scene_id", scene.id);
     const usedIds = (prior ?? []).map((r) => r.provider_clip_id);
 
-    const { searchStockFootage, orientationForAspect, targetWidthForAspect } = await import(
-      "@/lib/stock.server"
-    );
+    const { searchStockFootage, orientationForAspect, targetWidthForAspect } =
+      await import("@/lib/stock.server");
     const minDuration = Math.max(1, Math.ceil(Number(scene.end_ts) - Number(scene.start_ts)));
     const result = await searchStockFootage({
       query: scene.visual_query,
@@ -678,4 +706,3 @@ export const swapSceneClip = createServerFn({ method: "POST" })
 
     return { ok: true };
   });
-

@@ -45,16 +45,17 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       throw new Error(`Project is not ready to render (status: ${project.status}).`);
     }
 
-    // Load scenes in timeline order + their selected clip.
+    // Load scenes in timeline order. The plain path requires selected_clips;
+    // fixed-duration rendering uses render_clip_slices as the source of truth.
     const { data: scenes, error: scenesErr } = await supabase
       .from("scenes")
       .select(
-        "id, idx, start_ts, end_ts, visual_query, selected_clips!inner(in_point, out_point, clip_candidates!inner(url, provider_clip_id))",
+        "id, idx, start_ts, end_ts, visual_query, selected_clips(in_point, out_point, clip_candidates(url, provider_clip_id))",
       )
       .eq("project_id", projectId)
       .order("idx", { ascending: true });
     if (scenesErr) throw new Error(scenesErr.message);
-    if (!scenes || scenes.length === 0) throw new Error("No scenes with clips selected.");
+    if (!scenes || scenes.length === 0) throw new Error("No scenes found for this project.");
 
     type SceneRow = {
       id: string;
@@ -66,153 +67,180 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         in_point: number;
         out_point: number;
         clip_candidates: { url: string; provider_clip_id: string };
-      };
+      } | null;
     };
     const sceneRows = scenes as unknown as SceneRow[];
 
-    const fixedDuration = project.clip_duration_seconds != null
-      ? Number(project.clip_duration_seconds)
-      : null;
+    const fixedDuration =
+      project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
     let clips: Array<{ clip_url: string; start: number; end: number }>;
 
     if (fixedDuration == null || !(fixedDuration > 0)) {
       // Default behavior: exactly one clip per scene, natural sentence length.
-      clips = sceneRows.map((s) => ({
-        clip_url: s.selected_clips.clip_candidates.url,
-        start: Number(s.selected_clips.in_point),
-        end: Number(s.selected_clips.out_point),
-      }));
+      clips = sceneRows.map((s) => {
+        if (!s.selected_clips?.clip_candidates?.url) {
+          throw new Error(`Scene ${s.idx + 1} has no selected clip.`);
+        }
+        return {
+          clip_url: s.selected_clips.clip_candidates.url,
+          start: Number(s.selected_clips.in_point),
+          end: Number(s.selected_clips.out_point),
+        };
+      });
     } else {
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { buildExpectedSliceSlots, describeMissingSlots, sliceKey, summarizeSliceCoverage } =
+        await import("@/lib/clip-slices.server");
 
-      // Load any previously persisted slices for this project
       const { data: existingSlices } = await supabaseAdmin
         .from("render_clip_slices")
         .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
         .eq("project_id", projectId);
 
-      // Build a lookup map: `${scene_id}:${slice_index}` -> slice row
-      const sliceCache = new Map<string, { clip_url: string; provider_clip_id: string | null; duration_seconds: number }>();
-      for (const row of existingSlices ?? []) {
-        sliceCache.set(`${row.scene_id}:${row.slice_index}`, {
-          clip_url: row.clip_url,
-          provider_clip_id: row.provider_clip_id ?? null,
-          duration_seconds: Number(row.duration_seconds),
-        });
-      }
-
-      const { searchStockFootage, orientationForAspect, targetWidthForAspect } = await import(
-        "@/lib/stock.server"
+      const coverage = summarizeSliceCoverage(scenes, fixedDuration, existingSlices ?? []);
+      const sliceCache = new Map(
+        (existingSlices ?? []).map((row) => [sliceKey(row.scene_id, row.slice_index), row]),
       );
-      const orientation = orientationForAspect(project.aspect_ratio ?? "9:16");
-      const targetWidth = targetWidthForAspect(project.aspect_ratio ?? "9:16");
+      const cacheComplete =
+        coverage.missingSlots.length === 0 && coverage.actualCount === coverage.expectedCount;
 
-      // Project-wide dedup set, seeded with the clips already selected AND existing slice rows.
-      const usedIds = new Set<string>([
-        ...sceneRows.map((s) => s.selected_clips.clip_candidates.provider_clip_id).filter(Boolean),
-        ...(existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
-      ]);
-
-      // Build new slice rows to insert (only for slots not already cached)
-      const newSliceRows: Array<{
-        project_id: string;
-        scene_id: string;
-        slice_index: number;
-        clip_url: string;
-        provider_clip_id: string | null;
-        duration_seconds: number;
-      }> = [];
-
-      clips = [];
-      for (const scene of sceneRows) {
-        const sceneStart = Number(scene.start_ts ?? 0);
-        const sceneEnd = Number(scene.end_ts ?? 0);
-        const total = Math.max(0, sceneEnd - sceneStart);
-        if (total <= 0) continue;
-
-        // Every slot is exactly fixedDuration seconds — even if the scene voiceover
-        // is shorter. The video plays the full fixedDuration; audio continues into
-        // the next scene while this visual is still showing. This is intentional
-        // (Option A): uniform clip length takes priority over voiceover-visual sync.
-        const slots = Math.max(1, Math.ceil(total / fixedDuration));
-
-        for (let slotIdx = 0; slotIdx < slots; slotIdx++) {
-          const cacheKey = `${scene.id}:${slotIdx}`;
-          const cached = sliceCache.get(cacheKey);
-
-          let url: string;
-          let providerClipId: string | null = null;
-
-          if (cached) {
-            // Reuse persisted assignment — no API call needed
-            url = cached.clip_url;
-            providerClipId = cached.provider_clip_id;
-          } else {
-            // Search for a new clip
-            let found: string | null = null;
-            if (scene.visual_query) {
-              const result = await searchStockFootage({
-                query: scene.visual_query,
-                orientation,
-                minDurationSec: fixedDuration,   // always request full fixedDuration
-                targetWidth,
-                usedIds: [...usedIds],
-              });
-              if (result) {
-                found = result.chosenFile.url;
-                providerClipId = result.pick.provider_clip_id;
-                usedIds.add(result.pick.provider_clip_id);
-              }
-            }
-            url = found ?? scene.selected_clips.clip_candidates.url;
-
-            // Queue this new assignment for persistence
-            newSliceRows.push({
-              project_id: projectId,
-              scene_id: scene.id as string,
-              slice_index: slotIdx,
-              clip_url: url,
-              provider_clip_id: providerClipId,
-              duration_seconds: fixedDuration,
-            });
+      if (cacheComplete) {
+        clips = buildExpectedSliceSlots(sceneRows, fixedDuration).map((slot) => {
+          const cached = sliceCache.get(sliceKey(slot.sceneId, slot.sliceIndex));
+          if (!cached) {
+            throw new Error(
+              `Missing fixed-duration clip for scene ${slot.sceneIdx + 1}, slice ${slot.sliceIndex + 1}.`,
+            );
           }
+          return { clip_url: cached.clip_url, start: 0, end: fixedDuration };
+        });
+        if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
 
-          // Always use the full fixedDuration — never a sub-duration remainder.
-          clips.push({ clip_url: url, start: 0, end: fixedDuration });
-        }
-      }
-      if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
+        console.info("[submitRenderJob:fixed-duration-cache]", {
+          projectId,
+          expectedSlices: coverage.expectedCount,
+          cachedSlices: coverage.actualCount,
+        });
+      } else {
+        console.warn("[submitRenderJob:fixed-duration-cache-miss]", {
+          projectId,
+          expectedSlices: coverage.expectedCount,
+          cachedSlices: coverage.actualCount,
+          missing: describeMissingSlots(coverage.missingSlots),
+        });
+        const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-      // Persist new slice assignments (delete-all-for-project + re-insert pattern,
-      // since there is no unique constraint to drive upsert).
-      if (newSliceRows.length > 0) {
-        // Delete all existing slices for this project
-        await supabaseAdmin
+        // Load any previously persisted slices for this project
+        const { data: existingSlices } = await supabaseAdmin
           .from("render_clip_slices")
-          .delete()
+          .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
           .eq("project_id", projectId);
 
-        // Re-insert: cached rows + new rows
-        const allRows = [
-          ...[...sliceCache.entries()].map(([key, v]) => {
-            const colonIdx = key.indexOf(":");
-            const scene_id = key.slice(0, colonIdx);
-            const slice_index = Number(key.slice(colonIdx + 1));
-            return {
-              project_id: projectId,
-              scene_id,
-              slice_index,
-              clip_url: v.clip_url,
-              provider_clip_id: v.provider_clip_id,
-              duration_seconds: v.duration_seconds,
-            };
-          }),
-          ...newSliceRows,
-        ];
+        // Build a lookup map: `${scene_id}:${slice_index}` -> slice row
+        const sliceCache = new Map<
+          string,
+          { clip_url: string; provider_clip_id: string | null; duration_seconds: number }
+        >();
+        for (const row of existingSlices ?? []) {
+          sliceCache.set(`${row.scene_id}:${row.slice_index}`, {
+            clip_url: row.clip_url,
+            provider_clip_id: row.provider_clip_id ?? null,
+            duration_seconds: Number(row.duration_seconds),
+          });
+        }
 
-        if (allRows.length > 0) {
-          await supabaseAdmin.from("render_clip_slices").insert(allRows);
+        const { searchStockFootage, orientationForAspect, targetWidthForAspect } =
+          await import("@/lib/stock.server");
+        const orientation = orientationForAspect(project.aspect_ratio ?? "9:16");
+        const targetWidth = targetWidthForAspect(project.aspect_ratio ?? "9:16");
+
+        // Project-wide dedup set, seeded with the clips already selected AND existing slice rows.
+        const usedIds = new Set<string>([
+          ...sceneRows
+            .map((s) => s.selected_clips?.clip_candidates?.provider_clip_id)
+            .filter(Boolean),
+          ...(existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
+        ]);
+
+        // Build new slice rows to insert (only for slots not already cached)
+        const newSliceRows: Array<{
+          project_id: string;
+          scene_id: string;
+          slice_index: number;
+          clip_url: string;
+          provider_clip_id: string | null;
+          duration_seconds: number;
+        }> = [];
+
+        clips = [];
+        for (const scene of sceneRows) {
+          const sceneStart = Number(scene.start_ts ?? 0);
+          const sceneEnd = Number(scene.end_ts ?? 0);
+          const total = Math.max(0, sceneEnd - sceneStart);
+          if (total <= 0) continue;
+
+          // Every slot is exactly fixedDuration seconds — even if the scene voiceover
+          // is shorter. The video plays the full fixedDuration; audio continues into
+          // the next scene while this visual is still showing. This is intentional
+          // (Option A): uniform clip length takes priority over voiceover-visual sync.
+          const slots = Math.max(1, Math.ceil(total / fixedDuration));
+
+          for (let slotIdx = 0; slotIdx < slots; slotIdx++) {
+            const cacheKey = `${scene.id}:${slotIdx}`;
+            const cached = sliceCache.get(cacheKey);
+
+            let url: string;
+            let providerClipId: string | null = null;
+
+            if (cached) {
+              // Reuse persisted assignment — no API call needed
+              url = cached.clip_url;
+              providerClipId = cached.provider_clip_id;
+            } else {
+              // Search for a new clip
+              let found: string | null = null;
+              if (scene.visual_query) {
+                const result = await searchStockFootage({
+                  query: scene.visual_query,
+                  orientation,
+                  minDurationSec: fixedDuration, // always request full fixedDuration
+                  targetWidth,
+                  usedIds: [...usedIds],
+                });
+                if (result) {
+                  found = result.chosenFile.url;
+                  providerClipId = result.pick.provider_clip_id;
+                  usedIds.add(result.pick.provider_clip_id);
+                }
+              }
+              const fallbackUrl = scene.selected_clips?.clip_candidates?.url;
+              if (!found && !fallbackUrl) {
+                throw new Error(`Scene ${scene.idx + 1} has no selected clip fallback.`);
+              }
+              url = found ?? fallbackUrl!;
+
+              // Queue this new assignment for persistence
+              newSliceRows.push({
+                project_id: projectId,
+                scene_id: scene.id as string,
+                slice_index: slotIdx,
+                clip_url: url,
+                provider_clip_id: providerClipId,
+                duration_seconds: fixedDuration,
+              });
+            }
+
+            // Always use the full fixedDuration — never a sub-duration remainder.
+            clips.push({ clip_url: url, start: 0, end: fixedDuration });
+          }
+        }
+        if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
+
+        if (newSliceRows.length > 0) {
+          await supabaseAdmin.from("render_clip_slices").upsert(newSliceRows, {
+            onConflict: "project_id,scene_id,slice_index",
+          });
         }
       }
     }
@@ -332,7 +360,9 @@ export const pollRenderJob = createServerFn({ method: "POST" })
 
     const { data: job, error: jobErr } = await supabase
       .from("render_jobs")
-      .select("id, project_id, status, progress_pct, output_url, error, chunks_total, chunks_completed, projects!inner(user_id)")
+      .select(
+        "id, project_id, status, progress_pct, output_url, error, chunks_total, chunks_completed, projects!inner(user_id)",
+      )
       .eq("id", data.jobId)
       .maybeSingle();
     if (jobErr) throw new Error(jobErr.message);
@@ -448,10 +478,7 @@ export const pollRenderJob = createServerFn({ method: "POST" })
         .update({ status: "failed", error_message: error ?? "Render failed." })
         .eq("id", job.project_id);
     } else {
-      await supabaseAdmin
-        .from("projects")
-        .update({ status: "rendering" })
-        .eq("id", job.project_id);
+      await supabaseAdmin.from("projects").update({ status: "rendering" }).eq("id", job.project_id);
     }
 
     return {
@@ -460,14 +487,21 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       output_url: playbackUrl,
       error,
       chunks_total: chunksTotal,
-      chunks_completed: status === "completed" && chunksTotal != null ? chunksTotal : chunksCompleted,
+      chunks_completed:
+        status === "completed" && chunksTotal != null ? chunksTotal : chunksCompleted,
     };
   });
 
 // Silence unused ttl warning if compiler flags it.
 void OUTPUT_UPLOAD_TTL;
 
-const ACTIVE_RENDER_STATUSES = ["queued", "downloading", "rendering", "stitching", "uploading"] as const;
+const ACTIVE_RENDER_STATUSES = [
+  "queued",
+  "downloading",
+  "rendering",
+  "stitching",
+  "uploading",
+] as const;
 
 /**
  * Cancel a queued or active render job.
