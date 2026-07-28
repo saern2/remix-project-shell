@@ -1,12 +1,14 @@
 // Server-only helper for turning scene sentences into concrete, visually
 // searchable stock-footage phrases via Lovable AI Gateway.
 //
-// Matching is by explicit {idx} — never by array position — because the
-// model can drop, reorder, or duplicate entries. Missing idx values are
-// retried once in a small follow-up call before we give up.
+// Matching is by explicit {idx}, never array position. The gateway is asked for
+// JSON, but production model responses can still arrive fenced or malformed, so
+// parsing is deliberately defensive and every missing item has a deterministic
+// fallback query.
 
 const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const MODEL = "google/gemini-2.5-flash";
+const BATCH_SIZE = 12;
 
 const SYSTEM_PROMPT = `You convert narration sentences into short, CONCRETE, visually-searchable stock-footage phrases (3-6 words each).
 
@@ -33,12 +35,142 @@ type SceneInput = { idx: number; text: string };
 export type VisualCategory = "war" | "crime";
 
 const CATEGORY_THEMES: Record<VisualCategory, string> = {
-  war: "war/military conflict",
-  crime: "crime/law enforcement",
+  war: "war military conflict",
+  crime: "crime law enforcement",
 };
 
+const STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "but",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "is",
+  "it",
+  "no",
+  "of",
+  "on",
+  "or",
+  "the",
+  "their",
+  "there",
+  "this",
+  "to",
+  "was",
+  "were",
+  "with",
+]);
+
 function categoryInstruction(category: VisualCategory): string {
-  return `\n\nEvery visual query you generate MUST stay within the ${CATEGORY_THEMES[category]} visual theme, even when the narration sentence itself is unrelated or neutral — find the closest on-theme concrete visual interpretation rather than a literal one.`;
+  return `\n\nEvery visual query you generate MUST stay within the ${CATEGORY_THEMES[category]} visual theme, even when the narration sentence itself is unrelated or neutral. Find the closest on-theme concrete visual interpretation rather than a literal one.`;
+}
+
+function stripCodeFence(content: string): string {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1].trim() : trimmed;
+}
+
+function extractBalancedJson(content: string): string | null {
+  const source = stripCodeFence(content);
+  const start = source.search(/[\[{]/);
+  if (start < 0) return null;
+
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === "\"") {
+      inString = true;
+    } else if (ch === "{" || ch === "[") {
+      stack.push(ch);
+    } else if (ch === "}" || ch === "]") {
+      const open = stack.pop();
+      if ((ch === "}" && open !== "{") || (ch === "]" && open !== "[")) return null;
+      if (stack.length === 0) return source.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+export function parseVisualQueryContent(content: string): unknown {
+  const direct = stripCodeFence(content);
+  try {
+    return JSON.parse(direct);
+  } catch {
+    const extracted = extractBalancedJson(content);
+    if (!extracted) throw new Error("AI returned invalid JSON for visual queries.");
+    try {
+      return JSON.parse(extracted);
+    } catch {
+      throw new Error("AI returned invalid JSON for visual queries.");
+    }
+  }
+}
+
+function normalizeQuery(query: string): string {
+  return query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(" ");
+}
+
+function mapFromParsed(parsed: unknown, items: SceneInput[]): Map<number, string> {
+  const raw = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray((parsed as { results?: unknown }).results)
+      ? (parsed as { results: unknown[] }).results
+      : Array.isArray((parsed as { queries?: unknown }).queries)
+        ? (parsed as { queries: unknown[] }).queries
+        : null;
+  if (!raw) throw new Error("AI response missing results array.");
+
+  const allowed = new Set(items.map((i) => i.idx));
+  const map = new Map<number, string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as { idx?: unknown; query?: unknown };
+    if (typeof e.idx !== "number" || !allowed.has(e.idx)) continue;
+    if (typeof e.query !== "string") continue;
+    const q = normalizeQuery(e.query);
+    if (q) map.set(e.idx, q);
+  }
+  return map;
+}
+
+export function fallbackVisualQuery(text: string, category: VisualCategory | null = null): string {
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 2 && !STOP_WORDS.has(word))
+    .slice(0, 4);
+
+  const base = words.length > 0 ? words.join(" ") : "people outdoor scene";
+  return category ? `${CATEGORY_THEMES[category]} ${base}`.split(/\s+/).slice(0, 6).join(" ") : base;
 }
 
 async function callGateway(
@@ -82,36 +214,26 @@ async function callGateway(
   const content = payload.choices?.[0]?.message?.content;
   if (!content) throw new Error("AI response was empty.");
 
-  let parsed: unknown;
+  return mapFromParsed(parseVisualQueryContent(content), items);
+}
+
+async function callGatewayWithRetry(
+  items: SceneInput[],
+  category: VisualCategory | null,
+): Promise<Map<number, string>> {
   try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw new Error("AI returned invalid JSON for visual queries.");
+    return await callGateway(items, category);
+  } catch (firstErr) {
+    try {
+      return await callGateway(items, category);
+    } catch {
+      console.warn("[visual-queries:fallback]", {
+        scenes: items.map((item) => item.idx),
+        reason: firstErr instanceof Error ? firstErr.message : "gateway failed",
+      });
+      return new Map();
+    }
   }
-
-  // Accept either { results: [...] } or a bare array, for resilience.
-  const raw =
-    Array.isArray(parsed)
-      ? parsed
-      : Array.isArray((parsed as { results?: unknown }).results)
-        ? (parsed as { results: unknown[] }).results
-        : Array.isArray((parsed as { queries?: unknown }).queries)
-          ? (parsed as { queries: unknown[] }).queries
-          : null;
-  if (!raw) throw new Error("AI response missing results array.");
-
-  const allowed = new Set(items.map((i) => i.idx));
-  const map = new Map<number, string>();
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object") continue;
-    const e = entry as { idx?: unknown; query?: unknown };
-    if (typeof e.idx !== "number" || !allowed.has(e.idx)) continue;
-    if (typeof e.query !== "string") continue;
-    const q = e.query.trim().toLowerCase();
-    if (!q) continue;
-    map.set(e.idx, q);
-  }
-  return map;
 }
 
 export async function generateVisualQueries(
@@ -125,28 +247,24 @@ export async function generateVisualQueries(
     text: s.replace(/\s+/g, " ").trim(),
   }));
 
-  const map = await callGateway(items, category);
+  const map = new Map<number, string>();
+  for (let start = 0; start < items.length; start += BATCH_SIZE) {
+    const batch = items.slice(start, start + BATCH_SIZE);
+    const batchMap = await callGatewayWithRetry(batch, category);
+    for (const [idx, q] of batchMap) map.set(idx, q);
 
-  // Retry only missing idx values, in one follow-up call.
-  const missing = items.filter((i) => !map.has(i.idx));
-  if (missing.length > 0) {
-    try {
-      const retryMap = await callGateway(missing, category);
+    const missing = batch.filter((item) => !map.has(item.idx));
+    if (missing.length > 0) {
+      const retryMap = await callGatewayWithRetry(missing, category);
       for (const [idx, q] of retryMap) map.set(idx, q);
-    } catch {
-      // Swallow retry error; the check below produces a clearer message.
+    }
+
+    for (const item of batch) {
+      if (!map.has(item.idx)) {
+        map.set(item.idx, fallbackVisualQuery(item.text, category));
+      }
     }
   }
 
-  const result: string[] = [];
-  for (const item of items) {
-    const q = map.get(item.idx);
-    if (!q) {
-      throw new Error(
-        `Visual query generation failed for scene ${item.idx + 1} after retry.`,
-      );
-    }
-    result.push(q);
-  }
-  return result;
+  return items.map((item) => map.get(item.idx) ?? fallbackVisualQuery(item.text, category));
 }

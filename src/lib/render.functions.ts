@@ -75,6 +75,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
     let clips: Array<{ clip_url: string; start: number; end: number }>;
+    let renderTransition: "hard-cut" | "crossfade" = "crossfade";
 
     if (fixedDuration == null || !(fixedDuration > 0)) {
       // Default behavior: exactly one clip per scene, natural sentence length.
@@ -95,7 +96,9 @@ export const submitRenderJob = createServerFn({ method: "POST" })
 
       const { data: existingSlices } = await supabaseAdmin
         .from("render_clip_slices")
-        .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
+        .select(
+          "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+        )
         .eq("project_id", projectId);
 
       const coverage = summarizeSliceCoverage(scenes, fixedDuration, existingSlices ?? []);
@@ -113,7 +116,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
               `Missing fixed-duration clip for scene ${slot.sceneIdx + 1}, slice ${slot.sliceIndex + 1}.`,
             );
           }
-          return { clip_url: cached.clip_url, start: 0, end: fixedDuration };
+          return { clip_url: cached.clip_url, start: 0, end: Number(cached.duration_seconds) };
         });
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
 
@@ -134,7 +137,9 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         // Load any previously persisted slices for this project
         const { data: existingSlices } = await supabaseAdmin
           .from("render_clip_slices")
-          .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
+          .select(
+            "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+          )
           .eq("project_id", projectId);
 
         // Build a lookup map: `${scene_id}:${slice_index}` -> slice row
@@ -171,6 +176,9 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           clip_url: string;
           provider_clip_id: string | null;
           duration_seconds: number;
+          timeline_start_seconds: number;
+          timeline_end_seconds: number;
+          thumbnail_url: string | null;
         }> = [];
 
         clips = [];
@@ -184,14 +192,16 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           // is shorter. The video plays the full fixedDuration; audio continues into
           // the next scene while this visual is still showing. This is intentional
           // (Option A): uniform clip length takes priority over voiceover-visual sync.
-          const slots = Math.max(1, Math.ceil(total / fixedDuration));
+          const sceneSlots = buildExpectedSliceSlots([scene], fixedDuration);
 
-          for (let slotIdx = 0; slotIdx < slots; slotIdx++) {
+          for (let slotIdx = 0; slotIdx < sceneSlots.length; slotIdx++) {
+            const slot = sceneSlots[slotIdx];
             const cacheKey = `${scene.id}:${slotIdx}`;
             const cached = sliceCache.get(cacheKey);
 
             let url: string;
             let providerClipId: string | null = null;
+            let thumbnailUrl: string | null = null;
 
             if (cached) {
               // Reuse persisted assignment — no API call needed
@@ -207,10 +217,12 @@ export const submitRenderJob = createServerFn({ method: "POST" })
                   minDurationSec: fixedDuration, // always request full fixedDuration
                   targetWidth,
                   usedIds: [...usedIds],
+                  seed: `${projectId}:${scene.id}:${slotIdx}`,
                 });
                 if (result) {
                   found = result.chosenFile.url;
                   providerClipId = result.pick.provider_clip_id;
+                  thumbnailUrl = result.pick.thumbnail_url ?? null;
                   usedIds.add(result.pick.provider_clip_id);
                 }
               }
@@ -227,12 +239,15 @@ export const submitRenderJob = createServerFn({ method: "POST" })
                 slice_index: slotIdx,
                 clip_url: url,
                 provider_clip_id: providerClipId,
-                duration_seconds: fixedDuration,
+                duration_seconds: slot.durationSeconds,
+                timeline_start_seconds: slot.timelineStart,
+                timeline_end_seconds: slot.timelineEnd,
+                thumbnail_url: thumbnailUrl,
               });
             }
 
             // Always use the full fixedDuration — never a sub-duration remainder.
-            clips.push({ clip_url: url, start: 0, end: fixedDuration });
+            clips.push({ clip_url: url, start: 0, end: cached?.duration_seconds ?? slot.durationSeconds });
           }
         }
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
@@ -242,7 +257,45 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             onConflict: "project_id,scene_id,slice_index",
           });
         }
+
+        const { data: finalSlices } = await supabaseAdmin
+          .from("render_clip_slices")
+          .select(
+            "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+          )
+          .eq("project_id", projectId);
+        const finalCoverage = summarizeSliceCoverage(scenes, fixedDuration, finalSlices ?? []);
+        if (
+          finalCoverage.missingSlots.length > 0 ||
+          finalCoverage.actualCount !== finalCoverage.expectedCount
+        ) {
+          throw new Error(
+            `Fixed-duration footage cache incomplete after fallback search: expected ${finalCoverage.expectedCount} slices, prepared ${finalCoverage.actualCount}. Missing ${describeMissingSlots(finalCoverage.missingSlots)}.`,
+          );
+        }
+
+        const finalCache = new Map(
+          (finalSlices ?? []).map((row) => [sliceKey(row.scene_id, row.slice_index), row]),
+        );
+        clips = buildExpectedSliceSlots(sceneRows, fixedDuration).map((slot) => {
+          const row = finalCache.get(sliceKey(slot.sceneId, slot.sliceIndex));
+          if (!row) {
+            throw new Error(
+              `Missing fixed-duration clip for scene ${slot.sceneIdx + 1}, slice ${slot.sliceIndex + 1}.`,
+            );
+          }
+          return { clip_url: row.clip_url, start: 0, end: Number(row.duration_seconds) };
+        });
       }
+
+      const totalVisualDuration = clips.reduce((sum, clip) => sum + (clip.end - clip.start), 0);
+      const narrationEnd = Math.max(...sceneRows.map((scene) => Number(scene.end_ts ?? 0)));
+      if (Math.abs(totalVisualDuration - narrationEnd) > 1) {
+        throw new Error(
+          `Fixed-duration timeline duration mismatch: visual ${totalVisualDuration.toFixed(2)}s vs narration ${narrationEnd.toFixed(2)}s.`,
+        );
+      }
+      renderTransition = "hard-cut";
     }
 
     // Signed audio URL.
@@ -280,7 +333,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     const settings = {
       ...dims,
       fps: 30,
-      transition: "crossfade" as const,
+      transition: renderTransition,
       transition_duration: 0.5,
       format: "mp4" as const,
     };
@@ -311,7 +364,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       audio_url: audioSigned.signedUrl,
       ...dims,
       fps: 30,
-      transition: "crossfade",
+      transition: renderTransition,
       transition_duration: 0.5,
       format: "mp4",
       output_upload_url: uploadSigned.signedUrl,

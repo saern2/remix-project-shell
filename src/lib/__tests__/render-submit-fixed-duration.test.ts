@@ -9,6 +9,7 @@ const renderClipSliceUpsert = vi.fn();
 const renderJobInsert = vi.fn();
 const adminUpdate = vi.fn();
 const searchStockFootage = vi.fn();
+let renderClipSliceRows: unknown[] = [];
 
 vi.mock("@tanstack/react-start", () => ({
   createServerFn: () => {
@@ -40,9 +41,12 @@ vi.mock("@/integrations/supabase/client.server", () => ({
       if (table === "render_clip_slices") {
         return {
           select: () => ({
-            eq: async () => ({ data: [], error: null }),
+            eq: async () => ({ data: renderClipSliceRows, error: null }),
           }),
-          upsert: (rows: unknown, options: unknown) => renderClipSliceUpsert(rows, options),
+          upsert: (rows: unknown, options: unknown) => {
+            renderClipSliceRows = Array.isArray(rows) ? rows : [rows];
+            return renderClipSliceUpsert(rows, options);
+          },
         };
       }
       if (table === "render_jobs") {
@@ -152,6 +156,7 @@ describe("submitRenderJob fixed-duration fallback", () => {
   beforeEach(async () => {
     vi.resetModules();
     capturedHandlers = [];
+    renderClipSliceRows = [];
     renderClipSliceUpsert.mockReset().mockResolvedValue({ error: null });
     renderJobInsert.mockReset().mockResolvedValue({ data: { id: JOB_ID }, error: null });
     adminUpdate.mockReset().mockResolvedValue({ error: null });
@@ -197,9 +202,22 @@ describe("submitRenderJob fixed-duration fallback", () => {
       RequestInit,
     ];
     const workerBody = JSON.parse(String(init.body));
+    expect(workerBody.transition).toBe("hard-cut");
     expect(workerBody.clips).toEqual([
       { clip_url: "https://videos.example.com/a.mp4", start: 0, end: 4 },
       { clip_url: "https://videos.example.com/b.mp4", start: 0, end: 4 },
+    ]);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        duration_seconds: 4,
+        timeline_start_seconds: 0,
+        timeline_end_seconds: 4,
+      }),
+      expect.objectContaining({
+        duration_seconds: 4,
+        timeline_start_seconds: 4,
+        timeline_end_seconds: 8,
+      }),
     ]);
   });
 });

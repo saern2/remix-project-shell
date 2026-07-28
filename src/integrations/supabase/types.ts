@@ -225,6 +225,9 @@ export type Database = {
           provider_clip_id: string | null
           scene_id: string
           slice_index: number
+          thumbnail_url: string | null
+          timeline_end_seconds: number
+          timeline_start_seconds: number
         }
         Insert: {
           clip_url: string
@@ -235,6 +238,9 @@ export type Database = {
           provider_clip_id?: string | null
           scene_id: string
           slice_index: number
+          thumbnail_url?: string | null
+          timeline_end_seconds: number
+          timeline_start_seconds: number
         }
         Update: {
           clip_url?: string
@@ -245,6 +251,9 @@ export type Database = {
           provider_clip_id?: string | null
           scene_id?: string
           slice_index?: number
+          thumbnail_url?: string | null
+          timeline_end_seconds?: number
+          timeline_start_seconds?: number
         }
         Relationships: [
           {

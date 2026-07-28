@@ -199,6 +199,21 @@ export function targetWidthForAspect(aspect: string): number {
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
+function stableHash(input: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function seededIndex(seed: string | undefined, modulo: number): number {
+  if (modulo <= 1) return 0;
+  if (!seed) return Math.floor(Math.random() * modulo);
+  return stableHash(seed) % modulo;
+}
+
 /**
  * Search stock footage, dedup against usedIds, filter by minimum duration
  * (with fallback), and randomly pick from the top candidates. Selects the
@@ -212,6 +227,7 @@ export async function searchStockFootage(opts: {
   minDurationSec: number;
   targetWidth: number;
   usedIds: string[];
+  seed?: string;
 }): Promise<{ pick: StockVideo; chosenFile: StockVideoFile; candidates: StockVideo[] } | null> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const provider = getStockProvider();
@@ -234,7 +250,7 @@ export async function searchStockFootage(opts: {
     await bumpUsage(provider.name, { cache_hit: true });
   } else {
     // 2. Fresh call — random page 1..3 for variety
-    const page = 1 + Math.floor(Math.random() * 3);
+    const page = 1 + seededIndex(opts.seed ? `${opts.seed}:page` : undefined, 3);
     results = await provider.search(normQuery, opts.orientation, page);
     await bumpUsage(provider.name, { cache_hit: false });
     // Upsert cache
@@ -266,7 +282,7 @@ export async function searchStockFootage(opts: {
 
   // 5. Random pick from top 5 for variety
   const topN = candidates.slice(0, Math.min(5, candidates.length));
-  const pick = topN[Math.floor(Math.random() * topN.length)];
+  const pick = topN[seededIndex(opts.seed ? `${opts.seed}:pick` : undefined, topN.length)];
 
   // 6. Choose smallest file >= targetWidth, fallback to largest if all smaller
   const sortedFiles = [...pick.files].sort((a, b) => a.width - b.width);

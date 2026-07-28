@@ -47,6 +47,17 @@ type Scene = {
   visual_query: string | null;
 };
 
+type ClipSlice = {
+  id: string;
+  scene_id: string;
+  slice_index: number;
+  clip_url: string;
+  thumbnail_url: string | null;
+  duration_seconds: number;
+  timeline_start_seconds: number;
+  timeline_end_seconds: number;
+};
+
 const STATUS_STEPS: Array<{ key: string; label: string; pct: number }> = [
   { key: "uploading", label: "Uploading audio", pct: 15 },
   { key: "draft", label: "Audio uploaded", pct: 25 },
@@ -144,18 +155,20 @@ function ProjectDetail() {
     // refetches entirely — slices only change when submitRenderJob writes new
     // rows, which always triggers a status transition that changes this key.
     queryKey: ["clip-slices", projectId, project?.status],
-    queryFn: async () => {
+    queryFn: async (): Promise<ClipSlice[]> => {
       const { data, error } = await supabase
         .from("render_clip_slices")
-        .select("id, scene_id, slice_index, clip_url, duration_seconds")
+        .select(
+          "id, scene_id, slice_index, clip_url, thumbnail_url, duration_seconds, timeline_start_seconds, timeline_end_seconds",
+        )
         .eq("project_id", projectId);
       // NOTE: ordering by scene_id (UUID) is removed here — UUIDs are not sequential
       // and produce an effectively random scene order. Sorting is done client-side
       // in sortedClipSlices using the scene idx values from scenesQuery.
       if (error) throw error;
-      return data ?? [];
+      return (data ?? []) as ClipSlice[];
     },
-    staleTime: Infinity,   // never auto-stale; key change (status transition) forces a new fetch
+    refetchInterval: () => (project?.status === "matching_footage" ? 1500 : false),
   });
 
   const clipsByScene = useMemo(() => {
@@ -192,6 +205,21 @@ function ProjectDetail() {
       return a.slice_index - b.slice_index;
     });
   }, [clipSlicesQuery.data, scenesQuery.data]);
+
+  const expectedFixedSliceCount = useMemo(() => {
+    if (!project?.clip_duration_seconds || !scenesQuery.data) return 0;
+    const fixedDuration = Number(project.clip_duration_seconds);
+    return scenesQuery.data.reduce((count, scene) => {
+      const duration = Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
+      return count + (duration > 0 ? Math.max(1, Math.ceil(duration / fixedDuration)) : 0);
+    }, 0);
+  }, [project?.clip_duration_seconds, scenesQuery.data]);
+
+  const fixedSlicesComplete =
+    !project?.clip_duration_seconds ||
+    (expectedFixedSliceCount > 0 &&
+      new Set(sortedClipSlices.map((s) => `${s.scene_id}:${s.slice_index}`)).size >=
+        expectedFixedSliceCount);
 
   // Compute per-scene video timestamps by accumulating slice durations in scene
   // order. Each entry is { videoStart, videoEnd } in seconds from video position 0.
@@ -299,6 +327,10 @@ function ProjectDetail() {
     refetchInterval: (q) => (q.state.data && RENDER_ACTIVE.has(q.state.data.status) ? 3000 : false),
   });
   const renderJob = renderJobQuery.data;
+  const canSubmitRender =
+    project?.status === "ready" &&
+    fixedSlicesComplete &&
+    (!renderJob || !RENDER_ACTIVE.has(renderJob.status));
 
   const handleRender = async () => {
     setSubmittingRender(true);
@@ -529,18 +561,23 @@ function ProjectDetail() {
                           className="relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
                         >
                           <div className="relative aspect-video w-full bg-muted-foreground/10">
-                            <video
-                              src={slice.clip_url}
-                              muted
-                              playsInline
-                              preload="metadata"
-                              className="h-full w-full object-cover"
-                            />
+                            {slice.thumbnail_url ? (
+                              <img
+                                src={slice.thumbnail_url}
+                                alt=""
+                                className="h-full w-full object-cover"
+                                loading="lazy"
+                              />
+                            ) : (
+                              <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+                                Matched
+                              </div>
+                            )}
                           </div>
                           <div className="p-2 text-xs">
                             <div className="flex items-center justify-between text-muted-foreground">
                               <span>Slice {slice.slice_index + 1}</span>
-                              <span>{slice.duration_seconds}s</span>
+                              <span>{Number(slice.duration_seconds).toFixed(1)}s</span>
                             </div>
                           </div>
                         </div>
@@ -606,7 +643,7 @@ function ProjectDetail() {
                 <CardHeader>
                   <div className="flex items-center justify-between gap-4">
                     <CardTitle className="text-base">Final video</CardTitle>
-                    {isReady && (!renderJob || !RENDER_ACTIVE.has(renderJob.status)) ? (
+                    {canSubmitRender ? (
                       <div className="flex flex-wrap items-center gap-2">
                         <Button size="sm" onClick={handleRender} disabled={submittingRender} variant="outline">
                           {submittingRender ? (
@@ -614,7 +651,7 @@ function ProjectDetail() {
                           ) : (
                             <Film className="mr-2 h-4 w-4" />
                           )}
-                          {renderJob?.status === "completed" ? "Re-render" : "Render video"}
+                          Render video
                         </Button>
                       </div>
                     ) : null}
@@ -690,7 +727,7 @@ function ProjectDetail() {
                     </p>
                   ) : null}
 
-                  {!renderJob && isReady ? (
+                  {!renderJob && canSubmitRender ? (
                     <p className="text-sm text-muted-foreground">
                       Everything looks good. Click <span className="font-medium">Render video</span> to
                       stitch the timeline into an MP4.

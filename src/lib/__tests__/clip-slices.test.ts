@@ -15,11 +15,54 @@ const scenes = [
 describe("fixed-duration clip slice helpers", () => {
   it("computes expected slots from scene duration and fixed duration", () => {
     expect(buildExpectedSliceSlots(scenes, 4)).toEqual([
-      { sceneId: "scene-a", sceneIdx: 0, sliceIndex: 0 },
-      { sceneId: "scene-b", sceneIdx: 1, sliceIndex: 0 },
-      { sceneId: "scene-b", sceneIdx: 1, sliceIndex: 1 },
-      { sceneId: "scene-b", sceneIdx: 1, sliceIndex: 2 },
+      {
+        sceneId: "scene-a",
+        sceneIdx: 0,
+        sliceIndex: 0,
+        timelineStart: 0,
+        timelineEnd: 4,
+        durationSeconds: 4,
+      },
+      {
+        sceneId: "scene-b",
+        sceneIdx: 1,
+        sliceIndex: 0,
+        timelineStart: 4.1,
+        timelineEnd: 8.1,
+        durationSeconds: 4,
+      },
+      {
+        sceneId: "scene-b",
+        sceneIdx: 1,
+        sliceIndex: 1,
+        timelineStart: 8.1,
+        timelineEnd: 12.1,
+        durationSeconds: 4,
+      },
+      {
+        sceneId: "scene-b",
+        sceneIdx: 1,
+        sliceIndex: 2,
+        timelineStart: 12.1,
+        timelineEnd: 13.1,
+        durationSeconds: 1,
+      },
     ]);
+  });
+
+  it("keeps total fixed-duration visual time aligned to narration time", () => {
+    const longScenes = [
+      { id: "scene-a", idx: 0, start_ts: 0, end_ts: 4 },
+      { id: "scene-b", idx: 1, start_ts: 4, end_ts: 10.5 },
+      { id: "scene-c", idx: 2, start_ts: 10.5, end_ts: 12 },
+    ];
+
+    const total = buildExpectedSliceSlots(longScenes, 4).reduce(
+      (sum, slot) => sum + slot.durationSeconds,
+      0,
+    );
+
+    expect(total).toBe(12);
   });
 
   it("reports missing cache rows by scene and slice", () => {

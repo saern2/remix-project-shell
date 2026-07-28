@@ -363,20 +363,32 @@ async function advanceFromMatchingFootage(projectId: string) {
 
       const { data: existingSlices } = await supabaseAdmin
         .from("render_clip_slices")
-        .select("scene_id, slice_index, clip_url, provider_clip_id, duration_seconds")
+        .select(
+          "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+        )
         .eq("project_id", projectId);
 
       const startedAt = Date.now();
       const expectedSlots = buildExpectedSliceSlots(scenes, fixedDuration);
       const sliceCache = new Map<
         string,
-        { clip_url: string; provider_clip_id: string | null; duration_seconds: number }
+        {
+          clip_url: string;
+          provider_clip_id: string | null;
+          duration_seconds: number;
+          timeline_start_seconds: number;
+          timeline_end_seconds: number;
+          thumbnail_url: string | null;
+        }
       >();
       for (const row of existingSlices ?? []) {
         sliceCache.set(sliceKey(row.scene_id, row.slice_index), {
           clip_url: row.clip_url,
           provider_clip_id: row.provider_clip_id ?? null,
           duration_seconds: Number(row.duration_seconds),
+          timeline_start_seconds: Number(row.timeline_start_seconds),
+          timeline_end_seconds: Number(row.timeline_end_seconds),
+          thumbnail_url: row.thumbnail_url ?? null,
         });
       }
 
@@ -394,6 +406,9 @@ async function advanceFromMatchingFootage(projectId: string) {
         clip_url: string;
         provider_clip_id: string | null;
         duration_seconds: number;
+        timeline_start_seconds: number;
+        timeline_end_seconds: number;
+        thumbnail_url: string | null;
       }> = [];
       const unmatchedSlots: typeof pendingSlots = [];
       const FIXED_DURATION_CONCURRENCY = 4;
@@ -412,6 +427,7 @@ async function advanceFromMatchingFootage(projectId: string) {
             minDurationSec: fixedDuration,
             targetWidth,
             usedIds: [...usedIds],
+            seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
           });
           if (!result) {
             unmatchedSlots.push(slot);
@@ -422,13 +438,20 @@ async function advanceFromMatchingFootage(projectId: string) {
           if (usedIds.has(providerClipId) && attempt === 0) continue;
 
           usedIds.add(providerClipId);
-          newSliceRows.push({
+          const row = {
             project_id: projectId,
             scene_id: slot.sceneId,
             slice_index: slot.sliceIndex,
             clip_url: result.chosenFile.url,
             provider_clip_id: providerClipId,
-            duration_seconds: fixedDuration,
+            duration_seconds: slot.durationSeconds,
+            timeline_start_seconds: slot.timelineStart,
+            timeline_end_seconds: slot.timelineEnd,
+            thumbnail_url: result.pick.thumbnail_url ?? null,
+          };
+          newSliceRows.push(row);
+          await supabaseAdmin.from("render_clip_slices").upsert(row, {
+            onConflict: "project_id,scene_id,slice_index",
           });
           return;
         }
@@ -442,33 +465,18 @@ async function advanceFromMatchingFootage(projectId: string) {
         );
       }
 
-      const allRows = [
-        ...[...sliceCache.entries()].map(([key, v]) => {
-          const colonIdx = key.indexOf(":");
-          const scene_id = key.slice(0, colonIdx);
-          const slice_index = Number(key.slice(colonIdx + 1));
-          return {
-            project_id: projectId,
-            scene_id,
-            slice_index,
-            clip_url: v.clip_url,
-            provider_clip_id: v.provider_clip_id,
-            duration_seconds: fixedDuration,
-          };
-        }),
-        ...newSliceRows,
-      ];
+      const { data: finalSlices } = await supabaseAdmin
+        .from("render_clip_slices")
+        .select(
+          "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+        )
+        .eq("project_id", projectId);
+      const allRows = finalSlices ?? [];
       const coverage = summarizeSliceCoverage(scenes, fixedDuration, allRows);
       if (coverage.missingSlots.length > 0 || coverage.actualCount !== coverage.expectedCount) {
         throw new Error(
           `Fixed-duration footage matching incomplete: expected ${coverage.expectedCount} slices, prepared ${coverage.actualCount}. Missing ${describeMissingSlots(coverage.missingSlots)}.`,
         );
-      }
-
-      if (newSliceRows.length > 0) {
-        await supabaseAdmin.from("render_clip_slices").upsert(allRows, {
-          onConflict: "project_id,scene_id,slice_index",
-        });
       }
 
       const { data: selectedRows } = await supabaseAdmin
@@ -498,10 +506,10 @@ async function advanceFromMatchingFootage(projectId: string) {
             provider: "pexels",
             provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
             url: firstSlot.clip_url,
-            thumbnail_url: null,
+            thumbnail_url: firstSlot.thumbnail_url ?? null,
             width: targetWidth,
             height: Math.round(targetWidth * (orientation === "portrait" ? 16 / 9 : 9 / 16)),
-            duration_sec: fixedDuration,
+            duration_sec: Number(firstSlot.duration_seconds),
           })
           .select("id")
           .maybeSingle();
@@ -512,7 +520,7 @@ async function advanceFromMatchingFootage(projectId: string) {
               scene_id: scene.id,
               clip_candidate_id: candidate.id,
               in_point: 0,
-              out_point: Math.min(fixedDuration, Math.max(fixedSceneDuration(scene), 1)),
+              out_point: Math.min(Number(firstSlot.duration_seconds), Math.max(fixedSceneDuration(scene), 1)),
             },
             { onConflict: "scene_id" },
           );
