@@ -1,8 +1,3 @@
-alter table public.render_clip_slices
-  add column if not exists timeline_start_seconds numeric,
-  add column if not exists timeline_end_seconds numeric,
-  add column if not exists thumbnail_url text;
-
 with scene_spans as (
   select
     s.id,
@@ -40,14 +35,3 @@ set
   duration_seconds = greatest(0, aligned.timeline_end_seconds - aligned.timeline_start_seconds)
 from aligned
 where r.id = aligned.id;
-
-update public.render_clip_slices
-set
-  timeline_start_seconds = coalesce(timeline_start_seconds, 0),
-  timeline_end_seconds = coalesce(timeline_end_seconds, duration_seconds)
-where timeline_start_seconds is null
-  or timeline_end_seconds is null;
-
-alter table public.render_clip_slices
-  alter column timeline_start_seconds set not null,
-  alter column timeline_end_seconds set not null;

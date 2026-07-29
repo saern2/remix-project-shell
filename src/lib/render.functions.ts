@@ -167,6 +167,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             .filter(Boolean),
           ...(existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
         ]);
+        const expectedSlots = buildExpectedSliceSlots(sceneRows, fixedDuration);
+        const sceneById = new Map(sceneRows.map((scene) => [scene.id, scene]));
 
         // Build new slice rows to insert (only for slots not already cached)
         const newSliceRows: Array<{
@@ -182,73 +184,66 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         }> = [];
 
         clips = [];
-        for (const scene of sceneRows) {
-          const sceneStart = Number(scene.start_ts ?? 0);
-          const sceneEnd = Number(scene.end_ts ?? 0);
-          const total = Math.max(0, sceneEnd - sceneStart);
-          if (total <= 0) continue;
-
-          // Every slot is exactly fixedDuration seconds — even if the scene voiceover
-          // is shorter. The video plays the full fixedDuration; audio continues into
-          // the next scene while this visual is still showing. This is intentional
-          // (Option A): uniform clip length takes priority over voiceover-visual sync.
-          const sceneSlots = buildExpectedSliceSlots([scene], fixedDuration);
-
-          for (let slotIdx = 0; slotIdx < sceneSlots.length; slotIdx++) {
-            const slot = sceneSlots[slotIdx];
-            const cacheKey = `${scene.id}:${slotIdx}`;
-            const cached = sliceCache.get(cacheKey);
-
-            let url: string;
-            let providerClipId: string | null = null;
-            let thumbnailUrl: string | null = null;
-
-            if (cached) {
-              // Reuse persisted assignment — no API call needed
-              url = cached.clip_url;
-              providerClipId = cached.provider_clip_id;
-            } else {
-              // Search for a new clip
-              let found: string | null = null;
-              if (scene.visual_query) {
-                const result = await searchStockFootage({
-                  query: scene.visual_query,
-                  orientation,
-                  minDurationSec: fixedDuration, // always request full fixedDuration
-                  targetWidth,
-                  usedIds: [...usedIds],
-                  seed: `${projectId}:${scene.id}:${slotIdx}`,
-                });
-                if (result) {
-                  found = result.chosenFile.url;
-                  providerClipId = result.pick.provider_clip_id;
-                  thumbnailUrl = result.pick.thumbnail_url ?? null;
-                  usedIds.add(result.pick.provider_clip_id);
-                }
-              }
-              const fallbackUrl = scene.selected_clips?.clip_candidates?.url;
-              if (!found && !fallbackUrl) {
-                throw new Error(`Scene ${scene.idx + 1} has no selected clip fallback.`);
-              }
-              url = found ?? fallbackUrl!;
-
-              // Queue this new assignment for persistence
-              newSliceRows.push({
-                project_id: projectId,
-                scene_id: scene.id as string,
-                slice_index: slotIdx,
-                clip_url: url,
-                provider_clip_id: providerClipId,
-                duration_seconds: slot.durationSeconds,
-                timeline_start_seconds: slot.timelineStart,
-                timeline_end_seconds: slot.timelineEnd,
-                thumbnail_url: thumbnailUrl,
-              });
-            }
-
-            // Always use the full fixedDuration — never a sub-duration remainder.
-            clips.push({ clip_url: url, start: 0, end: cached?.duration_seconds ?? slot.durationSeconds });
+        for (const slot of expectedSlots) {
+          const scene = sceneById.get(slot.sceneId);
+          if (!scene) {
+            throw new Error(`Scene ${slot.sceneIdx + 1} is missing from the render timeline.`);
           }
+          const cacheKey = `${slot.sceneId}:${slot.sliceIndex}`;
+          const cached = sliceCache.get(cacheKey);
+
+          let url: string;
+          let providerClipId: string | null = null;
+          let thumbnailUrl: string | null = null;
+
+          if (cached) {
+            // Reuse persisted assignment — no API call needed
+            url = cached.clip_url;
+            providerClipId = cached.provider_clip_id;
+          } else {
+            // Search for a new clip
+            let found: string | null = null;
+            if (scene.visual_query) {
+              const result = await searchStockFootage({
+                query: scene.visual_query,
+                orientation,
+                minDurationSec: fixedDuration, // always request full fixedDuration
+                targetWidth,
+                usedIds: [...usedIds],
+                seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
+              });
+              if (result) {
+                found = result.chosenFile.url;
+                providerClipId = result.pick.provider_clip_id;
+                thumbnailUrl = result.pick.thumbnail_url ?? null;
+                usedIds.add(result.pick.provider_clip_id);
+              }
+            }
+            const fallbackUrl = scene.selected_clips?.clip_candidates?.url;
+            if (!found && !fallbackUrl) {
+              throw new Error(`Scene ${scene.idx + 1} has no selected clip fallback.`);
+            }
+            url = found ?? fallbackUrl!;
+
+            // Queue this new assignment for persistence
+            newSliceRows.push({
+              project_id: projectId,
+              scene_id: slot.sceneId,
+              slice_index: slot.sliceIndex,
+              clip_url: url,
+              provider_clip_id: providerClipId,
+              duration_seconds: slot.durationSeconds,
+              timeline_start_seconds: slot.timelineStart,
+              timeline_end_seconds: slot.timelineEnd,
+              thumbnail_url: thumbnailUrl,
+            });
+          }
+
+          clips.push({
+            clip_url: url,
+            start: 0,
+            end: cached?.duration_seconds ?? slot.durationSeconds,
+          });
         }
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
 

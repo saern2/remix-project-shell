@@ -10,6 +10,14 @@ const renderJobInsert = vi.fn();
 const adminUpdate = vi.fn();
 const searchStockFootage = vi.fn();
 let renderClipSliceRows: unknown[] = [];
+let userScenes: Array<{
+  id: string;
+  idx: number;
+  start_ts: number;
+  end_ts: number;
+  visual_query: string;
+  selected_clips: null;
+}> = [];
 
 vi.mock("@tanstack/react-start", () => ({
   createServerFn: () => {
@@ -107,16 +115,7 @@ function makeUserSupabase() {
           select: () => ({
             eq: () => ({
               order: async () => ({
-                data: [
-                  {
-                    id: "scene-one",
-                    idx: 0,
-                    start_ts: 0,
-                    end_ts: 8,
-                    visual_query: "football practice",
-                    selected_clips: null,
-                  },
-                ],
+                data: userScenes,
                 error: null,
               }),
             }),
@@ -157,6 +156,16 @@ describe("submitRenderJob fixed-duration fallback", () => {
     vi.resetModules();
     capturedHandlers = [];
     renderClipSliceRows = [];
+    userScenes = [
+      {
+        id: "scene-one",
+        idx: 0,
+        start_ts: 0,
+        end_ts: 8,
+        visual_query: "football practice",
+        selected_clips: null,
+      },
+    ];
     renderClipSliceUpsert.mockReset().mockResolvedValue({ error: null });
     renderJobInsert.mockReset().mockResolvedValue({ data: { id: JOB_ID }, error: null });
     adminUpdate.mockReset().mockResolvedValue({ error: null });
@@ -219,5 +228,81 @@ describe("submitRenderJob fixed-duration fallback", () => {
         timeline_end_seconds: 8,
       }),
     ]);
+  });
+
+  it("fills and renders fixed-duration gaps before the next scene starts", async () => {
+    userScenes = [
+      {
+        id: "scene-one",
+        idx: 0,
+        start_ts: 0,
+        end_ts: 4,
+        visual_query: "football kickoff",
+        selected_clips: null,
+      },
+      {
+        id: "scene-two",
+        idx: 1,
+        start_ts: 6,
+        end_ts: 10,
+        visual_query: "football crowd",
+        selected_clips: null,
+      },
+    ];
+    searchStockFootage
+      .mockReset()
+      .mockResolvedValueOnce({
+        chosenFile: { url: "https://videos.example.com/a.mp4" },
+        pick: { provider_clip_id: "pexels-a" },
+      })
+      .mockResolvedValueOnce({
+        chosenFile: { url: "https://videos.example.com/b.mp4" },
+        pick: { provider_clip_id: "pexels-b" },
+      })
+      .mockResolvedValueOnce({
+        chosenFile: { url: "https://videos.example.com/c.mp4" },
+        pick: { provider_clip_id: "pexels-c" },
+      });
+
+    const submitRenderJobHandler = capturedHandlers[0];
+    await submitRenderJobHandler({
+      data: { projectId: PROJECT_ID },
+      context: { supabase: makeUserSupabase(), userId: USER_ID },
+    });
+
+    expect(searchStockFootage).toHaveBeenCalledTimes(3);
+    const [rows] = renderClipSliceUpsert.mock.calls[0];
+    expect(rows).toHaveLength(3);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        scene_id: "scene-one",
+        slice_index: 0,
+        duration_seconds: 4,
+        timeline_start_seconds: 0,
+        timeline_end_seconds: 4,
+      }),
+      expect.objectContaining({
+        scene_id: "scene-one",
+        slice_index: 1,
+        duration_seconds: 2,
+        timeline_start_seconds: 4,
+        timeline_end_seconds: 6,
+      }),
+      expect.objectContaining({
+        scene_id: "scene-two",
+        slice_index: 0,
+        duration_seconds: 4,
+        timeline_start_seconds: 6,
+        timeline_end_seconds: 10,
+      }),
+    ]);
+
+    const [, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const workerBody = JSON.parse(String(init.body));
+    expect(workerBody.transition).toBe("hard-cut");
+    expect(workerBody.clips.map((clip: { end: number }) => clip.end)).toEqual([4, 2, 4]);
   });
 });

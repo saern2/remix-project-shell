@@ -41,15 +41,31 @@ export function expectedSlotCount(scene: FixedDurationScene, fixedDuration: numb
   return Math.max(1, Math.ceil(total / fixedDuration));
 }
 
+function timelineStartForScene(scene: FixedDurationScene): number {
+  return Number(scene.start_ts ?? 0);
+}
+
+function timelineEndForScene(scenes: FixedDurationScene[], index: number): number {
+  const scene = scenes[index];
+  const sceneEnd = Number(scene.end_ts ?? 0);
+  const nextSceneStart =
+    index + 1 < scenes.length ? Number(scenes[index + 1].start_ts ?? sceneEnd) : sceneEnd;
+
+  return nextSceneStart > sceneEnd ? nextSceneStart : sceneEnd;
+}
+
 export function buildExpectedSliceSlots(
   scenes: FixedDurationScene[],
   fixedDuration: number,
 ): ExpectedSliceSlot[] {
   const slots: ExpectedSliceSlot[] = [];
-  for (const scene of scenes) {
-    const count = expectedSlotCount(scene, fixedDuration);
-    const sceneStart = Number(scene.start_ts ?? 0);
-    const sceneEnd = Number(scene.end_ts ?? 0);
+  for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
+    const scene = scenes[sceneIndex];
+    const sceneStart = timelineStartForScene(scene);
+    const sceneEnd = timelineEndForScene(scenes, sceneIndex);
+    const total = Math.max(0, sceneEnd - sceneStart);
+    const count = total > 0 ? Math.max(1, Math.ceil(total / fixedDuration)) : 0;
+
     for (let sliceIndex = 0; sliceIndex < count; sliceIndex++) {
       const timelineStart = roundTime(sceneStart + sliceIndex * fixedDuration);
       const timelineEnd = roundTime(Math.min(sceneEnd, timelineStart + fixedDuration));
