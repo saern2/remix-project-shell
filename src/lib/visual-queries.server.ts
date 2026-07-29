@@ -10,14 +10,17 @@ const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const MODEL = "google/gemini-2.5-flash";
 const BATCH_SIZE = 12;
 
-const SYSTEM_PROMPT = `You convert narration sentences into short, CONCRETE, visually-searchable stock-footage phrases (3-6 words each).
+const SYSTEM_PROMPT = `You convert narration sentences into short, CONCRETE, visually-searchable stock-footage phrases (3-8 words each).
 
 Rules:
 - Each phrase must describe something a camera can literally film: people, places, objects, actions, weather, scenery.
 - Never output abstract nouns alone (e.g. "freedom", "success", "growth"). Ground abstractions in a concrete visual metaphor.
 - Prefer everyday, common footage terms that would match stock libraries (Pexels, Pixabay).
+- Preserve named entities, countries, cities, organizations, and public roles when they are visually searchable.
+- Use the surrounding story context to keep consecutive clips coherent, but make each query specific to its own sentence.
+- For geopolitics, diplomacy, and war analysis, prefer concrete visuals like country flags, maps, diplomats, press conferences, military briefings, borders, missiles, or newsrooms. Do not default every sentence to generic soldiers unless the sentence is actually about combat.
 - No punctuation, no quotes, no leading articles ("the", "a"), lowercase preferred.
-- 3-6 words. Never a full sentence.
+- 3-8 words. Never a full sentence.
 
 Examples:
 - "Success requires patience and discipline." -> "runner training empty stadium"
@@ -39,8 +42,25 @@ const CATEGORY_THEMES: Record<VisualCategory, string> = {
   crime: "crime law enforcement",
 };
 
+const KNOWN_ENTITY_TERMS: Array<[RegExp, string]> = [
+  [/\b(?:u\.s\.|us|usa|united states|america|american|washington)\b/i, "united states"],
+  [/\b(?:iran|iranian|tehran)\b/i, "iran"],
+  [/\b(?:israel|israeli)\b/i, "israel"],
+  [/\b(?:gaza|palestine|palestinian)\b/i, "palestine"],
+  [/\b(?:russia|russian|moscow)\b/i, "russia"],
+  [/\b(?:ukraine|ukrainian|kyiv|kiev)\b/i, "ukraine"],
+  [/\b(?:china|chinese|beijing)\b/i, "china"],
+  [/\b(?:white house|pentagon|congress|senate)\b/i, "washington politics"],
+  [/\b(?:foreign minister|president|official|diplomat|negotiator)\b/i, "government officials"],
+  [
+    /\b(?:missile|drone|airstrike|ceasefire|negotiation\w*|sanction\w*|border)\b/i,
+    "conflict diplomacy",
+  ],
+];
+
 const STOP_WORDS = new Set([
   "a",
+  "after",
   "an",
   "and",
   "are",
@@ -70,7 +90,12 @@ const STOP_WORDS = new Set([
 ]);
 
 function categoryInstruction(category: VisualCategory): string {
-  return `\n\nEvery visual query you generate MUST stay within the ${CATEGORY_THEMES[category]} visual theme, even when the narration sentence itself is unrelated or neutral. Find the closest on-theme concrete visual interpretation rather than a literal one.`;
+  const examples =
+    category === "war"
+      ? "If the script mentions Iran and the United States, use visuals like iran united states flags, tehran washington map, diplomats press conference, missile defense system, or war room briefing when appropriate."
+      : "If the script mentions named people, cities, agencies, evidence, money, courts, or police, preserve those details in the query instead of using generic crime footage.";
+
+  return `\n\nUse the ${CATEGORY_THEMES[category]} theme as a visual lane, not as a replacement for the sentence. Preserve concrete story entities first, then express them through the theme. ${examples}`;
 }
 
 function stripCodeFence(content: string): string {
@@ -94,13 +119,13 @@ function extractBalancedJson(content: string): string | null {
         escaped = false;
       } else if (ch === "\\") {
         escaped = true;
-      } else if (ch === "\"") {
+      } else if (ch === '"') {
         inString = false;
       }
       continue;
     }
 
-    if (ch === "\"") {
+    if (ch === '"') {
       inString = true;
     } else if (ch === "{" || ch === "[") {
       stack.push(ch);
@@ -134,8 +159,39 @@ function normalizeQuery(query: string): string {
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
     .filter(Boolean)
-    .slice(0, 6)
+    .slice(0, 8)
     .join(" ");
+}
+
+function uniqueTerms(terms: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const term of terms) {
+    const normalized = normalizeQuery(term);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function extractKnownEntityTerms(text: string): string[] {
+  return uniqueTerms(
+    KNOWN_ENTITY_TERMS.filter(([pattern]) => pattern.test(text)).map(([, term]) => term),
+  );
+}
+
+function narrativeContextTerms(items: SceneInput[]): string[] {
+  const text = items.map((item) => item.text).join(" ");
+  return uniqueTerms(extractKnownEntityTerms(text)).slice(0, 6);
+}
+
+function sceneContextTerms(items: SceneInput[], index: number): string[] {
+  const windowText = items
+    .slice(Math.max(0, index - 1), Math.min(items.length, index + 2))
+    .map((item) => item.text)
+    .join(" ");
+  return uniqueTerms(extractKnownEntityTerms(windowText)).slice(0, 5);
 }
 
 function mapFromParsed(parsed: unknown, items: SceneInput[]): Map<number, string> {
@@ -162,15 +218,27 @@ function mapFromParsed(parsed: unknown, items: SceneInput[]): Map<number, string
 }
 
 export function fallbackVisualQuery(text: string, category: VisualCategory | null = null): string {
+  const entityTerms = extractKnownEntityTerms(text);
+  const categoryWords = category ? CATEGORY_THEMES[category].split(/\s+/) : [];
+  const entityWords = new Set([
+    ...entityTerms.flatMap((term) => term.split(/\s+/)),
+    ...categoryWords,
+  ]);
   const words = text
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
-    .filter((word) => word.length > 2 && !STOP_WORDS.has(word))
+    .filter((word) => word.length > 2 && !STOP_WORDS.has(word) && !entityWords.has(word))
     .slice(0, 4);
 
-  const base = words.length > 0 ? words.join(" ") : "people outdoor scene";
-  return category ? `${CATEGORY_THEMES[category]} ${base}`.split(/\s+/).slice(0, 6).join(" ") : base;
+  const baseTerms = [
+    ...entityTerms,
+    ...(words.length > 0 ? [words.join(" ")] : ["people outdoor scene"]),
+  ];
+  const base = uniqueTerms(baseTerms).join(" ");
+  return category
+    ? `${base} ${CATEGORY_THEMES[category]}`.split(/\s+/).slice(0, 8).join(" ")
+    : base.split(/\s+/).slice(0, 8).join(" ");
 }
 
 async function callGateway(
@@ -183,7 +251,17 @@ async function callGateway(
   const systemPrompt =
     category === null ? SYSTEM_PROMPT : SYSTEM_PROMPT + categoryInstruction(category);
 
-  const userPrompt = `Convert each of the following ${items.length} narration sentences into a concrete visual stock-footage phrase. Return one entry per input idx.\n\nInput:\n${JSON.stringify(items)}`;
+  const narrativeTerms = narrativeContextTerms(items);
+  const contextualItems = items.map((item, index) => ({
+    ...item,
+    context_terms: sceneContextTerms(items, index),
+  }));
+  const userPrompt = `Convert each of the following ${items.length} narration sentences into a concrete visual stock-footage phrase. Return one entry per input idx.
+
+Project context terms: ${narrativeTerms.length ? narrativeTerms.join(", ") : "none"}
+
+Input:
+${JSON.stringify(contextualItems)}`;
 
   const res = await fetch(GATEWAY_URL, {
     method: "POST",

@@ -54,7 +54,11 @@ function buildPexelsUrl(query: string, orientation: Orientation, page: number): 
  * Legacy env-var key path. UNCHANGED behaviour — this is the fallback used
  * whenever the pexels_api_keys pool is empty (e.g. before any CSV upload).
  */
-async function pexelsFetchFromEnv(query: string, orientation: Orientation, page: number): Promise<Response> {
+async function pexelsFetchFromEnv(
+  query: string,
+  orientation: Orientation,
+  page: number,
+): Promise<Response> {
   const keys = parsePexelsKeys();
   const url = buildPexelsUrl(query, orientation, page);
 
@@ -123,7 +127,11 @@ async function markKeyDead(id: string, message: string) {
     .eq("id", id);
 }
 
-async function pexelsFetch(query: string, orientation: Orientation, page: number): Promise<Response> {
+async function pexelsFetch(
+  query: string,
+  orientation: Orientation,
+  page: number,
+): Promise<Response> {
   const pool = await loadActivePoolKeys();
   // CRITICAL: empty pool -> behave exactly as before, using env-var keys.
   if (pool.length === 0) return pexelsFetchFromEnv(query, orientation, page);
@@ -147,7 +155,6 @@ async function pexelsFetch(query: string, orientation: Orientation, page: number
   console.error(`[pexels-pool] ${lastAuthError}; falling back to env keys`);
   return pexelsFetchFromEnv(query, orientation, page);
 }
-
 
 export const pexelsProvider: StockProvider = {
   name: "pexels",
@@ -214,9 +221,26 @@ function seededIndex(seed: string | undefined, modulo: number): number {
   return stableHash(seed) % modulo;
 }
 
+export function providerFamilyKey(providerClipId: string): string {
+  const id = providerClipId.trim();
+  return /^\d{6,}$/.test(id) ? id.slice(0, 4) : id;
+}
+
+function stableCandidateScore(
+  video: StockVideo,
+  originalIndex: number,
+  minDurationSec: number,
+  seed: string | undefined,
+): number {
+  const durationSlack = Math.max(0, video.duration_sec - minDurationSec);
+  const durationBonus = Math.min(durationSlack, 20) / 100;
+  const seedJitter = stableHash(`${seed ?? "stock"}:${video.provider_clip_id}`) / 0xffffffff / 1000;
+  return originalIndex - durationBonus + seedJitter;
+}
+
 /**
  * Search stock footage, dedup against usedIds, filter by minimum duration
- * (with fallback), and randomly pick from the top candidates. Selects the
+ * (with fallback), and pick deterministically by relevance/diversity. Selects the
  * video_file whose width is closest to targetWidth. Uses 24h response cache
  * keyed by (provider, normalized query, orientation) and increments
  * provider_usage on real (non-cached) calls.
@@ -254,25 +278,34 @@ export async function searchStockFootage(opts: {
     results = await provider.search(normQuery, opts.orientation, page);
     await bumpUsage(provider.name, { cache_hit: false });
     // Upsert cache
-    await supabaseAdmin
-      .from("stock_search_cache")
-      .upsert(
-        {
-          provider: provider.name,
-          query: normQuery,
-          orientation: opts.orientation,
-          results: results as unknown as never,
-          cached_at: new Date().toISOString(),
-        },
-        { onConflict: "provider,query,orientation" },
-      );
+    await supabaseAdmin.from("stock_search_cache").upsert(
+      {
+        provider: provider.name,
+        query: normQuery,
+        orientation: opts.orientation,
+        results: results as unknown as never,
+        cached_at: new Date().toISOString(),
+      },
+      { onConflict: "provider,query,orientation" },
+    );
   }
 
   if (!results || results.length === 0) return null;
 
-  // 3. Dedup against usedIds
+  // 3. Dedup against exact clips and nearby Pexels series/families. Exact IDs
+  // prevent literal repeats; family IDs reduce visually similar clips from the
+  // same stock shoot when a theme produces broad repeated searches.
   const used = new Set(opts.usedIds);
-  let pool = results.filter((v) => !used.has(v.provider_clip_id) && v.files.length > 0);
+  const usedFamilies = new Set(opts.usedIds.map(providerFamilyKey));
+  let pool = results.filter(
+    (v) =>
+      !used.has(v.provider_clip_id) &&
+      !usedFamilies.has(providerFamilyKey(v.provider_clip_id)) &&
+      v.files.length > 0,
+  );
+  if (pool.length === 0) {
+    pool = results.filter((v) => !used.has(v.provider_clip_id) && v.files.length > 0);
+  }
   if (pool.length === 0) pool = results.filter((v) => v.files.length > 0);
   if (pool.length === 0) return null;
 
@@ -280,9 +313,18 @@ export async function searchStockFootage(opts: {
   const longEnough = pool.filter((v) => v.duration_sec >= opts.minDurationSec);
   const candidates = longEnough.length > 0 ? longEnough : pool;
 
-  // 5. Random pick from top 5 for variety
-  const topN = candidates.slice(0, Math.min(5, candidates.length));
-  const pick = topN[seededIndex(opts.seed ? `${opts.seed}:pick` : undefined, topN.length)];
+  // 5. Stable relevance pick. Provider order is already relevance-weighted, so
+  // index dominates; duration and seed only break close choices consistently.
+  const pick = candidates
+    .map((video) => ({
+      video,
+      index: results!.findIndex((result) => result.provider_clip_id === video.provider_clip_id),
+    }))
+    .sort(
+      (a, b) =>
+        stableCandidateScore(a.video, a.index, opts.minDurationSec, opts.seed) -
+        stableCandidateScore(b.video, b.index, opts.minDurationSec, opts.seed),
+    )[0].video;
 
   // 6. Choose smallest file >= targetWidth, fallback to largest if all smaller
   const sortedFiles = [...pick.files].sort((a, b) => a.width - b.width);

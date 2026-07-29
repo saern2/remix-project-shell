@@ -21,7 +21,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { ArrowLeft, RotateCcw, AlertTriangle, Shuffle, Film, Loader2, X, Trash2 } from "lucide-react";
+import {
+  ArrowLeft,
+  RotateCcw,
+  AlertTriangle,
+  Shuffle,
+  Film,
+  Loader2,
+  X,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/projects/$projectId")({
@@ -82,6 +91,16 @@ const STATUS_LABELS: Record<string, string> = {
 const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_footage"]);
 const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching", "uploading"]);
 
+function expectedFixedSlicesForScenes(scenes: Scene[], fixedDuration: number): number {
+  return scenes.reduce((count, scene, index) => {
+    const sceneStart = Number(scene.start_ts);
+    const sceneEnd = Number(scene.end_ts);
+    const nextStart = index + 1 < scenes.length ? Number(scenes[index + 1].start_ts) : sceneEnd;
+    const visualEnd = nextStart > sceneEnd ? nextStart : sceneEnd;
+    const duration = Math.max(0, visualEnd - sceneStart);
+    return count + (duration > 0 ? Math.max(1, Math.ceil(duration / fixedDuration)) : 0);
+  }, 0);
+}
 
 function ProjectDetail() {
   const { projectId } = Route.useParams();
@@ -102,7 +121,8 @@ function ProjectDetail() {
       return data as Project;
     },
     // Refetch quickly while the pipeline is running.
-    refetchInterval: (query) => (query.state.data && IN_PROGRESS.has(query.state.data.status) ? 3000 : false),
+    refetchInterval: (query) =>
+      query.state.data && IN_PROGRESS.has(query.state.data.status) ? 3000 : false,
   });
 
   const project = projectQuery.data;
@@ -111,9 +131,7 @@ function ProjectDetail() {
   const scenesQuery = useQuery({
     enabled:
       !!project &&
-      (isReady ||
-        project.status === "generating_scenes" ||
-        project.status === "matching_footage"),
+      (isReady || project.status === "generating_scenes" || project.status === "matching_footage"),
     queryKey: ["scenes", projectId],
     queryFn: async (): Promise<Scene[]> => {
       const { data, error } = await supabase
@@ -125,7 +143,9 @@ function ProjectDetail() {
       return data as Scene[];
     },
     refetchInterval: (query) =>
-      project?.status === "generating_scenes" || project?.status === "matching_footage" ? 3000 : false,
+      project?.status === "generating_scenes" || project?.status === "matching_footage"
+        ? 3000
+        : false,
   });
 
   const clipsQuery = useQuery({
@@ -174,10 +194,10 @@ function ProjectDetail() {
   const clipsByScene = useMemo(() => {
     const map = new Map<string, { thumb: string | null; url: string; duration: number }>();
     for (const row of clipsQuery.data ?? []) {
-      const c = (row as unknown as {
+      const c = row as unknown as {
         scene_id: string;
         clip_candidates: { thumbnail_url: string | null; url: string; duration_sec: number };
-      });
+      };
       map.set(c.scene_id, {
         thumb: c.clip_candidates.thumbnail_url,
         url: c.clip_candidates.url,
@@ -209,10 +229,7 @@ function ProjectDetail() {
   const expectedFixedSliceCount = useMemo(() => {
     if (!project?.clip_duration_seconds || !scenesQuery.data) return 0;
     const fixedDuration = Number(project.clip_duration_seconds);
-    return scenesQuery.data.reduce((count, scene) => {
-      const duration = Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
-      return count + (duration > 0 ? Math.max(1, Math.ceil(duration / fixedDuration)) : 0);
-    }, 0);
+    return expectedFixedSlicesForScenes(scenesQuery.data, fixedDuration);
   }, [project?.clip_duration_seconds, scenesQuery.data]);
 
   const fixedSlicesComplete =
@@ -220,39 +237,6 @@ function ProjectDetail() {
     (expectedFixedSliceCount > 0 &&
       new Set(sortedClipSlices.map((s) => `${s.scene_id}:${s.slice_index}`)).size >=
         expectedFixedSliceCount);
-
-  // Compute per-scene video timestamps by accumulating slice durations in scene
-  // order. Each entry is { videoStart, videoEnd } in seconds from video position 0.
-  // Only populated when the fixed-duration path is active (clip_duration_seconds set
-  // and slices loaded). In the default (scene-based) path this map stays empty and
-  // the Transcript panel shows only narration timestamps.
-  const sceneVideoTimestamps = useMemo((): Map<string, { videoStart: number; videoEnd: number }> => {
-    const map = new Map<string, { videoStart: number; videoEnd: number }>();
-    if (!project?.clip_duration_seconds || sortedClipSlices.length === 0) return map;
-
-    // Group total duration per scene_id, preserving scene order from sortedClipSlices.
-    // sortedClipSlices is already ordered by (sceneIdx, sliceIndex), so we can walk it
-    // once and accumulate in the order slices appear.
-    const seenOrder: string[] = [];   // scene_id insertion order
-    const durationByScene = new Map<string, number>();
-    for (const slice of sortedClipSlices) {
-      const sid = slice.scene_id;
-      if (!durationByScene.has(sid)) {
-        seenOrder.push(sid);
-        durationByScene.set(sid, 0);
-      }
-      durationByScene.set(sid, (durationByScene.get(sid) ?? 0) + Number(slice.duration_seconds));
-    }
-
-    // Walk scenes in order and accumulate cumulative video position.
-    let cursor = 0;
-    for (const sid of seenOrder) {
-      const dur = durationByScene.get(sid) ?? 0;
-      map.set(sid, { videoStart: cursor, videoEnd: cursor + dur });
-      cursor += dur;
-    }
-    return map;
-  }, [sortedClipSlices, project?.clip_duration_seconds]);
 
   const runSwap = useServerFn(swapSceneClip);
   const [swappingId, setSwappingId] = useState<string | null>(null);
@@ -316,7 +300,9 @@ function ProjectDetail() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("render_jobs")
-        .select("id, status, progress_pct, output_url, error, chunks_total, chunks_completed, created_at")
+        .select(
+          "id, status, progress_pct, output_url, error, chunks_total, chunks_completed, created_at",
+        )
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
         .limit(1)
@@ -380,9 +366,7 @@ function ProjectDetail() {
   useEffect(() => {
     if (!renderJob) return;
     if (renderJob.status !== "completed") return;
-    const needsResign =
-      !renderJob.output_url ||
-      renderJob.output_url.includes("/upload/sign/");
+    const needsResign = !renderJob.output_url || renderJob.output_url.includes("/upload/sign/");
     if (!needsResign) return;
 
     let cancelled = false;
@@ -396,11 +380,17 @@ function ProjectDetail() {
         // Silently ignore — worst case the video element shows no src
       }
     })();
-    return () => { cancelled = true; };
-  }, [renderJob?.id, renderJob?.output_url, renderJob?.status, projectId, queryClient, runPollRender]);
-
-
-
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    renderJob?.id,
+    renderJob?.output_url,
+    renderJob?.status,
+    projectId,
+    queryClient,
+    runPollRender,
+  ]);
 
   // Poll the pipeline server function whenever the project is mid-flight.
   useEffect(() => {
@@ -463,9 +453,7 @@ function ProjectDetail() {
                 Back
               </Link>
             </Button>
-            <h1 className="text-lg font-semibold">
-              {project?.name ?? "Loading..."}
-            </h1>
+            <h1 className="text-lg font-semibold">{project?.name ?? "Loading..."}</h1>
           </div>
           {project ? (
             <div className="flex items-center gap-2">
@@ -546,94 +534,111 @@ function ProjectDetail() {
               </CardContent>
             </Card>
 
-            {(isReady || project.status === "matching_footage") && scenesQuery.data && scenesQuery.data.length > 0 && (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">Timeline</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="flex gap-3 overflow-x-auto pb-2">
-                    {project.clip_duration_seconds && (clipSlicesQuery.data?.length ?? 0) > 0 ? (
-                      // Fixed-duration path: render persisted clip slices in correct scene order
-                      sortedClipSlices.map((slice) => (
-                        <div
-                          key={slice.id}
-                          className="relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
-                        >
-                          <div className="relative aspect-video w-full bg-muted-foreground/10">
-                            {slice.thumbnail_url ? (
-                              <img
-                                src={slice.thumbnail_url}
-                                alt=""
-                                className="h-full w-full object-cover"
-                                loading="lazy"
-                              />
-                            ) : (
-                              <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
-                                Matched
-                              </div>
-                            )}
-                          </div>
-                          <div className="p-2 text-xs">
-                            <div className="flex items-center justify-between text-muted-foreground">
-                              <span>Slice {slice.slice_index + 1}</span>
-                              <span>{Number(slice.duration_seconds).toFixed(1)}s</span>
-                            </div>
-                          </div>
-                        </div>
-                      ))
-                    ) : (
-                      // Default path: scene-based timeline
-                      scenesQuery.data.map((s) => {
-                        const clip = clipsByScene.get(s.id);
-                        const sceneDur = Number(s.end_ts) - Number(s.start_ts);
-                        const isSwapping = swappingId === s.id;
-                        return (
-                          <div
-                            key={s.id}
-                            className="group relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
-                          >
-                            <div className="relative aspect-video w-full bg-muted-foreground/10">
-                              {clip?.thumb ? (
-                                <img
-                                  src={clip.thumb}
-                                  alt={s.visual_query ?? ""}
-                                  className="h-full w-full object-cover"
-                                  loading="lazy"
-                                />
-                              ) : (
-                                <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
-                                  {project.status === "matching_footage" ? "Matching…" : "No clip"}
+            {(isReady || project.status === "matching_footage") &&
+              scenesQuery.data &&
+              scenesQuery.data.length > 0 && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-base">
+                      Timeline{" "}
+                      {project.clip_duration_seconds
+                        ? `(${sortedClipSlices.length}${expectedFixedSliceCount ? `/${expectedFixedSliceCount}` : ""} clips, ${
+                            scenesQuery.data.length
+                          } scenes)`
+                        : `(${scenesQuery.data.length} scenes)`}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex gap-3 overflow-x-auto pb-2">
+                      {project.clip_duration_seconds && (clipSlicesQuery.data?.length ?? 0) > 0
+                        ? // Fixed-duration path: render persisted clip slices in correct scene order
+                          sortedClipSlices.map((slice, index) => {
+                            const scene = scenesQuery.data.find((s) => s.id === slice.scene_id);
+                            return (
+                              <div
+                                key={slice.id}
+                                className="relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
+                              >
+                                <div className="relative aspect-video w-full bg-muted-foreground/10">
+                                  {slice.thumbnail_url ? (
+                                    <img
+                                      src={slice.thumbnail_url}
+                                      alt=""
+                                      className="h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
+                                  ) : (
+                                    <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+                                      Matched
+                                    </div>
+                                  )}
                                 </div>
-                              )}
-                              {clip && isReady ? (
-                                <Button
-                                  size="sm"
-                                  variant="secondary"
-                                  disabled={isSwapping}
-                                  onClick={() => handleSwap(s.id)}
-                                  className="absolute right-1 top-1 h-7 px-2 opacity-0 shadow transition-opacity group-hover:opacity-100"
-                                >
-                                  <Shuffle className="mr-1 h-3 w-3" />
-                                  {isSwapping ? "…" : "Swap"}
-                                </Button>
-                              ) : null}
-                            </div>
-                            <div className="p-2 text-xs">
-                              <div className="flex items-center justify-between text-muted-foreground">
-                                <span>Scene {s.idx + 1}</span>
-                                <span>{sceneDur.toFixed(1)}s</span>
+                                <div className="p-2 text-xs">
+                                  <div className="flex items-center justify-between text-muted-foreground">
+                                    <span>Clip {index + 1}</span>
+                                    <span>{Number(slice.duration_seconds).toFixed(1)}s</span>
+                                  </div>
+                                  {scene ? (
+                                    <div className="mt-1 text-muted-foreground/80">
+                                      Scene {scene.idx + 1}
+                                    </div>
+                                  ) : null}
+                                </div>
                               </div>
-                              <p className="mt-1 line-clamp-2 text-foreground/90">{s.text}</p>
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            )}
+                            );
+                          })
+                        : // Default path: scene-based timeline
+                          scenesQuery.data.map((s) => {
+                            const clip = clipsByScene.get(s.id);
+                            const sceneDur = Number(s.end_ts) - Number(s.start_ts);
+                            const isSwapping = swappingId === s.id;
+                            return (
+                              <div
+                                key={s.id}
+                                className="group relative w-40 shrink-0 overflow-hidden rounded-md border bg-muted"
+                              >
+                                <div className="relative aspect-video w-full bg-muted-foreground/10">
+                                  {clip?.thumb ? (
+                                    <img
+                                      src={clip.thumb}
+                                      alt={s.visual_query ?? ""}
+                                      className="h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
+                                  ) : (
+                                    <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+                                      {project.status === "matching_footage"
+                                        ? "Matching…"
+                                        : "No clip"}
+                                    </div>
+                                  )}
+                                  {clip && isReady ? (
+                                    <Button
+                                      size="sm"
+                                      variant="secondary"
+                                      disabled={isSwapping}
+                                      onClick={() => handleSwap(s.id)}
+                                      className="absolute right-1 top-1 h-7 px-2 opacity-0 shadow transition-opacity group-hover:opacity-100"
+                                    >
+                                      <Shuffle className="mr-1 h-3 w-3" />
+                                      {isSwapping ? "…" : "Swap"}
+                                    </Button>
+                                  ) : null}
+                                </div>
+                                <div className="p-2 text-xs">
+                                  <div className="flex items-center justify-between text-muted-foreground">
+                                    <span>Scene {s.idx + 1}</span>
+                                    <span>{sceneDur.toFixed(1)}s</span>
+                                  </div>
+                                  <p className="mt-1 line-clamp-2 text-foreground/90">{s.text}</p>
+                                </div>
+                              </div>
+                            );
+                          })}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
 
             {(isReady ||
               project.status === "rendering" ||
@@ -645,7 +650,12 @@ function ProjectDetail() {
                     <CardTitle className="text-base">Final video</CardTitle>
                     {canSubmitRender ? (
                       <div className="flex flex-wrap items-center gap-2">
-                        <Button size="sm" onClick={handleRender} disabled={submittingRender} variant="outline">
+                        <Button
+                          size="sm"
+                          onClick={handleRender}
+                          disabled={submittingRender}
+                          variant="outline"
+                        >
                           {submittingRender ? (
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                           ) : (
@@ -679,7 +689,11 @@ function ProjectDetail() {
                             (renderJob.chunks_total ?? 0) > 0
                               ? Math.max(
                                   renderJob.progress_pct,
-                                  Math.round(((renderJob.chunks_completed ?? 0) / (renderJob.chunks_total ?? 1)) * 100)
+                                  Math.round(
+                                    ((renderJob.chunks_completed ?? 0) /
+                                      (renderJob.chunks_total ?? 1)) *
+                                      100,
+                                  ),
                                 )
                               : renderJob.progress_pct
                           }
@@ -729,17 +743,17 @@ function ProjectDetail() {
 
                   {!renderJob && canSubmitRender ? (
                     <p className="text-sm text-muted-foreground">
-                      Everything looks good. Click <span className="font-medium">Render video</span> to
-                      stitch the timeline into an MP4.
+                      Everything looks good. Click <span className="font-medium">Render video</span>{" "}
+                      to stitch the timeline into an MP4.
                     </p>
                   ) : null}
                 </CardContent>
               </Card>
             )}
 
-
-
-            {(isReady || project.status === "generating_scenes" || project.status === "matching_footage") && (
+            {(isReady ||
+              project.status === "generating_scenes" ||
+              project.status === "matching_footage") && (
               <Card>
                 <CardHeader>
                   <CardTitle className="text-base">
@@ -753,38 +767,10 @@ function ProjectDetail() {
                     <p className="text-sm text-muted-foreground">No scenes yet.</p>
                   ) : (
                     <ol className="space-y-4">
-                      {scenesQuery.data.map((s) => {
-                        const videoTs = sceneVideoTimestamps.get(s.id);
-                        // Show the dual-timestamp row only when:
-                        //   (a) we have video position data for this scene, AND
-                        //   (b) the video timestamps differ from narration by >0.5s
-                        //       (avoid noise from rounding on perfectly-matched clips)
-                        const hasDrift =
-                          videoTs != null &&
-                          (Math.abs(videoTs.videoStart - s.start_ts) > 0.5 ||
-                            Math.abs(videoTs.videoEnd - s.end_ts) > 0.5);
-                        return (
+                      {scenesQuery.data.map((s) => (
                         <li key={s.id} className="rounded-md border p-4">
-                          <div className="mb-2 flex items-start justify-between gap-4 text-xs text-muted-foreground">
+                          <div className="mb-2 text-xs text-muted-foreground">
                             <span>Scene {s.idx + 1}</span>
-                            {hasDrift ? (
-                              <div className="flex flex-col items-end gap-0.5 text-right">
-                                <span>
-                                  <span className="text-muted-foreground/60">Narration</span>{" "}
-                                  {formatTs(s.start_ts)}–{formatTs(s.end_ts)}
-                                </span>
-                                <span>
-                                  <span className="text-muted-foreground/60">Video</span>{" "}
-                                  <span className="text-foreground/80">
-                                    {formatTs(videoTs!.videoStart)}–{formatTs(videoTs!.videoEnd)}
-                                  </span>
-                                </span>
-                              </div>
-                            ) : (
-                              <span>
-                                {formatTs(s.start_ts)}–{formatTs(s.end_ts)}
-                              </span>
-                            )}
                           </div>
                           <p className="text-sm leading-relaxed">{s.text}</p>
                           <div className="mt-3">
@@ -799,14 +785,12 @@ function ProjectDetail() {
                             )}
                           </div>
                         </li>
-                        );
-                      })}
+                      ))}
                     </ol>
                   )}
                 </CardContent>
               </Card>
             )}
-
           </div>
         )}
       </main>
@@ -816,7 +800,8 @@ function ProjectDetail() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete "{project?.name}"?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete the project and all its associated files. This action cannot be undone.
+              This will permanently delete the project and all its associated files. This action
+              cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -834,11 +819,4 @@ function ProjectDetail() {
       </AlertDialog>
     </div>
   );
-}
-
-function formatTs(sec: number): string {
-  if (!Number.isFinite(sec)) return "0:00";
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
 }
