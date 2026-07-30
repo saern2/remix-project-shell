@@ -1,1 +1,4 @@
 project_id = "fkinlreqbihdcnhputfh"
+
+[functions.cleanup-expired-projects]
+verify_jwt = false
