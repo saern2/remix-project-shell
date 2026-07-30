@@ -1,4 +1,6 @@
 // Feature: render-pipeline-reliability, Property 14: Progress component forwards aria-label to DOM
+import { describe, it, expect } from "vitest";
+
 
 import * as React from "react";
 import { render } from "@testing-library/react";

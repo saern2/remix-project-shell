@@ -138,6 +138,48 @@ export type Database = {
         }
         Relationships: []
       }
+      project_cleanup_audit: {
+        Row: {
+          active_render_cancelled: boolean
+          bytes_freed: number
+          cancelled_render_job_ids: string[]
+          created_at: string
+          deleted_at: string
+          file_count_removed: number
+          id: number
+          project_created_at: string | null
+          project_id: string
+          project_name: string | null
+          project_status: string | null
+        }
+        Insert: {
+          active_render_cancelled?: boolean
+          bytes_freed?: number
+          cancelled_render_job_ids?: string[]
+          created_at?: string
+          deleted_at?: string
+          file_count_removed?: number
+          id?: number
+          project_created_at?: string | null
+          project_id: string
+          project_name?: string | null
+          project_status?: string | null
+        }
+        Update: {
+          active_render_cancelled?: boolean
+          bytes_freed?: number
+          cancelled_render_job_ids?: string[]
+          created_at?: string
+          deleted_at?: string
+          file_count_removed?: number
+          id?: number
+          project_created_at?: string | null
+          project_id?: string
+          project_name?: string | null
+          project_status?: string | null
+        }
+        Relationships: []
+      }
       projects: {
         Row: {
           aspect_ratio: string
@@ -534,6 +576,19 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      cleanup_delete_project_with_audit: {
+        Args: {
+          p_active_render_cancelled: boolean
+          p_bytes_freed: number
+          p_cancelled_render_job_ids: string[]
+          p_file_count_removed: number
+          p_project_created_at: string
+          p_project_id: string
+          p_project_name: string
+          p_project_status: string
+        }
+        Returns: undefined
+      }
       increment_pexels_key_usage: { Args: { p_id: string }; Returns: undefined }
       increment_provider_usage: {
         Args: { p_cache_hit: boolean; p_date: string; p_provider: string }
