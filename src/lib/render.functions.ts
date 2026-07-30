@@ -164,7 +164,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         const usedIds = new Set<string>([
           ...sceneRows
             .map((s) => s.selected_clips?.clip_candidates?.provider_clip_id)
-            .filter(Boolean),
+            .filter((x): x is string => !!x),
+
           ...(existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
         ]);
         const expectedSlots = buildExpectedSliceSlots(sceneRows, fixedDuration);
