@@ -424,8 +424,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
     // pre-signed upload URL (written by the worker) or an expired playback URL.
     if (job.status === "completed" || job.status === "failed") {
       let outputUrl = job.output_url;
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
       if (job.status === "completed") {
-        const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
         const storagePath = `${job.project_id}/${job.id}.mp4`;
         const { data: signed } = await supabaseAdmin.storage
           .from("render-outputs")
@@ -439,6 +439,14 @@ export const pollRenderJob = createServerFn({ method: "POST" })
             .eq("id", job.id);
         }
       }
+      await supabaseAdmin
+        .from("projects")
+        .update(
+          job.status === "completed"
+            ? { status: "completed", error_message: null }
+            : { status: "failed", error_message: job.error ?? "Render failed." },
+        )
+        .eq("id", job.project_id);
       return {
         status: job.status,
         progress_pct: job.progress_pct,

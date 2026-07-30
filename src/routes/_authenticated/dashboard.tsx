@@ -18,7 +18,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Plus, LogOut, Video, Trash2, Loader2, Shield } from "lucide-react";
+import { Clock, Plus, LogOut, Video, Trash2, Loader2, Shield } from "lucide-react";
 import { amIAdmin } from "@/lib/admin.functions";
 
 import { formatDistanceToNow } from "date-fns";
@@ -67,18 +67,20 @@ function Dashboard() {
   const runDelete = useServerFn(deleteProject);
   const checkAdmin = useServerFn(amIAdmin);
 
-
   const { data: isAdmin } = useQuery({
     queryKey: ["am-i-admin"],
     queryFn: () => checkAdmin({}),
     retry: false,
   });
 
-
   const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const { data: projects, isLoading, error } = useQuery({
+  const {
+    data: projects,
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["projects"],
     queryFn: async (): Promise<Project[]> => {
       const { data, error } = await supabase
@@ -133,7 +135,6 @@ function Dashboard() {
               Sign out
             </Button>
           </div>
-
         </div>
       </header>
 
@@ -143,6 +144,11 @@ function Dashboard() {
             <h2 className="text-3xl font-bold tracking-tight">Your projects</h2>
             <p className="mt-1 text-sm text-muted-foreground">
               Upload audio and Auto Video Creator drafts a video for you.
+            </p>
+            <p className="mt-2 flex items-center gap-1.5 text-sm text-muted-foreground">
+              <Clock className="h-4 w-4" />
+              Project history, uploaded audio, and generated videos are automatically deleted 30
+              hours after creation.
             </p>
           </div>
           <Button asChild>
@@ -154,7 +160,9 @@ function Dashboard() {
         </div>
 
         {error ? (
-          <p className="text-sm text-destructive">Failed to load projects: {(error as Error).message}</p>
+          <p className="text-sm text-destructive">
+            Failed to load projects: {(error as Error).message}
+          </p>
         ) : isLoading ? (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 3 }).map((_, i) => (
@@ -180,11 +188,7 @@ function Dashboard() {
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {projects.map((p) => (
               <div key={p.id} className="relative group">
-                <Link
-                  to="/projects/$projectId"
-                  params={{ projectId: p.id }}
-                  className="block"
-                >
+                <Link to="/projects/$projectId" params={{ projectId: p.id }} className="block">
                   <Card className="h-full transition-colors hover:bg-accent/40">
                     <CardHeader className="pb-3">
                       <div className="flex items-start justify-between gap-2">

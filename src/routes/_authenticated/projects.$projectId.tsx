@@ -30,6 +30,7 @@ import {
   Loader2,
   X,
   Trash2,
+  Clock,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -497,6 +498,12 @@ function ProjectDetail() {
           </Card>
         ) : (
           <div className="space-y-6">
+            <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+              <Clock className="h-4 w-4 shrink-0" />
+              Project history, uploaded audio, and generated videos are automatically deleted 30
+              hours after creation.
+            </div>
+
             <Card>
               <CardHeader>
                 <CardTitle className="text-base">Progress</CardTitle>
