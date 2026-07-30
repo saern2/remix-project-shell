@@ -6,7 +6,7 @@ import { createFileRoute } from "@tanstack/react-router";
 export const Route = createFileRoute("/api/public/pipeline/$step")({
   server: {
     handlers: {
-      POST: async ({ params }) => {
+      POST: async ({ params }: { params: { step: string } }) => {
         return new Response(
           JSON.stringify({
             ok: false,
@@ -19,4 +19,5 @@ export const Route = createFileRoute("/api/public/pipeline/$step")({
       },
     },
   },
-});
+} as never);
+
