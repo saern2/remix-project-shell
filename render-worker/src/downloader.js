@@ -60,7 +60,10 @@ const cdnSemaphore = new Semaphore(config.globalCdnConcurrency || 15);
 function isCdnUrl(urlStr) {
   try {
     const host = new URL(urlStr).hostname.toLowerCase();
-    return host.includes('pexels.com') || host.includes('pixabay.com');
+    return host.includes('pexels.com') ||
+      host.includes('pixabay.com') ||
+      host === 'images-api.nasa.gov' ||
+      host === 'images-assets.nasa.gov';
   } catch {
     return false;
   }

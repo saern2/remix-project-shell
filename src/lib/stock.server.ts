@@ -8,7 +8,7 @@ export type StockVideoFile = {
 };
 
 export type StockVideo = {
-  provider: "pexels" | "pixabay";
+  provider: "pexels" | "pixabay" | "nasa";
   provider_clip_id: string;
   duration_sec: number;
   width: number;
@@ -221,6 +221,8 @@ function seededIndex(seed: string | undefined, modulo: number): number {
   return stableHash(seed) % modulo;
 }
 
+export type ProjectNiche = "general" | "space";
+
 export function providerFamilyKey(providerClipId: string): string {
   const id = providerClipId.trim();
   return /^\d{6,}$/.test(id) ? id.slice(0, 4) : id;
@@ -252,11 +254,23 @@ export async function searchStockFootage(opts: {
   targetWidth: number;
   usedIds: string[];
   seed?: string;
+  niche?: ProjectNiche | string | null;
 }): Promise<{ pick: StockVideo; chosenFile: StockVideoFile; candidates: StockVideo[] } | null> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const provider = getStockProvider();
   const normQuery = opts.query.trim().toLowerCase();
   if (!normQuery) return null;
+
+  if (opts.niche === "space") {
+    const nasaResult = await searchNasaWithCacheAndSelect({
+      normQuery,
+      minDurationSec: opts.minDurationSec,
+      targetWidth: opts.targetWidth,
+      usedIds: opts.usedIds,
+      seed: opts.seed,
+    });
+    if (nasaResult) return nasaResult;
+  }
 
   // 1. Cache lookup
   const { data: cached } = await supabaseAdmin
@@ -341,4 +355,109 @@ async function bumpUsage(provider: string, opts: { cache_hit: boolean }) {
     p_date: new Date().toISOString().slice(0, 10),
     p_cache_hit: opts.cache_hit,
   });
+}
+
+async function searchNasaWithCacheAndSelect(opts: {
+  normQuery: string;
+  minDurationSec: number;
+  targetWidth: number;
+  usedIds: string[];
+  seed?: string;
+}): Promise<{ pick: StockVideo; chosenFile: StockVideoFile; candidates: StockVideo[] } | null> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { searchNasaFootage } = await import("@/lib/nasaStock.server");
+  const provider = "nasa";
+  const cacheOrientation = "any";
+
+  let results: StockVideo[] | null = null;
+  const { data: cached } = await supabaseAdmin
+    .from("stock_search_cache")
+    .select("results, cached_at")
+    .eq("provider", provider)
+    .eq("query", opts.normQuery)
+    .eq("orientation", cacheOrientation)
+    .maybeSingle();
+
+  const fresh = cached && Date.now() - new Date(cached.cached_at).getTime() < CACHE_TTL_MS;
+  if (fresh) {
+    results = cached!.results as unknown as StockVideo[];
+    await bumpUsage(provider, { cache_hit: true });
+  } else {
+    try {
+      results = await searchNasaFootage(opts.normQuery, { targetWidth: opts.targetWidth });
+      await bumpUsage(provider, { cache_hit: false });
+      await supabaseAdmin.from("stock_search_cache").upsert(
+        {
+          provider,
+          query: opts.normQuery,
+          orientation: cacheOrientation,
+          results: results as unknown as never,
+          cached_at: new Date().toISOString(),
+        },
+        { onConflict: "provider,query,orientation" },
+      );
+    } catch (error) {
+      console.warn("[nasa-stock] search failed; falling back to default stock provider", {
+        query: opts.normQuery,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  return selectStockCandidate({
+    results,
+    minDurationSec: opts.minDurationSec,
+    targetWidth: opts.targetWidth,
+    usedIds: opts.usedIds,
+    seed: opts.seed,
+    requireMinDuration: true,
+  });
+}
+
+function selectStockCandidate(opts: {
+  results: StockVideo[] | null;
+  minDurationSec: number;
+  targetWidth: number;
+  usedIds: string[];
+  seed?: string;
+  requireMinDuration?: boolean;
+}): { pick: StockVideo; chosenFile: StockVideoFile; candidates: StockVideo[] } | null {
+  const { results } = opts;
+  if (!results || results.length === 0) return null;
+
+  const used = new Set(opts.usedIds);
+  const usedFamilies = new Set(opts.usedIds.map(providerFamilyKey));
+  let pool = results.filter(
+    (v) =>
+      !used.has(v.provider_clip_id) &&
+      !usedFamilies.has(providerFamilyKey(v.provider_clip_id)) &&
+      v.files.length > 0,
+  );
+  if (pool.length === 0) {
+    pool = results.filter((v) => !used.has(v.provider_clip_id) && v.files.length > 0);
+  }
+  if (pool.length === 0) pool = results.filter((v) => v.files.length > 0);
+  if (pool.length === 0) return null;
+
+  const longEnough = pool.filter((v) => v.duration_sec >= opts.minDurationSec);
+  if (opts.requireMinDuration && longEnough.length === 0) return null;
+  const candidates = longEnough.length > 0 ? longEnough : pool;
+
+  const pick = candidates
+    .map((video) => ({
+      video,
+      index: results.findIndex((result) => result.provider_clip_id === video.provider_clip_id),
+    }))
+    .sort(
+      (a, b) =>
+        stableCandidateScore(a.video, a.index, opts.minDurationSec, opts.seed) -
+        stableCandidateScore(b.video, b.index, opts.minDurationSec, opts.seed),
+    )[0].video;
+
+  const sortedFiles = [...pick.files].sort((a, b) => a.width - b.width);
+  let chosenFile = sortedFiles.find((f) => f.width >= opts.targetWidth);
+  if (!chosenFile) chosenFile = sortedFiles[sortedFiles.length - 1];
+
+  return { pick, chosenFile, candidates };
 }

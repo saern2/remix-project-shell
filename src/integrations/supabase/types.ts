@@ -189,6 +189,7 @@ export type Database = {
           error_message: string | null
           id: string
           name: string
+          niche: string
           provider_job_id: string | null
           status: string
           updated_at: string
@@ -202,6 +203,7 @@ export type Database = {
           error_message?: string | null
           id?: string
           name?: string
+          niche?: string
           provider_job_id?: string | null
           status?: string
           updated_at?: string
@@ -215,6 +217,7 @@ export type Database = {
           error_message?: string | null
           id?: string
           name?: string
+          niche?: string
           provider_job_id?: string | null
           status?: string
           updated_at?: string

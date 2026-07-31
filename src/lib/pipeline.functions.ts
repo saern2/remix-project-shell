@@ -327,7 +327,7 @@ async function advanceFromMatchingFootage(projectId: string) {
   try {
     const { data: project, error: pErr } = await supabaseAdmin
       .from("projects")
-      .select("id, aspect_ratio, clip_duration_seconds")
+      .select("id, aspect_ratio, clip_duration_seconds, niche")
       .eq("id", projectId)
       .single();
     if (pErr || !project) throw new Error(pErr?.message ?? "Project not found.");
@@ -405,6 +405,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         slice_index: number;
         clip_url: string;
         provider_clip_id: string | null;
+        provider: "pexels" | "pixabay" | "nasa";
         duration_seconds: number;
         timeline_start_seconds: number;
         timeline_end_seconds: number;
@@ -424,10 +425,11 @@ async function advanceFromMatchingFootage(projectId: string) {
           const result = await searchStockFootage({
             query: scene.visual_query,
             orientation,
-            minDurationSec: fixedDuration,
+            minDurationSec: slot.durationSeconds,
             targetWidth,
             usedIds: [...usedIds],
             seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
+            niche: project.niche,
           });
           if (!result) {
             unmatchedSlots.push(slot);
@@ -444,15 +446,18 @@ async function advanceFromMatchingFootage(projectId: string) {
             slice_index: slot.sliceIndex,
             clip_url: result.chosenFile.url,
             provider_clip_id: providerClipId,
+            provider: result.pick.provider,
             duration_seconds: slot.durationSeconds,
             timeline_start_seconds: slot.timelineStart,
             timeline_end_seconds: slot.timelineEnd,
             thumbnail_url: result.pick.thumbnail_url ?? null,
           };
           newSliceRows.push(row);
-          await supabaseAdmin.from("render_clip_slices").upsert(row, {
-            onConflict: "project_id,scene_id,slice_index",
-          });
+          const { provider: _provider, ...sliceRow } = row;
+          void _provider;
+          await supabaseAdmin
+            .from("render_clip_slices")
+            .upsert(sliceRow, { onConflict: "project_id,scene_id,slice_index" });
           return;
         }
 
@@ -498,12 +503,16 @@ async function advanceFromMatchingFootage(projectId: string) {
           .filter((row) => row.scene_id === scene.id)
           .sort((a, b) => a.slice_index - b.slice_index)[0];
         if (!firstSlot) continue;
+        const firstSlotKey = sliceKey(scene.id, firstSlot.slice_index);
+        const firstSlotProvider =
+          newSliceRows.find((row) => sliceKey(row.scene_id, row.slice_index) === firstSlotKey)
+            ?.provider ?? "pexels";
 
         const { data: candidate } = await supabaseAdmin
           .from("clip_candidates")
           .insert({
             scene_id: scene.id,
-            provider: "pexels",
+            provider: firstSlotProvider,
             provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
             url: firstSlot.clip_url,
             thumbnail_url: firstSlot.thumbnail_url ?? null,
@@ -520,7 +529,10 @@ async function advanceFromMatchingFootage(projectId: string) {
               scene_id: scene.id,
               clip_candidate_id: candidate.id,
               in_point: 0,
-              out_point: Math.min(Number(firstSlot.duration_seconds), Math.max(fixedSceneDuration(scene), 1)),
+              out_point: Math.min(
+                Number(firstSlot.duration_seconds),
+                Math.max(fixedSceneDuration(scene), 1),
+              ),
             },
             { onConflict: "scene_id" },
           );
@@ -579,6 +591,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         minDurationSec: minDuration,
         targetWidth,
         usedIds: [...usedIds],
+        niche: project.niche,
       });
       if (!result) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
@@ -652,14 +665,15 @@ export const swapSceneClip = createServerFn({ method: "POST" })
     const { data: scene, error: sErr } = await supabase
       .from("scenes")
       .select(
-        "id, project_id, text, start_ts, end_ts, visual_query, projects!inner(user_id, aspect_ratio)",
+        "id, project_id, text, start_ts, end_ts, visual_query, projects!inner(user_id, aspect_ratio, niche)",
       )
       .eq("id", data.sceneId)
       .maybeSingle();
     if (sErr) throw new Error(sErr.message);
     if (!scene) throw new Error("Scene not found.");
-    const project = (scene as unknown as { projects: { user_id: string; aspect_ratio: string } })
-      .projects;
+    const project = (
+      scene as unknown as { projects: { user_id: string; aspect_ratio: string; niche: string } }
+    ).projects;
     if (project.user_id !== userId) throw new Error("Forbidden.");
     if (!scene.visual_query) throw new Error("Scene has no visual query.");
 
@@ -680,6 +694,7 @@ export const swapSceneClip = createServerFn({ method: "POST" })
       minDurationSec: minDuration,
       targetWidth: targetWidthForAspect(project.aspect_ratio),
       usedIds,
+      niche: project.niche,
     });
     if (!result) throw new Error("No alternate clips available for this scene.");
     const { pick, chosenFile } = result;

@@ -7,27 +7,35 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { ArrowLeft, Upload } from "lucide-react";
 import { toast } from "sonner";
 
-
 export const Route = createFileRoute("/_authenticated/projects/new")({
   component: NewProject,
 });
 
-const ACCEPTED = "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/ogg,audio/mp4,audio/m4a,audio/aac,audio/flac";
+const ACCEPTED =
+  "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/ogg,audio/mp4,audio/m4a,audio/aac,audio/flac";
 const MAX_BYTES = 500 * 1024 * 1024; // 500 MB
 
 type CategoryValue = "none" | "war" | "crime";
+type NicheValue = "general" | "space";
 
 function NewProject() {
   const navigate = useNavigate();
   const runStartPipeline = useServerFn(startPipeline);
   const [name, setName] = useState("");
+  const [niche, setNiche] = useState<NicheValue>("general");
   const [category, setCategory] = useState<CategoryValue>("none");
   const [fixedClips, setFixedClips] = useState(false);
   const [clipDuration, setClipDuration] = useState(4);
@@ -35,7 +43,6 @@ function NewProject() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState<string>("");
-
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,6 +72,7 @@ function NewProject() {
         name: name.trim() || "Untitled project",
         status: "uploading",
         user_id: userData.user.id,
+        niche,
         category: category === "none" ? null : category,
         clip_duration_seconds: fixedClips ? clipDuration : null,
       })
@@ -87,7 +95,10 @@ function NewProject() {
       .createSignedUploadUrl(path);
 
     if (signedError || !signed) {
-      await supabase.from("projects").update({ status: "failed", error_message: "Could not get upload URL." }).eq("id", project.id);
+      await supabase
+        .from("projects")
+        .update({ status: "failed", error_message: "Could not get upload URL." })
+        .eq("id", project.id);
       setBusy(false);
       toast.error(signedError?.message ?? "Could not get upload URL.");
       return;
@@ -99,7 +110,10 @@ function NewProject() {
     try {
       await uploadWithProgress(signed.signedUrl, file, setProgress);
     } catch (err) {
-      await supabase.from("projects").update({ status: "failed", error_message: "Upload failed." }).eq("id", project.id);
+      await supabase
+        .from("projects")
+        .update({ status: "failed", error_message: "Upload failed." })
+        .eq("id", project.id);
       setBusy(false);
       toast.error((err as Error).message);
       return;
@@ -116,7 +130,10 @@ function NewProject() {
     });
 
     if (assetError) {
-      await supabase.from("projects").update({ status: "failed", error_message: assetError.message }).eq("id", project.id);
+      await supabase
+        .from("projects")
+        .update({ status: "failed", error_message: assetError.message })
+        .eq("id", project.id);
       setBusy(false);
       toast.error(assetError.message);
       return;
@@ -145,7 +162,6 @@ function NewProject() {
     navigate({ to: "/projects/$projectId", params: { projectId: project.id } });
   };
 
-
   return (
     <div className="min-h-screen bg-background">
       <header className="border-b">
@@ -164,7 +180,8 @@ function NewProject() {
           <CardHeader>
             <CardTitle>Create a project</CardTitle>
             <CardDescription>
-              Name it, upload an audio track, and we'll set it up. Rendering starts in a later phase.
+              Name it, upload an audio track, and we'll set it up. Rendering starts in a later
+              phase.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -197,9 +214,32 @@ function NewProject() {
                       {file.name} — {(file.size / 1024 / 1024).toFixed(1)} MB
                     </p>
                   ) : (
-                    <p className="mt-2 text-xs text-muted-foreground">MP3, WAV, M4A, FLAC, OGG — up to 500 MB</p>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      MP3, WAV, M4A, FLAC, OGG — up to 500 MB
+                    </p>
                   )}
                 </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="niche">Footage source niche</Label>
+                <Select
+                  value={niche}
+                  onValueChange={(v) => setNiche(v as NicheValue)}
+                  disabled={busy}
+                >
+                  <SelectTrigger id="niche">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="general">General stock libraries</SelectItem>
+                    <SelectItem value="space">Space (NASA first, stock fallback)</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Space projects try NASA's public video library first for each scene, then fall
+                  back when no usable clip fits.
+                </p>
               </div>
 
               <div className="space-y-2">
@@ -219,18 +259,18 @@ function NewProject() {
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  Biases every generated footage search toward this theme. Leave as None to keep queries literal.
+                  Biases every generated footage search toward this theme. Leave as None to keep
+                  queries literal.
                 </p>
               </div>
-
-
 
               <div className="space-y-3 rounded-md border p-4">
                 <div className="flex items-center justify-between gap-4">
                   <div className="space-y-0.5">
                     <Label htmlFor="fixed-clips">Fixed clip length</Label>
                     <p className="text-xs text-muted-foreground">
-                      Off: one clip per sentence, natural length. On: each scene is split into clips of this length.
+                      Off: one clip per sentence, natural length. On: each scene is split into clips
+                      of this length.
                     </p>
                   </div>
                   <Switch
@@ -262,7 +302,9 @@ function NewProject() {
               {busy ? (
                 <div className="space-y-2">
                   <Progress value={progress} />
-                  <p className="text-xs text-muted-foreground">{stage} {progress > 0 ? `(${progress}%)` : ""}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {stage} {progress > 0 ? `(${progress}%)` : ""}
+                  </p>
                 </div>
               ) : null}
 
@@ -282,7 +324,11 @@ function NewProject() {
   );
 }
 
-function uploadWithProgress(url: string, file: File, onProgress: (pct: number) => void): Promise<void> {
+function uploadWithProgress(
+  url: string,
+  file: File,
+  onProgress: (pct: number) => void,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", url);
