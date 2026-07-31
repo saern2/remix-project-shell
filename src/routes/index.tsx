@@ -8,7 +8,9 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { HeroDemo } from "@/components/landing/HeroDemo";
-import { AudioLines, ArrowRight } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { useEffect, useState } from "react";
+import { AudioLines, ArrowRight, Menu, X } from "lucide-react";
 
 export const Route = createFileRoute("/")({
   ssr: false,
