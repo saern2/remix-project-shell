@@ -347,6 +347,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       await import("@/lib/stock.server");
     const orientation = orientationForAspect(project.aspect_ratio);
     const targetWidth = targetWidthForAspect(project.aspect_ratio);
+    const projectNiche = project.niche;
 
     const fixedDuration =
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
