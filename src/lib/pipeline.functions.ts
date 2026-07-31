@@ -591,7 +591,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         minDurationSec: minDuration,
         targetWidth,
         usedIds: [...usedIds],
-        niche: project.niche,
+        niche: projectNiche,
       });
       if (!result) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
