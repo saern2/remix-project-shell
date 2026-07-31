@@ -16,7 +16,8 @@ const STATES = [
 
 const BARS = [
   18, 42, 66, 30, 88, 54, 72, 24, 60, 92, 38, 70, 46, 84, 28, 62, 50, 78, 34, 68, 22, 56, 90, 40,
-  74, 30, 64, 48, 82, 26, 58, 86,
+  74, 30, 64, 48, 82, 26, 58, 86, 20, 48, 70, 36, 92, 58, 66, 28, 54, 80, 34, 72, 44, 88, 30, 60,
+  50, 76, 26, 64, 40, 84, 32, 68,
 ];
 
 const THUMBS = [0, 1, 2, 3];
@@ -62,7 +63,7 @@ export function HeroDemo() {
                   active ? "bg-primary/80" : "bg-foreground/10",
                   step >= 1 && segment === step ? "bg-primary" : "",
                   // scene segmentation gaps
-                  step >= 1 && i % 8 === 7 ? "mr-2" : "",
+                  step >= 1 && i % 16 === 15 ? "mr-2" : "",
                 )}
                 style={{ height: `${step === 0 ? h : Math.max(18, h * 0.8)}%` }}
               />
