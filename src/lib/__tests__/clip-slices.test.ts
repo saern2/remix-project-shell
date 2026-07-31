@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   asyncPool,
   buildExpectedSliceSlots,
+  buildSceneTimelineSlots,
   describeMissingSlots,
   summarizeSliceCoverage,
 } from "../clip-slices.server";
@@ -94,6 +95,59 @@ describe("fixed-duration clip slice helpers", () => {
         durationSeconds: 3.5,
       }),
     );
+  });
+
+  it("covers leading and trailing silence through the measured audio duration", () => {
+    const timedScenes = [
+      { id: "scene-a", idx: 0, start_ts: 0.4, end_ts: 2.16 },
+      { id: "scene-b", idx: 1, start_ts: 2.8, end_ts: 5.6 },
+    ];
+
+    expect(buildSceneTimelineSlots(timedScenes, 6.25)).toEqual([
+      {
+        sceneId: "scene-a",
+        sceneIdx: 0,
+        timelineStart: 0,
+        timelineEnd: 2.8,
+        durationSeconds: 2.8,
+      },
+      {
+        sceneId: "scene-b",
+        sceneIdx: 1,
+        timelineStart: 2.8,
+        timelineEnd: 6.25,
+        durationSeconds: 3.45,
+      },
+    ]);
+
+    const total = buildExpectedSliceSlots(timedScenes, 2, 6.25).reduce(
+      (sum, slot) => sum + slot.durationSeconds,
+      0,
+    );
+    expect(total).toBe(6.25);
+  });
+
+  it("treats stale timeline metadata as incomplete coverage", () => {
+    const timedScenes = [{ id: "scene-a", idx: 0, start_ts: 0.4, end_ts: 4 }];
+    const coverage = summarizeSliceCoverage(
+      timedScenes,
+      4,
+      [
+        {
+          scene_id: "scene-a",
+          slice_index: 0,
+          clip_url: "https://example.com/a.mp4",
+          provider_clip_id: "a",
+          duration_seconds: 3.6,
+          timeline_start_seconds: 0.4,
+          timeline_end_seconds: 4,
+        },
+      ],
+      4.5,
+    );
+
+    expect(coverage.actualCount).toBe(0);
+    expect(coverage.missingSlots).toHaveLength(2);
   });
 
   it("reports missing cache rows by scene and slice", () => {

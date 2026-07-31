@@ -262,14 +262,20 @@ export async function searchStockFootage(opts: {
   if (!normQuery) return null;
 
   if (opts.niche === "space") {
-    const nasaResult = await searchNasaWithCacheAndSelect({
-      normQuery,
-      minDurationSec: opts.minDurationSec,
-      targetWidth: opts.targetWidth,
-      usedIds: opts.usedIds,
-      seed: opts.seed,
-    });
-    if (nasaResult) return nasaResult;
+    const nasaQueries = [normQuery, nasaFallbackQuery(normQuery)].filter(
+      (query, index, all) => all.indexOf(query) === index,
+    );
+    for (const nasaQuery of nasaQueries) {
+      const nasaResult = await searchNasaWithCacheAndSelect({
+        normQuery: nasaQuery,
+        minDurationSec: opts.minDurationSec,
+        targetWidth: opts.targetWidth,
+        usedIds: opts.usedIds,
+        seed: opts.seed,
+      });
+      if (nasaResult) return nasaResult;
+    }
+    return null;
   }
 
   // 1. Cache lookup
@@ -397,7 +403,7 @@ async function searchNasaWithCacheAndSelect(opts: {
         { onConflict: "provider,query,orientation" },
       );
     } catch (error) {
-      console.warn("[nasa-stock] search failed; falling back to default stock provider", {
+      console.warn("[nasa-stock] search failed", {
         query: opts.normQuery,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -411,8 +417,17 @@ async function searchNasaWithCacheAndSelect(opts: {
     targetWidth: opts.targetWidth,
     usedIds: opts.usedIds,
     seed: opts.seed,
-    requireMinDuration: true,
+    requireMinDuration: false,
   });
+}
+
+function nasaFallbackQuery(query: string): string {
+  if (/\b(planet|world|solar|orbit|star)\b/.test(query)) return "planet solar system";
+  if (/\b(galaxy|milky|deep space|cosmic)\b/.test(query)) return "deep space galaxy";
+  if (/\b(astronaut|rocket|launch|spacecraft|telescope)\b/.test(query)) {
+    return "space mission science";
+  }
+  return "space astronomy";
 }
 
 function selectStockCandidate(opts: {

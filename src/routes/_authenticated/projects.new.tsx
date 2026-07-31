@@ -28,14 +28,12 @@ const ACCEPTED =
   "audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/ogg,audio/mp4,audio/m4a,audio/aac,audio/flac";
 const MAX_BYTES = 500 * 1024 * 1024; // 500 MB
 
-type CategoryValue = "none" | "war" | "crime";
-type NicheValue = "general" | "space";
+type CategoryValue = "none" | "war" | "crime" | "space";
 
 function NewProject() {
   const navigate = useNavigate();
   const runStartPipeline = useServerFn(startPipeline);
   const [name, setName] = useState("");
-  const [niche, setNiche] = useState<NicheValue>("general");
   const [category, setCategory] = useState<CategoryValue>("none");
   const [fixedClips, setFixedClips] = useState(false);
   const [clipDuration, setClipDuration] = useState(4);
@@ -72,7 +70,7 @@ function NewProject() {
         name: name.trim() || "Untitled project",
         status: "uploading",
         user_id: userData.user.id,
-        niche,
+        niche: category === "space" ? "space" : "general",
         category: category === "none" ? null : category,
         clip_duration_seconds: fixedClips ? clipDuration : null,
       })
@@ -222,27 +220,6 @@ function NewProject() {
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="niche">Footage source niche</Label>
-                <Select
-                  value={niche}
-                  onValueChange={(v) => setNiche(v as NicheValue)}
-                  disabled={busy}
-                >
-                  <SelectTrigger id="niche">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="general">General stock libraries</SelectItem>
-                    <SelectItem value="space">Space (NASA first, stock fallback)</SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="text-xs text-muted-foreground">
-                  Space projects try NASA's public video library first for each scene, then fall
-                  back when no usable clip fits.
-                </p>
-              </div>
-
-              <div className="space-y-2">
                 <Label htmlFor="category">Visual theme</Label>
                 <Select
                   value={category}
@@ -256,6 +233,7 @@ function NewProject() {
                     <SelectItem value="none">None (no thematic bias)</SelectItem>
                     <SelectItem value="war">War / military conflict</SelectItem>
                     <SelectItem value="crime">Crime / law enforcement</SelectItem>
+                    <SelectItem value="space">Space / astronomy</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">

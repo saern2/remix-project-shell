@@ -27,4 +27,10 @@ describe("visual query resilience", () => {
       fallbackVisualQuery("Iran and the US denied formal negotiations after the war.", "war"),
     ).toBe("united states iran conflict diplomacy denied formal negotiations");
   });
+
+  it("keeps space fallbacks inside the astronomy visual lane", () => {
+    expect(
+      fallbackVisualQuery("Hit subscribe, and let's explore the next cosmic mystery.", "space"),
+    ).toBe("hit subscribe let explore space astronomy cosmos");
+  });
 });

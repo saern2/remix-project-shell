@@ -15,7 +15,7 @@ const SYSTEM_PROMPT = `You convert narration sentences into short, CONCRETE, vis
 Rules:
 - Each phrase must describe something a camera can literally film: people, places, objects, actions, weather, scenery.
 - Never output abstract nouns alone (e.g. "freedom", "success", "growth"). Ground abstractions in a concrete visual metaphor.
-- Prefer everyday, common footage terms that would match stock libraries (Pexels, Pixabay).
+- Prefer everyday, common footage terms that would match stock libraries or public media archives.
 - Preserve named entities, countries, cities, organizations, and public roles when they are visually searchable.
 - Use the surrounding story context to keep consecutive clips coherent, but make each query specific to its own sentence.
 - For geopolitics, diplomacy, and war analysis, prefer concrete visuals like country flags, maps, diplomats, press conferences, military briefings, borders, missiles, or newsrooms. Do not default every sentence to generic soldiers unless the sentence is actually about combat.
@@ -35,11 +35,12 @@ Output: STRICT JSON matching {"results": [{"idx": number, "query": string}, ...]
 
 type SceneInput = { idx: number; text: string };
 
-export type VisualCategory = "war" | "crime";
+export type VisualCategory = "war" | "crime" | "space";
 
 const CATEGORY_THEMES: Record<VisualCategory, string> = {
   war: "war military conflict",
   crime: "crime law enforcement",
+  space: "space astronomy cosmos",
 };
 
 const KNOWN_ENTITY_TERMS: Array<[RegExp, string]> = [
@@ -90,12 +91,15 @@ const STOP_WORDS = new Set([
 ]);
 
 function categoryInstruction(category: VisualCategory): string {
-  const examples =
-    category === "war"
-      ? "If the script mentions Iran and the United States, use visuals like iran united states flags, tehran washington map, diplomats press conference, missile defense system, or war room briefing when appropriate."
-      : "If the script mentions named people, cities, agencies, evidence, money, courts, or police, preserve those details in the query instead of using generic crime footage.";
+  const examples = {
+    war: "If the script mentions Iran and the United States, use visuals like iran united states flags, tehran washington map, diplomats press conference, missile defense system, or war room briefing when appropriate.",
+    crime:
+      "If the script mentions named people, cities, agencies, evidence, money, courts, or police, preserve those details in the query instead of using generic crime footage.",
+    space:
+      "Use literal astronomy subjects and mission-searchable terms such as rogue planet, solar system formation, milky way stars, space telescope, icy moon ocean, or planetary scientist. Keep calls to action visually inside the same cosmic story.",
+  } satisfies Record<VisualCategory, string>;
 
-  return `\n\nUse the ${CATEGORY_THEMES[category]} theme as a visual lane, not as a replacement for the sentence. Preserve concrete story entities first, then express them through the theme. ${examples}`;
+  return `\n\nUse the ${CATEGORY_THEMES[category]} theme as a visual lane, not as a replacement for the sentence. Preserve concrete story entities first, then express them through the theme. ${examples[category]}`;
 }
 
 function stripCodeFence(content: string): string {
@@ -106,7 +110,9 @@ function stripCodeFence(content: string): string {
 
 function extractBalancedJson(content: string): string | null {
   const source = stripCodeFence(content);
-  const start = source.search(/[\[{]/);
+  const objectStart = source.indexOf("{");
+  const arrayStart = source.indexOf("[");
+  const start = objectStart < 0 ? arrayStart : arrayStart < 0 ? objectStart : Math.min(objectStart, arrayStart);
   if (start < 0) return null;
 
   const stack: string[] = [];

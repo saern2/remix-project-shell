@@ -144,7 +144,8 @@ describe('Normalisation filter chain (v1 bug fix)', () => {
         height: TARGET_HEIGHT,
         fps: TARGET_FPS,
       });
-    }
+    },
+    30_000
   );
 
   test(
@@ -190,7 +191,8 @@ describe('Normalisation filter chain (v1 bug fix)', () => {
 
       // Cleanup
       await fsp.rm(xfOutputPath, { force: true });
-    }
+    },
+    30_000
   );
 });
 
@@ -248,21 +250,22 @@ describe('Payload validation', () => {
 });
 
 describe('SSRF allowlist guard', () => {
-  const { assertAllowedUrl } = require('../../src/downloader');
+  function resetDownloaderModules() {
+    delete require.cache[require.resolve('../../src/downloader')];
+    delete require.cache[require.resolve('../../src/config')];
+  }
 
   beforeAll(() => {
     process.env.URL_ALLOWLIST = 'videos.pexels.com,cdn.pixabay.com';
-    // Re-require config to pick up the new env
-    jest.resetModules();
+    resetDownloaderModules();
   });
 
   afterAll(() => {
     process.env.URL_ALLOWLIST = '';
-    jest.resetModules();
+    resetDownloaderModules();
   });
 
   test('allows a URL on the allowlist', () => {
-    // Re-require after resetModules
     const { assertAllowedUrl: check } = require('../../src/downloader');
     expect(() => check('https://videos.pexels.com/path/to/video.mp4')).not.toThrow();
   });

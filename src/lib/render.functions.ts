@@ -10,6 +10,14 @@ const AUDIO_SIGNED_TTL = 60 * 60 * 6; // 6 hours
 const OUTPUT_UPLOAD_TTL = 60 * 60 * 6;
 const OUTPUT_PLAYBACK_TTL = 60 * 60 * 24;
 
+function isNasaClipUrl(url: string): boolean {
+  try {
+    return new URL(url).hostname.toLowerCase() === "images-assets.nasa.gov";
+  } catch {
+    return false;
+  }
+}
+
 function workerBase(): string {
   const url = process.env.RENDER_WORKER_URL;
   if (!url) throw new Error("RENDER_WORKER_URL is not configured.");
@@ -35,7 +43,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
 
     const { data: project, error: projErr } = await supabase
       .from("projects")
-      .select("id, status, user_id, aspect_ratio, clip_duration_seconds")
+      .select("id, status, user_id, aspect_ratio, clip_duration_seconds, niche")
       .eq("id", projectId)
       .maybeSingle();
     if (projErr) throw new Error(projErr.message);
@@ -71,22 +79,50 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     };
     const sceneRows = scenes as unknown as SceneRow[];
 
+    const { data: asset, error: assetErr } = await supabase
+      .from("audio_assets")
+      .select("storage_path, duration_sec")
+      .eq("project_id", projectId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (assetErr) throw new Error(assetErr.message);
+    if (!asset) throw new Error("No audio for this project.");
+
+    const measuredAudioDuration = Number(asset.duration_sec);
+    const narrationEnd = Math.max(...sceneRows.map((scene) => Number(scene.end_ts ?? 0)));
+    const audioDuration =
+      Number.isFinite(measuredAudioDuration) && measuredAudioDuration > 0
+        ? Math.max(measuredAudioDuration, narrationEnd)
+        : narrationEnd;
+
     const fixedDuration =
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
     let clips: Array<{ clip_url: string; start: number; end: number }>;
-    let renderTransition: "hard-cut" | "crossfade" = "crossfade";
+    const renderTransition = "hard-cut" as const;
 
     if (fixedDuration == null || !(fixedDuration > 0)) {
-      // Default behavior: exactly one clip per scene, natural sentence length.
-      clips = sceneRows.map((s) => {
-        if (!s.selected_clips?.clip_candidates?.url) {
-          throw new Error(`Scene ${s.idx + 1} has no selected clip.`);
+      const { buildSceneTimelineSlots } = await import("@/lib/clip-slices.server");
+      const sceneById = new Map(sceneRows.map((scene) => [scene.id, scene]));
+      clips = buildSceneTimelineSlots(sceneRows, audioDuration).map((slot) => {
+        const scene = sceneById.get(slot.sceneId);
+        if (!scene?.selected_clips?.clip_candidates?.url) {
+          throw new Error(`Scene ${slot.sceneIdx + 1} has no selected clip.`);
         }
+        if (
+          project.niche === "space" &&
+          !isNasaClipUrl(scene.selected_clips.clip_candidates.url)
+        ) {
+          throw new Error(
+            `Scene ${slot.sceneIdx + 1} does not have NASA footage. Retry footage matching before rendering.`,
+          );
+        }
+        const start = Number(scene.selected_clips.in_point);
         return {
-          clip_url: s.selected_clips.clip_candidates.url,
-          start: Number(s.selected_clips.in_point),
-          end: Number(s.selected_clips.out_point),
+          clip_url: scene.selected_clips.clip_candidates.url,
+          start,
+          end: start + slot.durationSeconds,
         };
       });
     } else {
@@ -101,22 +137,31 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         )
         .eq("project_id", projectId);
 
-      const coverage = summarizeSliceCoverage(scenes, fixedDuration, existingSlices ?? []);
+      const eligibleExistingSlices =
+        project.niche === "space"
+          ? (existingSlices ?? []).filter((slice) => isNasaClipUrl(slice.clip_url))
+          : (existingSlices ?? []);
+      const coverage = summarizeSliceCoverage(
+        scenes,
+        fixedDuration,
+        eligibleExistingSlices,
+        audioDuration,
+      );
       const sliceCache = new Map(
-        (existingSlices ?? []).map((row) => [sliceKey(row.scene_id, row.slice_index), row]),
+        eligibleExistingSlices.map((row) => [sliceKey(row.scene_id, row.slice_index), row]),
       );
       const cacheComplete =
         coverage.missingSlots.length === 0 && coverage.actualCount === coverage.expectedCount;
 
       if (cacheComplete) {
-        clips = buildExpectedSliceSlots(sceneRows, fixedDuration).map((slot) => {
+        clips = buildExpectedSliceSlots(sceneRows, fixedDuration, audioDuration).map((slot) => {
           const cached = sliceCache.get(sliceKey(slot.sceneId, slot.sliceIndex));
           if (!cached) {
             throw new Error(
               `Missing fixed-duration clip for scene ${slot.sceneIdx + 1}, slice ${slot.sliceIndex + 1}.`,
             );
           }
-          return { clip_url: cached.clip_url, start: 0, end: Number(cached.duration_seconds) };
+          return { clip_url: cached.clip_url, start: 0, end: slot.durationSeconds };
         });
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
 
@@ -145,13 +190,21 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         // Build a lookup map: `${scene_id}:${slice_index}` -> slice row
         const sliceCache = new Map<
           string,
-          { clip_url: string; provider_clip_id: string | null; duration_seconds: number }
+          {
+            clip_url: string;
+            provider_clip_id: string | null;
+            thumbnail_url: string | null;
+          }
         >();
-        for (const row of existingSlices ?? []) {
+        const eligibleFallbackSlices =
+          project.niche === "space"
+            ? (existingSlices ?? []).filter((slice) => isNasaClipUrl(slice.clip_url))
+            : (existingSlices ?? []);
+        for (const row of eligibleFallbackSlices) {
           sliceCache.set(`${row.scene_id}:${row.slice_index}`, {
             clip_url: row.clip_url,
             provider_clip_id: row.provider_clip_id ?? null,
-            duration_seconds: Number(row.duration_seconds),
+            thumbnail_url: row.thumbnail_url ?? null,
           });
         }
 
@@ -163,12 +216,18 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         // Project-wide dedup set, seeded with the clips already selected AND existing slice rows.
         const usedIds = new Set<string>([
           ...sceneRows
+            .filter(
+              (scene) =>
+                project.niche !== "space" ||
+                (scene.selected_clips?.clip_candidates?.url &&
+                  isNasaClipUrl(scene.selected_clips.clip_candidates.url)),
+            )
             .map((s) => s.selected_clips?.clip_candidates?.provider_clip_id)
             .filter((x): x is string => !!x),
 
-          ...(existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
+          ...eligibleFallbackSlices.map((r) => r.provider_clip_id).filter((x): x is string => !!x),
         ]);
-        const expectedSlots = buildExpectedSliceSlots(sceneRows, fixedDuration);
+        const expectedSlots = buildExpectedSliceSlots(sceneRows, fixedDuration, audioDuration);
         const sceneById = new Map(sceneRows.map((scene) => [scene.id, scene]));
 
         // Build new slice rows to insert (only for slots not already cached)
@@ -201,6 +260,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             // Reuse persisted assignment — no API call needed
             url = cached.clip_url;
             providerClipId = cached.provider_clip_id;
+            thumbnailUrl = cached.thumbnail_url;
           } else {
             // Search for a new clip
             let found: string | null = null;
@@ -212,6 +272,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
                 targetWidth,
                 usedIds: [...usedIds],
                 seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
+                niche: project.niche,
               });
               if (result) {
                 found = result.chosenFile.url;
@@ -220,30 +281,38 @@ export const submitRenderJob = createServerFn({ method: "POST" })
                 usedIds.add(result.pick.provider_clip_id);
               }
             }
-            const fallbackUrl = scene.selected_clips?.clip_candidates?.url;
+            const selectedUrl = scene.selected_clips?.clip_candidates?.url;
+            const fallbackUrl =
+              selectedUrl && (project.niche !== "space" || isNasaClipUrl(selectedUrl))
+                ? selectedUrl
+                : null;
             if (!found && !fallbackUrl) {
-              throw new Error(`Scene ${scene.idx + 1} has no selected clip fallback.`);
+              throw new Error(
+                project.niche === "space"
+                  ? `Scene ${scene.idx + 1} has no usable NASA footage. Retry footage matching.`
+                  : `Scene ${scene.idx + 1} has no selected clip fallback.`,
+              );
             }
             url = found ?? fallbackUrl!;
 
             // Queue this new assignment for persistence
-            newSliceRows.push({
-              project_id: projectId,
-              scene_id: slot.sceneId,
-              slice_index: slot.sliceIndex,
-              clip_url: url,
-              provider_clip_id: providerClipId,
-              duration_seconds: slot.durationSeconds,
-              timeline_start_seconds: slot.timelineStart,
-              timeline_end_seconds: slot.timelineEnd,
-              thumbnail_url: thumbnailUrl,
-            });
           }
 
+          newSliceRows.push({
+            project_id: projectId,
+            scene_id: slot.sceneId,
+            slice_index: slot.sliceIndex,
+            clip_url: url,
+            provider_clip_id: providerClipId,
+            duration_seconds: slot.durationSeconds,
+            timeline_start_seconds: slot.timelineStart,
+            timeline_end_seconds: slot.timelineEnd,
+            thumbnail_url: thumbnailUrl,
+          });
           clips.push({
             clip_url: url,
             start: 0,
-            end: cached?.duration_seconds ?? slot.durationSeconds,
+            end: slot.durationSeconds,
           });
         }
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
@@ -260,7 +329,12 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
           )
           .eq("project_id", projectId);
-        const finalCoverage = summarizeSliceCoverage(scenes, fixedDuration, finalSlices ?? []);
+        const finalCoverage = summarizeSliceCoverage(
+          scenes,
+          fixedDuration,
+          finalSlices ?? [],
+          audioDuration,
+        );
         if (
           finalCoverage.missingSlots.length > 0 ||
           finalCoverage.actualCount !== finalCoverage.expectedCount
@@ -273,38 +347,27 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         const finalCache = new Map(
           (finalSlices ?? []).map((row) => [sliceKey(row.scene_id, row.slice_index), row]),
         );
-        clips = buildExpectedSliceSlots(sceneRows, fixedDuration).map((slot) => {
+        clips = buildExpectedSliceSlots(sceneRows, fixedDuration, audioDuration).map((slot) => {
           const row = finalCache.get(sliceKey(slot.sceneId, slot.sliceIndex));
           if (!row) {
             throw new Error(
               `Missing fixed-duration clip for scene ${slot.sceneIdx + 1}, slice ${slot.sliceIndex + 1}.`,
             );
           }
-          return { clip_url: row.clip_url, start: 0, end: Number(row.duration_seconds) };
+          return { clip_url: row.clip_url, start: 0, end: slot.durationSeconds };
         });
       }
 
-      const totalVisualDuration = clips.reduce((sum, clip) => sum + (clip.end - clip.start), 0);
-      const narrationEnd = Math.max(...sceneRows.map((scene) => Number(scene.end_ts ?? 0)));
-      if (Math.abs(totalVisualDuration - narrationEnd) > 1) {
-        throw new Error(
-          `Fixed-duration timeline duration mismatch: visual ${totalVisualDuration.toFixed(2)}s vs narration ${narrationEnd.toFixed(2)}s.`,
-        );
-      }
-      renderTransition = "hard-cut";
+    }
+
+    const totalVisualDuration = clips.reduce((sum, clip) => sum + (clip.end - clip.start), 0);
+    if (Math.abs(totalVisualDuration - audioDuration) > 0.05) {
+      throw new Error(
+        `Render timeline duration mismatch: visual ${totalVisualDuration.toFixed(2)}s vs audio ${audioDuration.toFixed(2)}s.`,
+      );
     }
 
     // Signed audio URL.
-    const { data: asset, error: assetErr } = await supabase
-      .from("audio_assets")
-      .select("storage_path")
-      .eq("project_id", projectId)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (assetErr) throw new Error(assetErr.message);
-    if (!asset) throw new Error("No audio for this project.");
-
     const { data: audioSigned, error: audioErr } = await supabase.storage
       .from("audio")
       .createSignedUrl(asset.storage_path, AUDIO_SIGNED_TTL);

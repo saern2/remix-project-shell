@@ -34,14 +34,17 @@ const path = require('path');
 
 const SUPPORTED_TRANSITIONS = new Set(['hard-cut', 'crossfade']);
 
-function buildNormFilter(inputIndex, outLabel, width, height, fps) {
+function buildNormFilter(inputIndex, outLabel, width, height, fps, duration) {
   // Note: stream specifier [N:v] selects the video stream of the Nth input.
   return (
     `[${inputIndex}:v]setpts=PTS-STARTPTS,` +
     `scale=${width}:${height}:force_original_aspect_ratio=increase,` +
     `crop=${width}:${height},` +
     `setsar=1,` +
-    `fps=${fps}` +
+    `fps=${fps},` +
+    `tpad=stop_mode=clone:stop_duration=${duration},` +
+    `trim=duration=${duration},` +
+    `setpts=PTS-STARTPTS` +
     `${outLabel}`
   );
 }
@@ -88,7 +91,8 @@ function buildFilterGraph({ clips, width, height, fps, transition, transitionDur
 
   // ── Step 1: Normalise every input clip ──────────────────────────────────
   for (let i = 0; i < n; i++) {
-    lines.push(buildNormFilter(i, `[v${i}]`, w, h, fps));
+    const duration = clips[i].end - clips[i].start;
+    lines.push(buildNormFilter(i, `[v${i}]`, w, h, fps, duration));
   }
 
   let finalLabel;

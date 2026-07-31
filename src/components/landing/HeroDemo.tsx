@@ -20,7 +20,12 @@ const BARS = [
   50, 76, 26, 64, 40, 84, 32, 68,
 ];
 
-const THUMBS = [0, 1, 2, 3];
+const THUMBS = [
+  { label: "Convoy at dawn", position: "0%" },
+  { label: "Mountain ridge", position: "33.333%" },
+  { label: "Sunlit valley", position: "66.667%" },
+  { label: "Final assembly", position: "100%" },
+] as const;
 
 export function HeroDemo() {
   const [step, setStep] = useState(0);
@@ -84,18 +89,30 @@ export function HeroDemo() {
           )}
           aria-hidden="true"
         >
-          {THUMBS.map((t) => (
+          {THUMBS.map((thumb, index) => (
             <div
-              key={t}
+              key={thumb.label}
               className={cn(
                 "relative aspect-video overflow-hidden rounded-lg border transition-all duration-500",
-                step >= 2 && t === 1
-                  ? "border-primary/60 bg-linear-to-br from-primary/35 to-primary/5"
-                  : "border-border bg-linear-to-br from-foreground/10 to-foreground/5",
+                step >= 2 && index === 1
+                  ? "border-primary/70 shadow-[0_0_0_1px_rgb(245_166_35/0.15)]"
+                  : "border-border",
               )}
             >
-              {step >= 2 && t === 1 ? (
-                <span className="absolute right-1 top-1 grid h-4 w-4 place-items-center rounded-full bg-primary text-primary-foreground">
+              <div
+                className="absolute inset-0 bg-no-repeat transition-transform duration-700 hover:scale-105"
+                style={{
+                  backgroundImage: "url('/images/hero-storyboard.webp')",
+                  backgroundPosition: `${thumb.position} center`,
+                  backgroundSize: "400% 100%",
+                }}
+              />
+              <div className="absolute inset-0 bg-linear-to-t from-black/75 via-black/5 to-black/10" />
+              <span className="absolute inset-x-2 bottom-1.5 truncate text-[10px] font-medium text-white/90 sm:text-xs">
+                {thumb.label}
+              </span>
+              {step >= 2 && index === 1 ? (
+                <span className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-primary text-primary-foreground shadow-sm">
                   <Check className="h-3 w-3" />
                 </span>
               ) : null}

@@ -38,9 +38,11 @@ let _cancelRedis = null;
 function getCancelRedis() {
   if (!_cancelRedis) {
     _cancelRedis = new IORedis(config.redisUrl, {
-      maxRetriesPerRequest: null,
+      maxRetriesPerRequest: 1,
       enableReadyCheck: false,
       lazyConnect: false,
+      connectTimeout: 1000,
+      commandTimeout: 1000,
     });
     _cancelRedis.on('error', (err) =>
       logger.warn({ err: err.message }, 'Cancel-poll Redis error'),
@@ -76,11 +78,21 @@ function sleep(ms) {
  */
 async function pollCancellationUntilDone(redis, jobId, abortControllers, done) {
   while (!done.value) {
-    const cancelled = await checkCancellation(redis, jobId);
-    if (cancelled) {
-      for (const ac of abortControllers) ac.abort();
-      return true;
+    try {
+      const cancelled = await checkCancellation(redis, jobId);
+      if (cancelled) {
+        for (const ac of abortControllers) ac.abort();
+        return true;
+      }
+    } catch (error) {
+      if (!done.value) {
+        logger.warn(
+          { jobId, err: error instanceof Error ? error.message : String(error) },
+          'Cancellation check unavailable; render continues',
+        );
+      }
     }
+    if (done.value) break;
     await sleep(CANCEL_POLL_INTERVAL_MS);
   }
   return false;

@@ -291,7 +291,7 @@ async function advanceFromGeneratingScenes(projectId: string) {
       .select("category")
       .eq("id", projectId)
       .maybeSingle();
-    const category = (projectRow?.category ?? null) as "war" | "crime" | null;
+    const category = (projectRow?.category ?? null) as "war" | "crime" | "space" | null;
 
     const { generateVisualQueries } = await import("@/lib/visual-queries.server");
     const queries = await generateVisualQueries(
@@ -343,6 +343,21 @@ async function advanceFromMatchingFootage(projectId: string) {
       return { status: "ready", error_message: null };
     }
 
+    const { data: audioAsset, error: audioAssetError } = await supabaseAdmin
+      .from("audio_assets")
+      .select("duration_sec")
+      .eq("project_id", projectId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (audioAssetError) throw new Error(audioAssetError.message);
+    const narrationEnd = Math.max(...scenes.map((scene) => Number(scene.end_ts ?? 0)));
+    const measuredAudioDuration = Number(audioAsset?.duration_sec);
+    const audioDuration =
+      Number.isFinite(measuredAudioDuration) && measuredAudioDuration > 0
+        ? Math.max(measuredAudioDuration, narrationEnd)
+        : narrationEnd;
+
     const { searchStockFootage, orientationForAspect, targetWidthForAspect } =
       await import("@/lib/stock.server");
     const orientation = orientationForAspect(project.aspect_ratio);
@@ -368,9 +383,19 @@ async function advanceFromMatchingFootage(projectId: string) {
           "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
         )
         .eq("project_id", projectId);
+      const eligibleExistingSlices =
+        project.niche === "space"
+          ? (existingSlices ?? []).filter((slice) => {
+              try {
+                return new URL(slice.clip_url).hostname.toLowerCase() === "images-assets.nasa.gov";
+              } catch {
+                return false;
+              }
+            })
+          : (existingSlices ?? []);
 
       const startedAt = Date.now();
-      const expectedSlots = buildExpectedSliceSlots(scenes, fixedDuration);
+      const expectedSlots = buildExpectedSliceSlots(scenes, fixedDuration, audioDuration);
       const sliceCache = new Map<
         string,
         {
@@ -382,7 +407,7 @@ async function advanceFromMatchingFootage(projectId: string) {
           thumbnail_url: string | null;
         }
       >();
-      for (const row of existingSlices ?? []) {
+      for (const row of eligibleExistingSlices) {
         sliceCache.set(sliceKey(row.scene_id, row.slice_index), {
           clip_url: row.clip_url,
           provider_clip_id: row.provider_clip_id ?? null,
@@ -393,8 +418,34 @@ async function advanceFromMatchingFootage(projectId: string) {
         });
       }
 
+      const alignedCachedRows = expectedSlots.flatMap((slot) => {
+        const cached = sliceCache.get(sliceKey(slot.sceneId, slot.sliceIndex));
+        if (!cached) return [];
+        cached.duration_seconds = slot.durationSeconds;
+        cached.timeline_start_seconds = slot.timelineStart;
+        cached.timeline_end_seconds = slot.timelineEnd;
+        return [
+          {
+            project_id: projectId,
+            scene_id: slot.sceneId,
+            slice_index: slot.sliceIndex,
+            clip_url: cached.clip_url,
+            provider_clip_id: cached.provider_clip_id,
+            duration_seconds: slot.durationSeconds,
+            timeline_start_seconds: slot.timelineStart,
+            timeline_end_seconds: slot.timelineEnd,
+            thumbnail_url: cached.thumbnail_url,
+          },
+        ];
+      });
+      if (alignedCachedRows.length > 0) {
+        await supabaseAdmin.from("render_clip_slices").upsert(alignedCachedRows, {
+          onConflict: "project_id,scene_id,slice_index",
+        });
+      }
+
       const usedIds = new Set<string>(
-        (existingSlices ?? []).map((r) => r.provider_clip_id).filter((x): x is string => !!x),
+        eligibleExistingSlices.map((r) => r.provider_clip_id).filter((x): x is string => !!x),
       );
       const sceneById = new Map(scenes.map((scene) => [scene.id, scene]));
       const pendingSlots = expectedSlots.filter(
@@ -478,7 +529,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         )
         .eq("project_id", projectId);
       const allRows = finalSlices ?? [];
-      const coverage = summarizeSliceCoverage(scenes, fixedDuration, allRows);
+      const coverage = summarizeSliceCoverage(scenes, fixedDuration, allRows, audioDuration);
       if (coverage.missingSlots.length > 0 || coverage.actualCount !== coverage.expectedCount) {
         throw new Error(
           `Fixed-duration footage matching incomplete: expected ${coverage.expectedCount} slices, prepared ${coverage.actualCount}. Missing ${describeMissingSlots(coverage.missingSlots)}.`,
@@ -487,12 +538,21 @@ async function advanceFromMatchingFootage(projectId: string) {
 
       const { data: selectedRows } = await supabaseAdmin
         .from("selected_clips")
-        .select("scene_id")
+        .select("scene_id, clip_candidates!inner(provider)")
         .in(
           "scene_id",
           scenes.map((s) => s.id),
         );
-      const selectedSceneIds = new Set((selectedRows ?? []).map((row) => row.scene_id));
+      const selectedSceneIds = new Set(
+        (selectedRows ?? [])
+          .filter((row) => {
+            const provider = (
+              row as unknown as { clip_candidates: { provider: string } | null }
+            ).clip_candidates?.provider;
+            return project.niche !== "space" || provider === "nasa";
+          })
+          .map((row) => row.scene_id),
+      );
 
       for (const scene of scenes) {
         if (selectedSceneIds.has(scene.id)) {
@@ -507,7 +567,8 @@ async function advanceFromMatchingFootage(projectId: string) {
         const firstSlotKey = sliceKey(scene.id, firstSlot.slice_index);
         const firstSlotProvider =
           newSliceRows.find((row) => sliceKey(row.scene_id, row.slice_index) === firstSlotKey)
-            ?.provider ?? "pexels";
+            ?.provider ??
+          (project.niche === "space" ? "nasa" : "pexels");
 
         const { data: candidate } = await supabaseAdmin
           .from("clip_candidates")
@@ -562,20 +623,36 @@ async function advanceFromMatchingFootage(projectId: string) {
     // Existing selections (idempotent re-runs). Skip scenes already selected.
     const { data: existingSel } = await supabaseAdmin
       .from("selected_clips")
-      .select("scene_id, clip_candidates!inner(provider_clip_id)")
+      .select("scene_id, clip_candidates!inner(provider, provider_clip_id)")
       .in(
         "scene_id",
         scenes.map((s) => s.id),
       );
-    const alreadySelected = new Set((existingSel ?? []).map((r) => r.scene_id));
-    const usedIds: string[] = (existingSel ?? [])
+    const eligibleExistingSelections = (existingSel ?? []).filter((row) => {
+      const provider = (
+        row as unknown as {
+          clip_candidates: { provider: string; provider_clip_id: string } | null;
+        }
+      ).clip_candidates?.provider;
+      return project.niche !== "space" || provider === "nasa";
+    });
+    const alreadySelected = new Set(eligibleExistingSelections.map((r) => r.scene_id));
+    const usedIds: string[] = eligibleExistingSelections
       .map(
         (r) =>
-          (r as { clip_candidates: { provider_clip_id: string } | null }).clip_candidates
+          (
+            r as {
+              clip_candidates: { provider: string; provider_clip_id: string } | null;
+            }
+          ).clip_candidates
             ?.provider_clip_id,
       )
       .filter((x): x is string => !!x);
 
+    const { buildSceneTimelineSlots } = await import("@/lib/clip-slices.server");
+    const timelineSlots = new Map(
+      buildSceneTimelineSlots(scenes, audioDuration).map((slot) => [slot.sceneId, slot]),
+    );
     const CONCURRENCY = 5;
     const pending = scenes.filter((s) => !alreadySelected.has(s.id));
 
@@ -585,7 +662,10 @@ async function advanceFromMatchingFootage(projectId: string) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
         return;
       }
-      const minDuration = Math.max(1, Math.ceil(Number(scene.end_ts) - Number(scene.start_ts)));
+      const visualDuration =
+        timelineSlots.get(scene.id)?.durationSeconds ??
+        Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
+      const minDuration = Math.max(1, Math.ceil(visualDuration));
       const result = await searchStockFootage({
         query,
         orientation,
@@ -616,13 +696,12 @@ async function advanceFromMatchingFootage(projectId: string) {
         .single();
       if (cErr || !candidate) throw new Error(cErr?.message ?? "Failed to save candidate.");
 
-      const sceneDuration = Number(scene.end_ts) - Number(scene.start_ts);
       const { error: sErr } = await supabaseAdmin.from("selected_clips").upsert(
         {
           scene_id: scene.id,
           clip_candidate_id: candidate.id,
           in_point: 0,
-          out_point: Math.min(pick.duration_sec, Math.max(sceneDuration, 1)),
+          out_point: Math.max(visualDuration, 1),
         },
         { onConflict: "scene_id" },
       );
