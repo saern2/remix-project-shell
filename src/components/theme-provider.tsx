@@ -30,7 +30,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const apply = () => {
       const resolved = theme === "system" ? (media?.matches ? "dark" : "light") : theme;
       document.documentElement.classList.toggle("dark", resolved === "dark");
-      document.documentElement.style.colorScheme = resolved;
       window.localStorage.setItem(STORAGE_KEY, theme);
       setResolvedTheme(resolved);
     };
@@ -54,6 +53,5 @@ export const themeBootScript = `(() => {
     const saved = localStorage.getItem('${STORAGE_KEY}') || 'system';
     const dark = saved === 'dark' || (saved === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
     document.documentElement.classList.toggle('dark', dark);
-    document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
   } catch (_) {}
 })();`;

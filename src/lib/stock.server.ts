@@ -228,6 +228,12 @@ export function providerFamilyKey(providerClipId: string): string {
   return /^\d{6,}$/.test(id) ? id.slice(0, 4) : id;
 }
 
+export function reserveProviderClipId(usedIds: Set<string>, providerClipId: string): boolean {
+  if (usedIds.has(providerClipId)) return false;
+  usedIds.add(providerClipId);
+  return true;
+}
+
 function stableCandidateScore(
   video: StockVideo,
   originalIndex: number,
@@ -247,7 +253,7 @@ function stableCandidateScore(
  * keyed by (provider, normalized query, orientation) and increments
  * provider_usage on real (non-cached) calls.
  */
-export async function searchStockFootage(opts: {
+export type StockSearchOptions = {
   query: string;
   orientation: Orientation;
   minDurationSec: number;
@@ -255,7 +261,17 @@ export async function searchStockFootage(opts: {
   usedIds: string[];
   seed?: string;
   niche?: ProjectNiche | string | null;
-}): Promise<{ pick: StockVideo; chosenFile: StockVideoFile; candidates: StockVideo[] } | null> {
+};
+
+export type StockSearchResult = {
+  pick: StockVideo;
+  chosenFile: StockVideoFile;
+  candidates: StockVideo[];
+};
+
+export async function searchStockFootage(
+  opts: StockSearchOptions,
+): Promise<StockSearchResult | null> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const provider = getStockProvider();
   const normQuery = opts.query.trim().toLowerCase();
@@ -326,7 +342,6 @@ export async function searchStockFootage(opts: {
   if (pool.length === 0) {
     pool = results.filter((v) => !used.has(v.provider_clip_id) && v.files.length > 0);
   }
-  if (pool.length === 0) pool = results.filter((v) => v.files.length > 0);
   if (pool.length === 0) return null;
 
   // 4. Duration filter, with full-pool fallback
@@ -352,6 +367,29 @@ export async function searchStockFootage(opts: {
   if (!chosenFile) chosenFile = sortedFiles[sortedFiles.length - 1];
 
   return { pick, chosenFile, candidates };
+}
+
+export async function searchUniqueStockFootage(
+  opts: Omit<StockSearchOptions, "usedIds" | "seed"> & {
+    usedIds: Set<string>;
+    seed: string;
+    maxAttempts?: number;
+  },
+  search: (
+    searchOpts: StockSearchOptions,
+  ) => Promise<StockSearchResult | null> = searchStockFootage,
+): Promise<StockSearchResult | null> {
+  const { usedIds, seed, maxAttempts = 8, ...searchOpts } = opts;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const result = await search({
+      ...searchOpts,
+      usedIds: [...usedIds],
+      seed: `${seed}:${attempt}`,
+    });
+    if (!result) return null;
+    if (reserveProviderClipId(usedIds, result.pick.provider_clip_id)) return result;
+  }
+  return null;
 }
 
 async function bumpUsage(provider: string, opts: { cache_hit: boolean }) {
@@ -452,7 +490,6 @@ function selectStockCandidate(opts: {
   if (pool.length === 0) {
     pool = results.filter((v) => !used.has(v.provider_clip_id) && v.files.length > 0);
   }
-  if (pool.length === 0) pool = results.filter((v) => v.files.length > 0);
   if (pool.length === 0) return null;
 
   const longEnough = pool.filter((v) => v.duration_sec >= opts.minDurationSec);

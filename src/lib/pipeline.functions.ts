@@ -358,7 +358,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         ? Math.max(measuredAudioDuration, narrationEnd)
         : narrationEnd;
 
-    const { searchStockFootage, orientationForAspect, targetWidthForAspect } =
+    const { searchUniqueStockFootage, orientationForAspect, targetWidthForAspect } =
       await import("@/lib/stock.server");
     const orientation = orientationForAspect(project.aspect_ratio);
     const targetWidth = targetWidthForAspect(project.aspect_ratio);
@@ -407,7 +407,17 @@ async function advanceFromMatchingFootage(projectId: string) {
           thumbnail_url: string | null;
         }
       >();
-      for (const row of eligibleExistingSlices) {
+      const expectedSlotOrder = new Map(
+        expectedSlots.map((slot, index) => [sliceKey(slot.sceneId, slot.sliceIndex), index]),
+      );
+      const cachedProviderIds = new Set<string>();
+      for (const row of [...eligibleExistingSlices].sort(
+        (a, b) =>
+          (expectedSlotOrder.get(sliceKey(a.scene_id, a.slice_index)) ?? Number.MAX_SAFE_INTEGER) -
+          (expectedSlotOrder.get(sliceKey(b.scene_id, b.slice_index)) ?? Number.MAX_SAFE_INTEGER),
+      )) {
+        if (row.provider_clip_id && cachedProviderIds.has(row.provider_clip_id)) continue;
+        if (row.provider_clip_id) cachedProviderIds.add(row.provider_clip_id);
         sliceCache.set(sliceKey(row.scene_id, row.slice_index), {
           clip_url: row.clip_url,
           provider_clip_id: row.provider_clip_id ?? null,
@@ -445,7 +455,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       }
 
       const usedIds = new Set<string>(
-        eligibleExistingSlices.map((r) => r.provider_clip_id).filter((x): x is string => !!x),
+        [...sliceCache.values()].map((row) => row.provider_clip_id).filter((x): x is string => !!x),
       );
       const sceneById = new Map(scenes.map((scene) => [scene.id, scene]));
       const pendingSlots = expectedSlots.filter(
@@ -473,25 +483,17 @@ async function advanceFromMatchingFootage(projectId: string) {
           return;
         }
 
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const result = await searchStockFootage({
-            query: scene.visual_query,
-            orientation,
-            minDurationSec: slot.durationSeconds,
-            targetWidth,
-            usedIds: [...usedIds],
-            seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
-            niche: project.niche,
-          });
-          if (!result) {
-            unmatchedSlots.push(slot);
-            return;
-          }
-
+        const result = await searchUniqueStockFootage({
+          query: scene.visual_query,
+          orientation,
+          minDurationSec: slot.durationSeconds,
+          targetWidth,
+          usedIds,
+          seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
+          niche: project.niche,
+        });
+        if (result) {
           const providerClipId = result.pick.provider_clip_id;
-          if (usedIds.has(providerClipId) && attempt === 0) continue;
-
-          usedIds.add(providerClipId);
           const row = {
             project_id: projectId,
             scene_id: slot.sceneId,
@@ -546,9 +548,8 @@ async function advanceFromMatchingFootage(projectId: string) {
       const selectedSceneIds = new Set(
         (selectedRows ?? [])
           .filter((row) => {
-            const provider = (
-              row as unknown as { clip_candidates: { provider: string } | null }
-            ).clip_candidates?.provider;
+            const provider = (row as unknown as { clip_candidates: { provider: string } | null })
+              .clip_candidates?.provider;
             return project.niche !== "space" || provider === "nasa";
           })
           .map((row) => row.scene_id),
@@ -567,8 +568,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         const firstSlotKey = sliceKey(scene.id, firstSlot.slice_index);
         const firstSlotProvider =
           newSliceRows.find((row) => sliceKey(row.scene_id, row.slice_index) === firstSlotKey)
-            ?.provider ??
-          (project.niche === "space" ? "nasa" : "pexels");
+            ?.provider ?? (project.niche === "space" ? "nasa" : "pexels");
 
         const { data: candidate } = await supabaseAdmin
           .from("clip_candidates")
@@ -636,18 +636,23 @@ async function advanceFromMatchingFootage(projectId: string) {
       ).clip_candidates?.provider;
       return project.niche !== "space" || provider === "nasa";
     });
-    const alreadySelected = new Set(eligibleExistingSelections.map((r) => r.scene_id));
-    const usedIds: string[] = eligibleExistingSelections
-      .map(
-        (r) =>
-          (
-            r as {
-              clip_candidates: { provider: string; provider_clip_id: string } | null;
-            }
-          ).clip_candidates
-            ?.provider_clip_id,
-      )
-      .filter((x): x is string => !!x);
+    const sceneOrder = new Map(scenes.map((scene, index) => [scene.id, index]));
+    const alreadySelected = new Set<string>();
+    const usedIds = new Set<string>();
+    for (const row of [...eligibleExistingSelections].sort(
+      (a, b) =>
+        (sceneOrder.get(a.scene_id) ?? Number.MAX_SAFE_INTEGER) -
+        (sceneOrder.get(b.scene_id) ?? Number.MAX_SAFE_INTEGER),
+    )) {
+      const providerClipId = (
+        row as {
+          clip_candidates: { provider: string; provider_clip_id: string } | null;
+        }
+      ).clip_candidates?.provider_clip_id;
+      if (!providerClipId || usedIds.has(providerClipId)) continue;
+      usedIds.add(providerClipId);
+      alreadySelected.add(row.scene_id);
+    }
 
     const { buildSceneTimelineSlots } = await import("@/lib/clip-slices.server");
     const timelineSlots = new Map(
@@ -655,27 +660,31 @@ async function advanceFromMatchingFootage(projectId: string) {
     );
     const CONCURRENCY = 5;
     const pending = scenes.filter((s) => !alreadySelected.has(s.id));
+    const unmatchedSceneIds = new Set<string>();
 
     async function processScene(scene: NonNullable<typeof scenes>[number]) {
       const query = scene.visual_query;
       if (!query) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
+        unmatchedSceneIds.add(scene.id);
         return;
       }
       const visualDuration =
         timelineSlots.get(scene.id)?.durationSeconds ??
         Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
       const minDuration = Math.max(1, Math.ceil(visualDuration));
-      const result = await searchStockFootage({
+      const result = await searchUniqueStockFootage({
         query,
         orientation,
         minDurationSec: minDuration,
         targetWidth,
-        usedIds: [...usedIds],
+        usedIds,
+        seed: `${projectId}:${scene.id}`,
         niche: projectNiche,
       });
       if (!result) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
+        unmatchedSceneIds.add(scene.id);
         return;
       }
 
@@ -708,12 +717,17 @@ async function advanceFromMatchingFootage(projectId: string) {
       if (sErr) throw new Error(sErr.message);
 
       await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
-      usedIds.push(pick.provider_clip_id);
     }
 
     for (let i = 0; i < pending.length; i += CONCURRENCY) {
       const batch = pending.slice(i, i + CONCURRENCY);
       await Promise.all(batch.map((s) => processScene(s)));
+    }
+
+    if (unmatchedSceneIds.size > 0) {
+      throw new Error(
+        `Could not find unique stock footage for ${unmatchedSceneIds.size} scene(s). Retry matching to search again.`,
+      );
     }
 
     await supabaseAdmin
