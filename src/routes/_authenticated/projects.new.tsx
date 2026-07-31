@@ -17,8 +17,17 @@ import {
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { ArrowLeft, Upload } from "lucide-react";
+import { AlertCircle, ArrowLeft, FolderKanban, Upload } from "lucide-react";
 import { toast } from "sonner";
+import { useProjects } from "@/components/project-overview";
+import {
+  isProjectLimitError,
+  PROJECT_LIMIT,
+  PROJECT_LIMIT_MESSAGE,
+  projectUsage,
+} from "@/lib/project-limit";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Skeleton } from "@/components/ui/skeleton";
 
 export const Route = createFileRoute("/_authenticated/projects/new")({
   component: NewProject,
@@ -41,6 +50,8 @@ function NewProject() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState<string>("");
+  const { data: existingProjects = [], isLoading: projectsLoading } = useProjects();
+  const usage = projectUsage(existingProjects.length);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -79,7 +90,11 @@ function NewProject() {
 
     if (projectError || !project) {
       setBusy(false);
-      toast.error(projectError?.message ?? "Failed to create project.");
+      toast.error(
+        isProjectLimitError(projectError)
+          ? PROJECT_LIMIT_MESSAGE
+          : (projectError?.message ?? "Failed to create project."),
+      );
       return;
     }
 
@@ -160,145 +175,185 @@ function NewProject() {
     navigate({ to: "/projects/$projectId", params: { projectId: project.id } });
   };
 
-  return (
-    <div className="min-h-screen bg-background">
-      <header className="border-b">
-        <div className="mx-auto flex max-w-3xl items-center gap-4 px-6 py-4">
-          <Button variant="ghost" size="sm" asChild>
-            <Link to="/dashboard">
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Back
+  if (projectsLoading) {
+    return (
+      <main className="mx-auto max-w-2xl px-5 py-10 sm:px-8">
+        <Skeleton className="h-96 w-full" />
+      </main>
+    );
+  }
+
+  if (usage.atLimit) {
+    return (
+      <main className="mx-auto max-w-2xl px-5 py-10 sm:px-8">
+        <Button variant="ghost" size="sm" asChild className="mb-6">
+          <Link to="/dashboard">
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to dashboard
+          </Link>
+        </Button>
+        <Alert>
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>All project slots are in use</AlertTitle>
+          <AlertDescription className="mt-2">{PROJECT_LIMIT_MESSAGE}</AlertDescription>
+        </Alert>
+        <div className="mt-5 flex items-center justify-between rounded-lg border bg-card p-4">
+          <div>
+            <p className="text-sm font-medium">
+              {usage.count} of {PROJECT_LIMIT} projects used
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Delete an existing project before starting another.
+            </p>
+          </div>
+          <Button asChild variant="outline">
+            <Link to="/projects">
+              <FolderKanban className="mr-2 h-4 w-4" />
+              Manage projects
             </Link>
           </Button>
-          <h1 className="text-lg font-semibold">New project</h1>
         </div>
-      </header>
-      <main className="mx-auto max-w-2xl px-6 py-10">
-        <Card>
-          <CardHeader>
-            <CardTitle>Create a project</CardTitle>
-            <CardDescription>
-              Name it, upload an audio track, and we'll set it up. Rendering starts in a later
-              phase.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleSubmit} className="space-y-6">
-              <div className="space-y-2">
-                <Label htmlFor="name">Project name</Label>
-                <Input
-                  id="name"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="My awesome video"
+      </main>
+    );
+  }
+
+  return (
+    <main className="mx-auto max-w-2xl px-5 py-10 sm:px-8">
+      <div className="mb-6">
+        <Button variant="ghost" size="sm" asChild>
+          <Link to="/dashboard">
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back
+          </Link>
+        </Button>
+        <h1 className="mt-5 text-2xl font-semibold">New project</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          {usage.count} of {PROJECT_LIMIT} project slots used
+        </p>
+      </div>
+      <Card>
+        <CardHeader>
+          <CardTitle>Create a project</CardTitle>
+          <CardDescription>
+            Name it, upload an audio track, and we'll set it up. Rendering starts in a later phase.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit} className="space-y-6">
+            <div className="space-y-2">
+              <Label htmlFor="name">Project name</Label>
+              <Input
+                id="name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="My awesome video"
+                disabled={busy}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="audio">Audio file</Label>
+              <div className="rounded-md border border-dashed p-6 text-center">
+                <Upload className="mx-auto mb-2 h-6 w-6 text-muted-foreground" />
+                <input
+                  id="audio"
+                  type="file"
+                  accept={ACCEPTED}
+                  disabled={busy}
+                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                  className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-medium file:text-secondary-foreground hover:file:bg-secondary/80"
+                />
+                {file ? (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {file.name} — {(file.size / 1024 / 1024).toFixed(1)} MB
+                  </p>
+                ) : (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    MP3, WAV, M4A, FLAC, OGG — up to 500 MB
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="category">Visual theme</Label>
+              <Select
+                value={category}
+                onValueChange={(v) => setCategory(v as CategoryValue)}
+                disabled={busy}
+              >
+                <SelectTrigger id="category">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">None (no thematic bias)</SelectItem>
+                  <SelectItem value="war">War / military conflict</SelectItem>
+                  <SelectItem value="crime">Crime / law enforcement</SelectItem>
+                  <SelectItem value="space">Space / astronomy</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Biases every generated footage search toward this theme. Leave as None to keep
+                queries literal.
+              </p>
+            </div>
+
+            <div className="space-y-3 rounded-md border p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div className="space-y-0.5">
+                  <Label htmlFor="fixed-clips">Fixed clip length</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Off: one clip per sentence, natural length. On: each scene is split into clips
+                    of this length.
+                  </p>
+                </div>
+                <Switch
+                  id="fixed-clips"
+                  checked={fixedClips}
+                  onCheckedChange={setFixedClips}
                   disabled={busy}
                 />
               </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="audio">Audio file</Label>
-                <div className="rounded-md border border-dashed p-6 text-center">
-                  <Upload className="mx-auto mb-2 h-6 w-6 text-muted-foreground" />
-                  <input
-                    id="audio"
-                    type="file"
-                    accept={ACCEPTED}
-                    disabled={busy}
-                    onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                    className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-medium file:text-secondary-foreground hover:file:bg-secondary/80"
-                  />
-                  {file ? (
-                    <p className="mt-2 text-xs text-muted-foreground">
-                      {file.name} — {(file.size / 1024 / 1024).toFixed(1)} MB
-                    </p>
-                  ) : (
-                    <p className="mt-2 text-xs text-muted-foreground">
-                      MP3, WAV, M4A, FLAC, OGG — up to 500 MB
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="category">Visual theme</Label>
-                <Select
-                  value={category}
-                  onValueChange={(v) => setCategory(v as CategoryValue)}
-                  disabled={busy}
-                >
-                  <SelectTrigger id="category">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">None (no thematic bias)</SelectItem>
-                    <SelectItem value="war">War / military conflict</SelectItem>
-                    <SelectItem value="crime">Crime / law enforcement</SelectItem>
-                    <SelectItem value="space">Space / astronomy</SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="text-xs text-muted-foreground">
-                  Biases every generated footage search toward this theme. Leave as None to keep
-                  queries literal.
-                </p>
-              </div>
-
-              <div className="space-y-3 rounded-md border p-4">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="space-y-0.5">
-                    <Label htmlFor="fixed-clips">Fixed clip length</Label>
-                    <p className="text-xs text-muted-foreground">
-                      Off: one clip per sentence, natural length. On: each scene is split into clips
-                      of this length.
-                    </p>
-                  </div>
-                  <Switch
-                    id="fixed-clips"
-                    checked={fixedClips}
-                    onCheckedChange={setFixedClips}
-                    disabled={busy}
-                  />
-                </div>
-                {fixedClips ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between text-sm">
-                      <Label htmlFor="clip-duration">Clip duration</Label>
-                      <span className="font-medium tabular-nums">{clipDuration}s</span>
-                    </div>
-                    <Slider
-                      id="clip-duration"
-                      min={3}
-                      max={6}
-                      step={1}
-                      value={[clipDuration]}
-                      onValueChange={(v) => setClipDuration(v[0])}
-                      disabled={busy}
-                    />
-                  </div>
-                ) : null}
-              </div>
-
-              {busy ? (
+              {fixedClips ? (
                 <div className="space-y-2">
-                  <Progress value={progress} />
-                  <p className="text-xs text-muted-foreground">
-                    {stage} {progress > 0 ? `(${progress}%)` : ""}
-                  </p>
+                  <div className="flex items-center justify-between text-sm">
+                    <Label htmlFor="clip-duration">Clip duration</Label>
+                    <span className="font-medium tabular-nums">{clipDuration}s</span>
+                  </div>
+                  <Slider
+                    id="clip-duration"
+                    min={3}
+                    max={6}
+                    step={1}
+                    value={[clipDuration]}
+                    onValueChange={(v) => setClipDuration(v[0])}
+                    disabled={busy}
+                  />
                 </div>
               ) : null}
+            </div>
 
-              <div className="flex justify-end gap-2">
-                <Button type="button" variant="ghost" asChild disabled={busy}>
-                  <Link to="/dashboard">Cancel</Link>
-                </Button>
-                <Button type="submit" disabled={busy || !file}>
-                  {busy ? "Uploading..." : "Create project"}
-                </Button>
+            {busy ? (
+              <div className="space-y-2">
+                <Progress value={progress} />
+                <p className="text-xs text-muted-foreground">
+                  {stage} {progress > 0 ? `(${progress}%)` : ""}
+                </p>
               </div>
-            </form>
-          </CardContent>
-        </Card>
-      </main>
-    </div>
+            ) : null}
+
+            <div className="flex justify-end gap-2">
+              <Button type="button" variant="ghost" asChild disabled={busy}>
+                <Link to="/dashboard">Cancel</Link>
+              </Button>
+              <Button type="submit" disabled={busy || !file}>
+                {busy ? "Uploading..." : "Create project"}
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+    </main>
   );
 }
 

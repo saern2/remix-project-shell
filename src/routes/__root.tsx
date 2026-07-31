@@ -13,6 +13,7 @@ import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
 import { supabase } from "@/integrations/supabase/client";
 import { Toaster } from "@/components/ui/sonner";
+import { ThemeProvider, themeBootScript } from "@/components/theme-provider";
 
 function NotFoundComponent() {
   return (
@@ -84,15 +85,35 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "Audio to vid" },
-      { name: "description", content: "Project Shell provides the foundational structure for an automated video creation web application." },
+      {
+        name: "description",
+        content:
+          "Project Shell provides the foundational structure for an automated video creation web application.",
+      },
       { property: "og:title", content: "Audio to vid" },
-      { property: "og:description", content: "Project Shell provides the foundational structure for an automated video creation web application." },
+      {
+        property: "og:description",
+        content:
+          "Project Shell provides the foundational structure for an automated video creation web application.",
+      },
       { property: "og:type", content: "website" },
-      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/3ec63576-f374-44d9-b96b-ceca9d412c99/id-preview-f65b9cde--5428befa-2baf-416e-a4ac-071aeb9bec67.lovable.app-1784578872248.png" },
+      {
+        property: "og:image",
+        content:
+          "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/3ec63576-f374-44d9-b96b-ceca9d412c99/id-preview-f65b9cde--5428befa-2baf-416e-a4ac-071aeb9bec67.lovable.app-1784578872248.png",
+      },
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:title", content: "Audio to vid" },
-      { name: "twitter:description", content: "Project Shell provides the foundational structure for an automated video creation web application." },
-      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/3ec63576-f374-44d9-b96b-ceca9d412c99/id-preview-f65b9cde--5428befa-2baf-416e-a4ac-071aeb9bec67.lovable.app-1784578872248.png" },
+      {
+        name: "twitter:description",
+        content:
+          "Project Shell provides the foundational structure for an automated video creation web application.",
+      },
+      {
+        name: "twitter:image",
+        content:
+          "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/3ec63576-f374-44d9-b96b-ceca9d412c99/id-preview-f65b9cde--5428befa-2baf-416e-a4ac-071aeb9bec67.lovable.app-1784578872248.png",
+      },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
@@ -104,7 +125,6 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { rel: "icon", href: "/favicon.ico", type: "image/x-icon" },
     ],
-
   }),
   shellComponent: RootShell,
   component: RootComponent,
@@ -117,6 +137,7 @@ function RootShell({ children }: { children: ReactNode }) {
     <html lang="en">
       <head>
         <HeadContent />
+        <script dangerouslySetInnerHTML={{ __html: themeBootScript }} />
       </head>
       <body>
         {children}
@@ -141,8 +162,10 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <Outlet />
-      <Toaster />
+      <ThemeProvider>
+        <Outlet />
+        <Toaster />
+      </ThemeProvider>
     </QueryClientProvider>
   );
 }

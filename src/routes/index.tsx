@@ -45,13 +45,7 @@ export const Route = createFileRoute("/")({
   component: Landing,
 });
 
-const TAGS = [
-  "Transcription",
-  "Scene matching",
-  "Stock footage",
-  "Custom pacing",
-  "Auto-render",
-];
+const TAGS = ["Transcription", "Scene matching", "Stock footage", "Custom pacing", "Auto-render"];
 
 const STEPS = [
   {
@@ -128,7 +122,7 @@ function Landing() {
   const [menuOpen, setMenuOpen] = useState(false);
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="dark min-h-screen bg-background text-foreground">
       <header
         className={cn(
           "fixed inset-x-0 top-0 z-40 transition-all duration-300",
@@ -356,4 +350,3 @@ function Landing() {
     </div>
   );
 }
-
