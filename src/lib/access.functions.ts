@@ -347,3 +347,18 @@ export const revokeUserAccessSecret = createServerFn({ method: "POST" })
     });
     return { ok: true as const };
   });
+
+export const resetUserAccessSecretActivations = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ secretId: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: reset, error } = await supabaseAdmin.rpc("reset_access_secret_activations", {
+      p_actor_user_id: context.userId,
+      p_secret_id: data.secretId,
+    });
+    if (error) throw new Error(error.message);
+    if (!reset) throw new Error("This access secret is no longer usable.");
+    return { ok: true as const };
+  });

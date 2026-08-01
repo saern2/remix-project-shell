@@ -1,5 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { getCookie, setCookie, deleteCookie } from "@tanstack/react-start/server";
+import { getCookie, setCookie, deleteCookie, getRequest } from "@tanstack/react-start/server";
+import { TRUSTED_CLIENT_HEADER } from "@/lib/trusted-client";
 
 export const ACCESS_COOKIE_NAME = "ss_trusted_client";
 
@@ -24,6 +25,8 @@ export function generateClientToken() {
 }
 
 export function readTrustedClientToken() {
+  const headerToken = getRequest()?.headers.get(TRUSTED_CLIENT_HEADER);
+  if (headerToken && /^[a-f0-9]{64}$/.test(headerToken)) return headerToken;
   return getCookie(ACCESS_COOKIE_NAME);
 }
 

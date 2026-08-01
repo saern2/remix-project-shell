@@ -63,8 +63,13 @@ function AuthPage() {
     const { data: authListener } = supabase.auth.onAuthStateChange((event) => {
       if (!cancelled && event === "PASSWORD_RECOVERY") setIsPasswordRecovery(true);
     });
-    supabase.auth.getUser().then(async ({ data }) => {
-      if (!data.user || cancelled) return;
+    supabase.auth.getUser().then(async ({ data, error }) => {
+      if (cancelled) return;
+      if (error || !data.user) {
+        await supabase.auth.signOut({ scope: "local" });
+        if (!cancelled) setGate(null);
+        return;
+      }
       setNeedsPasswordSetup(data.user.user_metadata?.needs_password_setup === true);
       try {
         const status = await getGate({});
@@ -127,7 +132,14 @@ function AuthPage() {
       await activate({ data: { secret } });
       await refreshGate();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Access verification failed.");
+      const message = error instanceof Error ? error.message : "Access verification failed.";
+      if (message.includes("Unauthorized") || message.includes("Invalid token")) {
+        await supabase.auth.signOut({ scope: "local" });
+        setGate(null);
+        toast.error("Your session expired. Sign in again to continue.");
+      } else {
+        toast.error(message);
+      }
     } finally {
       setLoading(false);
     }

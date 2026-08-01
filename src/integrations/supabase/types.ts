@@ -748,6 +748,10 @@ export type Database = {
         Returns: boolean;
       };
       has_platform_account_access: { Args: never; Returns: boolean };
+      reset_access_secret_activations: {
+        Args: { p_actor_user_id: string; p_secret_id: string };
+        Returns: boolean;
+      };
       cleanup_delete_project_with_audit: {
         Args: {
           p_active_render_cancelled: boolean;

@@ -84,26 +84,22 @@ async function authenticateRequest() {
     },
   });
 
-  const { data, error } = await supabase.auth.getClaims(token);
-  if (error || !data?.claims) {
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) {
     throw new Error("Unauthorized: Invalid token");
-  }
-
-  if (!data.claims.sub) {
-    throw new Error("Unauthorized: No user ID found in token");
   }
 
   const { data: profile, error: profileError } = await supabase
     .from("users")
     .select("approval_status, role, is_primary_admin")
-    .eq("id", data.claims.sub)
+    .eq("id", data.user.id)
     .maybeSingle();
 
   if (profileError) {
     throw new Error(`Unauthorized: ${profileError.message}`);
   }
 
-  return { supabase, userId: data.claims.sub, claims: data.claims, profile };
+  return { supabase, userId: data.user.id, profile };
 }
 
 export const requireSupabaseIdentity = createMiddleware({ type: "function" }).server(

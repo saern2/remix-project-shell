@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { KeyRound, Loader2, ShieldX } from "lucide-react";
+import { KeyRound, Loader2, RotateCcw, ShieldX } from "lucide-react";
 import { toast } from "sonner";
 import {
   issueUserAccessSecret,
   listAccessAdministration,
   reviewAccessRequest,
+  resetUserAccessSecretActivations,
   revokeUserAccessSecret,
 } from "@/lib/access.functions";
 import { listAdminUsers } from "@/lib/admin.functions";
@@ -29,6 +30,7 @@ export function AdminAccessPanel() {
   const review = useServerFn(reviewAccessRequest);
   const issue = useServerFn(issueUserAccessSecret);
   const revoke = useServerFn(revokeUserAccessSecret);
+  const resetActivations = useServerFn(resetUserAccessSecretActivations);
   const [busy, setBusy] = useState<string | null>(null);
   const [revealedSecret, setRevealedSecret] = useState<{ email: string; secret: string } | null>(
     null,
@@ -190,7 +192,7 @@ export function AdminAccessPanel() {
             </TableHeader>
             <TableBody>
               {userRows
-                .filter((user) => user.approval_status === "approved")
+                .filter((user) => user.approval_status === "approved" && user.role !== "admin")
                 .map((user) => {
                   const current = currentSecretByUser.get(user.id);
                   return (
@@ -220,32 +222,56 @@ export function AdminAccessPanel() {
                       <TableCell>
                         <div className="flex justify-end gap-2">
                           {current ? (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              disabled={busy === current.id}
-                              onClick={() => {
-                                if (
-                                  window.confirm(
-                                    `Revoke access for ${user.email}? Existing trusted browsers will be blocked immediately.`,
+                            <>
+                              {current.activation_count > 0 ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={busy === current.id}
+                                  onClick={() => {
+                                    if (
+                                      window.confirm(
+                                        `Reset trusted browsers for ${user.email}? Their existing secret remains valid, but every browser must verify it again.`,
+                                      )
+                                    )
+                                      void run(
+                                        current.id,
+                                        () => resetActivations({ data: { secretId: current.id } }),
+                                        "Browser activations reset.",
+                                      );
+                                  }}
+                                >
+                                  <RotateCcw className="mr-2 h-4 w-4" />
+                                  Reset activations
+                                </Button>
+                              ) : null}
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={busy === current.id}
+                                onClick={() => {
+                                  if (
+                                    window.confirm(
+                                      `Revoke access for ${user.email}? Existing trusted browsers will be blocked immediately.`,
+                                    )
                                   )
-                                )
-                                  void run(
-                                    current.id,
-                                    () =>
-                                      revoke({
-                                        data: {
-                                          secretId: current.id,
-                                          reason: "Revoked by administrator",
-                                        },
-                                      }),
-                                    "Access revoked.",
-                                  );
-                              }}
-                            >
-                              <ShieldX className="mr-2 h-4 w-4" />
-                              Revoke
-                            </Button>
+                                    void run(
+                                      current.id,
+                                      () =>
+                                        revoke({
+                                          data: {
+                                            secretId: current.id,
+                                            reason: "Revoked by administrator",
+                                          },
+                                        }),
+                                      "Access revoked.",
+                                    );
+                                }}
+                              >
+                                <ShieldX className="mr-2 h-4 w-4" />
+                                Revoke
+                              </Button>
+                            </>
                           ) : (
                             <Button
                               size="sm"
