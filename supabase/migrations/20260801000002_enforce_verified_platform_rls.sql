@@ -10,11 +10,18 @@ as $$
   select exists (
     select 1
     from public.users u
-    join public.user_access_secrets s on s.user_id = u.id
     where u.id = auth.uid()
       and u.approval_status = 'approved'
-      and s.status in ('active', 'exhausted')
-      and s.activation_count > 0
+      and (
+        u.role = 'admin'
+        or exists (
+          select 1
+          from public.user_access_secrets s
+          where s.user_id = u.id
+            and s.status in ('active', 'exhausted')
+            and s.activation_count > 0
+        )
+      )
   );
 $$;
 revoke all on function public.has_platform_account_access() from public, anon;

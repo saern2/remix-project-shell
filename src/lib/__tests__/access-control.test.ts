@@ -25,8 +25,16 @@ const enforcementMigration = readFileSync(
   resolve("supabase/migrations/20260801000002_enforce_verified_platform_rls.sql"),
   "utf8",
 );
+const adminBypassMigration = readFileSync(
+  resolve("supabase/migrations/20260801120000_admin_bypass_and_activation_fix.sql"),
+  "utf8",
+);
 const accessFunctions = readFileSync(resolve("src/lib/access.functions.ts"), "utf8");
 const authRoute = readFileSync(resolve("src/routes/auth.tsx"), "utf8");
+const authMiddleware = readFileSync(
+  resolve("src/integrations/supabase/auth-middleware.ts"),
+  "utf8",
+);
 
 describe("access control security contract", () => {
   beforeEach(() => {
@@ -95,5 +103,20 @@ describe("access control security contract", () => {
     expect(accessFunctions).toContain("supabaseAdmin.auth.resetPasswordForEmail");
     expect(authRoute).toContain('event === "PASSWORD_RECOVERY"');
     expect(authRoute).not.toContain("supabase.auth.resetPasswordForEmail");
+  });
+
+  it("allows approved administrators through without access-secret activation", () => {
+    expect(authMiddleware).toContain('identity.profile.role === "admin"');
+    expect(authMiddleware).toContain('identity.profile?.approval_status === "approved"');
+    expect(accessFunctions).toContain("isAdmin || (await hasTrustedAccess(context.userId))");
+    expect(accessFunctions).toContain("Administrators do not require access secrets.");
+    expect(authRoute).not.toContain("Initialize primary administrator access");
+    expect(adminBypassMigration).toContain("u.role = 'admin'");
+  });
+
+  it("qualifies activation counters so the regular-user RPC is unambiguous", () => {
+    expect(adminBypassMigration).toContain("activation_count = uas.activation_count + 1");
+    expect(adminBypassMigration).toContain("when uas.activation_count + 1 >= uas.max_activations");
+    expect(adminBypassMigration).toContain("returning uas.* into v_secret");
   });
 });

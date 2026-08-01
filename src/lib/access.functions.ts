@@ -99,17 +99,12 @@ export const getAccessGateStatus = createServerFn({ method: "GET" })
   .middleware([requireSupabaseIdentity])
   .handler(async ({ context }) => {
     const { hasTrustedAccess } = await import("@/lib/access-control.server");
-    const hasAccess =
-      context.profile?.approval_status === "approved" && (await hasTrustedAccess(context.userId));
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { count } = await supabaseAdmin
-      .from("user_access_secrets")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", context.userId);
+    const isApproved = context.profile?.approval_status === "approved";
+    const isAdmin = context.profile?.role === "admin";
+    const hasAccess = isApproved && (isAdmin || (await hasTrustedAccess(context.userId)));
     return {
       approvalStatus: context.profile?.approval_status ?? "pending",
       hasAccess,
-      bootstrapEligible: context.profile?.is_primary_admin === true && (count ?? 0) === 0,
     };
   });
 
@@ -147,53 +142,6 @@ export const activateAccessSecret = createServerFn({ method: "POST" })
       activationCount: result.activation_count,
       maxActivations: result.max_activations,
     };
-  });
-
-export const bootstrapPrimaryAdminAccess = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseIdentity])
-  .handler(async ({ context }) => {
-    if (context.profile?.approval_status !== "approved" || !context.profile?.is_primary_admin) {
-      throw new Error("Forbidden.");
-    }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { count } = await supabaseAdmin
-      .from("user_access_secrets")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", context.userId);
-    if ((count ?? 0) !== 0) throw new Error("Primary administrator access is already initialized.");
-
-    const access = await import("@/lib/access-control.server");
-    const secret = access.generateAccessSecret();
-    const { data: created, error } = await supabaseAdmin
-      .from("user_access_secrets")
-      .insert({
-        user_id: context.userId,
-        secret_hash: access.secureHash(secret),
-        secret_suffix: secret.slice(-4),
-        created_by: context.userId,
-      })
-      .select("id")
-      .single();
-    if (error) throw new Error(error.message);
-
-    const clientToken = access.generateClientToken();
-    const { error: activationError } = await supabaseAdmin.rpc("activate_access_secret", {
-      p_user_id: context.userId,
-      p_secret_hash: access.secureHash(secret),
-      p_client_token_hash: access.secureHash(clientToken),
-    });
-    if (activationError) {
-      await supabaseAdmin.from("user_access_secrets").delete().eq("id", created.id);
-      throw new Error(activationError.message);
-    }
-    access.writeTrustedClientToken(clientToken);
-    await supabaseAdmin.from("access_security_events").insert({
-      event_type: "primary_admin_bootstrapped",
-      user_id: context.userId,
-      secret_id: created.id,
-      actor_user_id: context.userId,
-    });
-    return { secret };
   });
 
 async function assertAdmin(context: { profile?: { role?: string | null } | null }) {
@@ -326,11 +274,12 @@ export const issueUserAccessSecret = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: user } = await supabaseAdmin
       .from("users")
-      .select("approval_status")
+      .select("approval_status,role")
       .eq("id", data.userId)
       .maybeSingle();
     if (user?.approval_status !== "approved")
       throw new Error("Approve the user before issuing access.");
+    if (user.role === "admin") throw new Error("Administrators do not require access secrets.");
     const { count } = await supabaseAdmin
       .from("user_access_secrets")
       .select("id", { count: "exact", head: true })

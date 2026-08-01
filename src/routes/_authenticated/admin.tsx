@@ -38,13 +38,12 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import { ArrowLeft, Loader2, Upload, ShieldCheck } from "lucide-react";
-import { AdminAccessPanel } from "@/components/admin-access-panel";
 
 export const Route = createFileRoute("/_authenticated/admin")({
   head: () => ({
     meta: [
       { title: "Admin panel — Auto Video Creator" },
-      { name: "description", content: "Manage users, renders, and the Pexels key pool." },
+      { name: "description", content: "Review platform activity and stock provider health." },
       { name: "robots", content: "noindex" },
     ],
   }),
@@ -81,7 +80,9 @@ function AdminPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Admin panel</h1>
-          <p className="text-sm text-muted-foreground">Users, renders and Pexels key pool</p>
+          <p className="text-sm text-muted-foreground">
+            Platform activity and stock provider health
+          </p>
         </div>
         <Button variant="outline" asChild>
           <Link to="/dashboard">
@@ -93,18 +94,10 @@ function AdminPage() {
       <Tabs defaultValue="overview">
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="users">Users</TabsTrigger>
-          <TabsTrigger value="access">Access</TabsTrigger>
           <TabsTrigger value="keys">Pexels keys</TabsTrigger>
         </TabsList>
         <TabsContent value="overview" className="mt-4">
           <OverviewTab />
-        </TabsContent>
-        <TabsContent value="users" className="mt-4">
-          <UsersTab />
-        </TabsContent>
-        <TabsContent value="access" className="mt-4">
-          <AdminAccessPanel />
         </TabsContent>
         <TabsContent value="keys" className="mt-4">
           <KeysTab />
@@ -231,7 +224,7 @@ function OverviewTab() {
   );
 }
 
-function UsersTab() {
+export function AdminUsersPanel() {
   const qc = useQueryClient();
   const fetchUsers = useServerFn(listAdminUsers);
   const approvalFn = useServerFn(setUserApprovalStatus);

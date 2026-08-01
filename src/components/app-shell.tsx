@@ -15,6 +15,7 @@ import {
   Settings,
   Shield,
   Sun,
+  UsersRound,
   type LucideIcon,
 } from "lucide-react";
 import { amIAdmin } from "@/lib/admin.functions";
@@ -32,7 +33,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-type ShellPath = "/dashboard" | "/projects/new" | "/projects" | "/settings" | "/account" | "/admin";
+type ShellPath =
+  "/dashboard" | "/projects/new" | "/projects" | "/settings" | "/account" | "/admin" | "/users";
 type NavItem = { label: string; to: ShellPath; icon: LucideIcon; exact?: boolean };
 
 const PRIMARY_NAV: NavItem[] = [
@@ -112,7 +114,12 @@ function ShellNav({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: 
         {!collapsed ? (
           <p className="px-3 pb-2 text-xs font-medium text-muted-foreground">Manage</p>
         ) : null}
-        {admin?.isAdmin ? renderLink({ label: "Admin", to: "/admin", icon: Shield }) : null}
+        {admin?.isAdmin ? (
+          <>
+            {renderLink({ label: "Admin", to: "/admin", icon: Shield, exact: true })}
+            {renderLink({ label: "Users", to: "/users", icon: UsersRound })}
+          </>
+        ) : null}
         {SECONDARY_NAV.map(renderLink)}
       </div>
     </div>

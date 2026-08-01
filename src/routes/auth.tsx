@@ -6,7 +6,6 @@ import { CheckCircle2, KeyRound, Loader2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import {
   activateAccessSecret,
-  bootstrapPrimaryAdminAccess,
   getAccessGateStatus,
   requestAdminPasswordRecovery,
   submitAccessRequest,
@@ -25,7 +24,6 @@ export const Route = createFileRoute("/auth")({
 type Gate = {
   approvalStatus: string;
   hasAccess: boolean;
-  bootstrapEligible: boolean;
 };
 
 function AuthPage() {
@@ -33,7 +31,6 @@ function AuthPage() {
   const router = useRouter();
   const getGate = useServerFn(getAccessGateStatus);
   const activate = useServerFn(activateAccessSecret);
-  const bootstrap = useServerFn(bootstrapPrimaryAdminAccess);
   const submitWaitlist = useServerFn(submitAccessRequest);
   const requestPasswordRecovery = useServerFn(requestAdminPasswordRecovery);
   const [email, setEmail] = useState("");
@@ -43,7 +40,6 @@ function AuthPage() {
   const [needsPasswordSetup, setNeedsPasswordSetup] = useState(false);
   const [isPasswordRecovery, setIsPasswordRecovery] = useState(false);
   const [newPassword, setNewPassword] = useState("");
-  const [oneTimeSecret, setOneTimeSecret] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [waitlistSent, setWaitlistSent] = useState(false);
   const [fullName, setFullName] = useState("");
@@ -137,21 +133,6 @@ function AuthPage() {
     }
   }
 
-  async function handleBootstrap() {
-    setLoading(true);
-    try {
-      const result = await bootstrap({});
-      setOneTimeSecret(result.secret);
-      setGate((current) =>
-        current ? { ...current, hasAccess: true, bootstrapEligible: false } : current,
-      );
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Initialization failed.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
   async function handleWaitlist(event: React.FormEvent) {
     event.preventDefault();
     setLoading(true);
@@ -237,23 +218,6 @@ function AuthPage() {
                     {loading ? "Verifying..." : "Enter workspace"}
                   </Button>
                 </form>
-                {gate.bootstrapEligible ? (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="w-full"
-                    disabled={loading}
-                    onClick={() => void handleBootstrap()}
-                  >
-                    Initialize primary administrator access
-                  </Button>
-                ) : null}
-                {oneTimeSecret ? (
-                  <OneTimeSecret
-                    secret={oneTimeSecret}
-                    onContinue={() => navigate({ to: "/dashboard", replace: true })}
-                  />
-                ) : null}
               </>
             )}
             <Button
@@ -429,16 +393,4 @@ function StatusMessage({ status }: { status: string }) {
         ? "This account is suspended. Contact support."
         : "This account is waiting for administrator approval.";
   return <div className="rounded-md border bg-muted/40 p-4 text-sm">{text}</div>;
-}
-
-function OneTimeSecret({ secret, onContinue }: { secret: string; onContinue: () => void }) {
-  return (
-    <div className="space-y-3 rounded-md border border-primary/30 bg-primary/10 p-3">
-      <p className="text-xs font-medium">Save this secret now. It will not be shown again.</p>
-      <code className="block break-all text-xs">{secret}</code>
-      <Button type="button" size="sm" onClick={onContinue}>
-        I saved it, continue
-      </Button>
-    </div>
-  );
 }

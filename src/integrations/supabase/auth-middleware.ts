@@ -119,6 +119,9 @@ export const requireSupabaseIdentity = createMiddleware({ type: "function" }).se
 export const requireSupabaseAuth = createMiddleware({ type: "function" }).server(
   async ({ next }) => {
     const identity = await authenticateRequest();
+    if (identity.profile?.approval_status === "approved" && identity.profile.role === "admin") {
+      return next({ context: identity });
+    }
     const { hasTrustedAccess } = await import("@/lib/access-control.server");
     if (!(await hasTrustedAccess(identity.userId))) {
       throw new Error("Unauthorized: Access secret verification required.");

@@ -7,8 +7,8 @@ Deploy this feature in this order. The application code expects the new schema a
 3. Apply `20260801000001_approval_waitlist_access_secrets.sql` to a disposable database and run the activation tests.
 4. Apply only migration `20260801000001` to production and confirm all four access tables and two private RPCs exist.
 5. Deploy the application.
-6. Sign in as the primary administrator. The access screen offers a one-time bootstrap only when that account has never had a secret.
-7. Save the displayed primary-admin secret, acknowledge it, and confirm the dashboard and Admin > Access page load.
-8. Apply `20260801000002_enforce_verified_platform_rls.sql` and confirm project, audio, and render-output access still works for that trusted administrator.
+6. Apply `20260801120000_admin_bypass_and_activation_fix.sql`. Approved administrators use credentials only; regular users still require an issued access secret.
+7. Sign in as an approved administrator and confirm the dashboard, Admin, and Users pages load without a secret prompt.
+8. Apply `20260801000002_enforce_verified_platform_rls.sql` only if it has not already been applied, then confirm project, audio, and render-output access still works for the administrator and a trusted regular user.
 
 The fifth distinct browser activation succeeds and marks the secret exhausted. Existing trusted browsers remain valid; a sixth new browser is denied. Revoking the secret blocks every associated trusted browser on its next protected server request.
