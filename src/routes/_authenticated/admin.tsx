@@ -11,9 +11,9 @@ import {
   setUserApprovalStatus,
   setUserPlanTier,
   setUserRole,
-  uploadPexelsKeys,
   deactivatePexelsKey,
 } from "@/lib/admin.functions";
+import { revalidateAllPexelsKeys, uploadPexelsKeysResilient } from "@/lib/admin-pexels.functions";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -37,7 +37,7 @@ import {
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "sonner";
-import { ArrowLeft, Loader2, Upload, ShieldCheck } from "lucide-react";
+import { ArrowLeft, Loader2, RefreshCw, Upload, ShieldCheck } from "lucide-react";
 
 export const Route = createFileRoute("/_authenticated/admin")({
   head: () => ({
@@ -487,7 +487,8 @@ function KeysTab() {
   const qc = useQueryClient();
   const fetchKeys = useServerFn(listPexelsKeys);
   const preview = useServerFn(previewPexelsKeys);
-  const upload = useServerFn(uploadPexelsKeys);
+  const upload = useServerFn(uploadPexelsKeysResilient);
+  const revalidate = useServerFn(revalidateAllPexelsKeys);
   const deactivate = useServerFn(deactivatePexelsKey);
 
   // Phase 1: preview state
@@ -500,6 +501,7 @@ function KeysTab() {
 
   // Phase 2: upload state
   const [uploading, setUploading] = useState(false);
+  const [revalidating, setRevalidating] = useState(false);
   const [report, setReport] = useState<Awaited<ReturnType<typeof upload>> | null>(null);
 
   const { data, isPending, error } = useQuery({
@@ -536,7 +538,7 @@ function KeysTab() {
       await qc.invalidateQueries({ queryKey: ["admin-pexels-keys"] });
       await qc.invalidateQueries({ queryKey: ["admin-overview"] });
       if (res.committed) {
-        toast.success(`${res.inserted} keys added, old pool deactivated`);
+        toast.success(`${res.inserted} keys added and ${res.reactivated} reactivated`);
       } else {
         toast.warning(res.warning ?? "Upload did not meet safety threshold");
       }
@@ -674,7 +676,9 @@ function KeysTab() {
               )}
               <div className="flex gap-4 text-sm text-muted-foreground">
                 <span>Valid: {report.validCount}</span>
+                <span>Reactivated: {report.reactivated}</span>
                 <span>Invalid: {report.invalid}</span>
+                <span>Unverified: {report.unverified}</span>
                 <span>Duplicates: {report.duplicates}</span>
                 {report.errors > 0 && (
                   <span className="text-destructive">Errors: {report.errors}</span>
@@ -695,13 +699,11 @@ function KeysTab() {
                       <TableCell>
                         <Badge
                           variant={
-                            r.status === "inserted"
+                            r.status === "inserted" || r.status === "reactivated"
                               ? "default"
-                              : r.status === "valid"
-                                ? "default"
-                                : r.status === "duplicate"
-                                  ? "secondary"
-                                  : "destructive"
+                              : r.status === "duplicate" || r.status === "unverified"
+                                ? "secondary"
+                                : "destructive"
                           }
                         >
                           {r.status}
@@ -719,7 +721,31 @@ function KeysTab() {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Key pool</CardTitle>
+          <div className="flex items-center justify-between gap-3">
+            <CardTitle className="text-base">Key pool</CardTitle>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={revalidating || isPending || !data?.length}
+              onClick={async () => {
+                setRevalidating(true);
+                try {
+                  const result = await revalidate({});
+                  await qc.invalidateQueries({ queryKey: ["admin-pexels-keys"] });
+                  toast.success(
+                    `${result.active} active, ${result.inactive} inactive, ${result.unverified} unverified`,
+                  );
+                } catch (e) {
+                  toast.error(e instanceof Error ? e.message : "Revalidation failed");
+                } finally {
+                  setRevalidating(false);
+                }
+              }}
+            >
+              <RefreshCw className={`mr-2 h-4 w-4 ${revalidating ? "animate-spin" : ""}`} />
+              Revalidate all keys
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="overflow-x-auto">
           {isPending ? (
@@ -737,6 +763,8 @@ function KeysTab() {
                   <TableHead>Key</TableHead>
                   <TableHead>Active</TableHead>
                   <TableHead className="text-right">Requests</TableHead>
+                  <TableHead className="text-right">Remaining</TableHead>
+                  <TableHead>Rate reset</TableHead>
                   <TableHead>Last used</TableHead>
                   <TableHead>Last error</TableHead>
                   <TableHead>Errored at</TableHead>
@@ -753,6 +781,14 @@ function KeysTab() {
                       </Badge>
                     </TableCell>
                     <TableCell className="text-right">{k.request_count}</TableCell>
+                    <TableCell className="text-right">
+                      {k.rate_limit_remaining ?? "unknown"}
+                    </TableCell>
+                    <TableCell>
+                      {k.rate_limit_reset_at
+                        ? new Date(k.rate_limit_reset_at).toLocaleString()
+                        : "—"}
+                    </TableCell>
                     <TableCell>
                       {k.last_used_at ? new Date(k.last_used_at).toLocaleString() : "—"}
                     </TableCell>

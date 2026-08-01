@@ -35,6 +35,7 @@ vi.mock("@/integrations/supabase/auth-middleware", () => ({
 const mockAudioRemove = vi.fn();
 const mockRenderOutputsRemove = vi.fn();
 const mockProjectsDelete = vi.fn();
+const mockProjectsUpdate = vi.fn();
 const mockCancelRenderJob = vi.fn();
 
 let mockActiveJob: { id: string; status: string } | null = null;
@@ -86,6 +87,9 @@ vi.mock("@/integrations/supabase/client.server", () => ({
       }
       if (table === "projects") {
         return {
+          update: (values: unknown) => ({
+            eq: (column: string, value: string) => mockProjectsUpdate(values, column, value),
+          }),
           delete: () => ({
             eq: () => mockProjectsDelete(),
           }),
@@ -135,11 +139,7 @@ function makeMockSupabase(ownerUserId: string = USER_ID) {
   };
 }
 
-async function callHandler(
-  projectId: string,
-  userId: string,
-  supabase = makeMockSupabase(userId),
-) {
+async function callHandler(projectId: string, userId: string, supabase = makeMockSupabase(userId)) {
   if (!capturedHandler) throw new Error("Handler not captured");
   return capturedHandler({ data: { projectId }, context: { supabase, userId } });
 }
@@ -155,6 +155,7 @@ describe("deleteProject handler", () => {
     mockAudioPaths = [];
     mockRenderJobIds = [];
     mockProjectsDelete.mockResolvedValue({ error: null });
+    mockProjectsUpdate.mockResolvedValue({ error: null });
     mockAudioRemove.mockResolvedValue({ error: null });
     mockRenderOutputsRemove.mockResolvedValue({ error: null });
     mockCancelRenderJob.mockResolvedValue({ ok: true });
@@ -177,6 +178,11 @@ describe("deleteProject handler", () => {
     await callHandler(PROJECT_ID, USER_ID);
 
     expect(mockCancelRenderJob).toHaveBeenCalledOnce();
+    expect(mockProjectsUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ pipeline_cancel_requested_at: expect.any(String) }),
+      "id",
+      PROJECT_ID,
+    );
     expect(mockAudioRemove).toHaveBeenCalledOnce();
     expect(mockProjectsDelete).toHaveBeenCalledOnce();
   });
