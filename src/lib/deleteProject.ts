@@ -30,6 +30,15 @@ export const deleteProject = createServerFn({ method: "POST" })
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
+    // Block service-role pipeline callbacks before any child rows or files disappear.
+    const { error: cancelPipelineError } = await supabaseAdmin
+      .from("projects")
+      .update({ pipeline_cancel_requested_at: new Date().toISOString() })
+      .eq("id", projectId);
+    if (cancelPipelineError) {
+      throw new Error("Could not stop project processing. Please try deleting again.");
+    }
+
     // Cancel any active render job first (REQ 4.3)
     const { data: activeJob } = await supabaseAdmin
       .from("render_jobs")
@@ -57,9 +66,7 @@ export const deleteProject = createServerFn({ method: "POST" })
       .eq("project_id", projectId);
     const audioPaths = (audioAssets ?? []).map((a) => a.storage_path).filter(Boolean);
     if (audioPaths.length > 0) {
-      const { error: audioErr } = await supabaseAdmin.storage
-        .from("audio")
-        .remove(audioPaths);
+      const { error: audioErr } = await supabaseAdmin.storage.from("audio").remove(audioPaths);
       if (audioErr) console.error("[deleteProject] audio Storage error:", audioErr.message);
     }
 
@@ -77,10 +84,7 @@ export const deleteProject = createServerFn({ method: "POST" })
     }
 
     // DB delete — cascades to all child rows via ON DELETE CASCADE (REQ 4.7)
-    const { error: delErr } = await supabaseAdmin
-      .from("projects")
-      .delete()
-      .eq("id", projectId);
+    const { error: delErr } = await supabaseAdmin.from("projects").delete().eq("id", projectId);
     if (delErr) throw new Error(delErr.message);
 
     return { ok: true as const, projectId };

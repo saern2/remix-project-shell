@@ -10,14 +10,6 @@ const AUDIO_SIGNED_TTL = 60 * 60 * 6; // 6 hours
 const OUTPUT_UPLOAD_TTL = 60 * 60 * 6;
 const OUTPUT_PLAYBACK_TTL = 60 * 60 * 24;
 
-function isNasaClipUrl(url: string): boolean {
-  try {
-    return new URL(url).hostname.toLowerCase() === "images-assets.nasa.gov";
-  } catch {
-    return false;
-  }
-}
-
 function workerBase(): string {
   const url = process.env.RENDER_WORKER_URL;
   if (!url) throw new Error("RENDER_WORKER_URL is not configured.");
@@ -58,7 +50,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     const { data: scenes, error: scenesErr } = await supabase
       .from("scenes")
       .select(
-        "id, idx, start_ts, end_ts, visual_query, selected_clips(in_point, out_point, clip_candidates(url, provider_clip_id))",
+        "id, idx, start_ts, end_ts, visual_query, selected_clips(in_point, out_point, clip_candidates(url, provider, provider_clip_id))",
       )
       .eq("project_id", projectId)
       .order("idx", { ascending: true });
@@ -74,7 +66,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       selected_clips: {
         in_point: number;
         out_point: number;
-        clip_candidates: { url: string; provider_clip_id: string };
+        clip_candidates: { url: string; provider: string; provider_clip_id: string };
       } | null;
     };
     const sceneRows = scenes as unknown as SceneRow[];
@@ -110,14 +102,6 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         if (!scene?.selected_clips?.clip_candidates?.url) {
           throw new Error(`Scene ${slot.sceneIdx + 1} has no selected clip.`);
         }
-        if (
-          project.niche === "space" &&
-          !isNasaClipUrl(scene.selected_clips.clip_candidates.url)
-        ) {
-          throw new Error(
-            `Scene ${slot.sceneIdx + 1} does not have NASA footage. Retry footage matching before rendering.`,
-          );
-        }
         const start = Number(scene.selected_clips.in_point);
         return {
           clip_url: scene.selected_clips.clip_candidates.url,
@@ -133,14 +117,11 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       const { data: existingSlices } = await supabaseAdmin
         .from("render_clip_slices")
         .select(
-          "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+          "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
         )
         .eq("project_id", projectId);
 
-      const eligibleExistingSlices =
-        project.niche === "space"
-          ? (existingSlices ?? []).filter((slice) => isNasaClipUrl(slice.clip_url))
-          : (existingSlices ?? []);
+      const eligibleExistingSlices = existingSlices ?? [];
       const coverage = summarizeSliceCoverage(
         scenes,
         fixedDuration,
@@ -161,7 +142,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
               `Missing fixed-duration clip for scene ${slot.sceneIdx + 1}, slice ${slot.sliceIndex + 1}.`,
             );
           }
-          return { clip_url: cached.clip_url, start: 0, end: slot.durationSeconds };
+          const start = Number(cached.in_point_seconds);
+          return { clip_url: cached.clip_url, start, end: start + slot.durationSeconds };
         });
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
 
@@ -183,7 +165,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         const { data: existingSlices } = await supabaseAdmin
           .from("render_clip_slices")
           .select(
-            "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+            "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
           )
           .eq("project_id", projectId);
 
@@ -192,41 +174,55 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           string,
           {
             clip_url: string;
+            provider: string;
             provider_clip_id: string | null;
+            in_point_seconds: number;
             thumbnail_url: string | null;
           }
         >();
-        const eligibleFallbackSlices =
-          project.niche === "space"
-            ? (existingSlices ?? []).filter((slice) => isNasaClipUrl(slice.clip_url))
-            : (existingSlices ?? []);
+        const eligibleFallbackSlices = existingSlices ?? [];
         for (const row of eligibleFallbackSlices) {
           sliceCache.set(`${row.scene_id}:${row.slice_index}`, {
             clip_url: row.clip_url,
+            provider: row.provider,
             provider_clip_id: row.provider_clip_id ?? null,
+            in_point_seconds: Number(row.in_point_seconds),
             thumbnail_url: row.thumbnail_url ?? null,
           });
         }
 
-        const { searchStockFootage, orientationForAspect, targetWidthForAspect } =
-          await import("@/lib/stock.server");
+        const {
+          searchStockFootage,
+          stockReservationKey,
+          orientationForAspect,
+          targetWidthForAspect,
+        } = await import("@/lib/stock.server");
         const orientation = orientationForAspect(project.aspect_ratio ?? "9:16");
         const targetWidth = targetWidthForAspect(project.aspect_ratio ?? "9:16");
 
         // Project-wide dedup set, seeded with the clips already selected AND existing slice rows.
-        const usedIds = new Set<string>([
-          ...sceneRows
-            .filter(
-              (scene) =>
-                project.niche !== "space" ||
-                (scene.selected_clips?.clip_candidates?.url &&
-                  isNasaClipUrl(scene.selected_clips.clip_candidates.url)),
-            )
-            .map((s) => s.selected_clips?.clip_candidates?.provider_clip_id)
-            .filter((x): x is string => !!x),
-
-          ...eligibleFallbackSlices.map((r) => r.provider_clip_id).filter((x): x is string => !!x),
-        ]);
+        const usedIds = new Set<string>();
+        for (const scene of sceneRows) {
+          const selection = scene.selected_clips;
+          if (!selection?.clip_candidates?.provider_clip_id) continue;
+          usedIds.add(
+            stockReservationKey(
+              selection.clip_candidates.provider as "pexels" | "pixabay" | "nasa",
+              selection.clip_candidates.provider_clip_id,
+              Number(selection.in_point),
+            ),
+          );
+        }
+        for (const row of eligibleFallbackSlices) {
+          if (!row.provider_clip_id) continue;
+          usedIds.add(
+            stockReservationKey(
+              row.provider as "pexels" | "pixabay" | "nasa",
+              row.provider_clip_id,
+              Number(row.in_point_seconds),
+            ),
+          );
+        }
         const expectedSlots = buildExpectedSliceSlots(sceneRows, fixedDuration, audioDuration);
         const sceneById = new Map(sceneRows.map((scene) => [scene.id, scene]));
 
@@ -236,7 +232,9 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           scene_id: string;
           slice_index: number;
           clip_url: string;
+          provider: string;
           provider_clip_id: string | null;
+          in_point_seconds: number;
           duration_seconds: number;
           timeline_start_seconds: number;
           timeline_end_seconds: number;
@@ -253,13 +251,17 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           const cached = sliceCache.get(cacheKey);
 
           let url: string;
+          let provider = "pexels";
           let providerClipId: string | null = null;
+          let inPoint = 0;
           let thumbnailUrl: string | null = null;
 
           if (cached) {
             // Reuse persisted assignment — no API call needed
             url = cached.clip_url;
+            provider = cached.provider;
             providerClipId = cached.provider_clip_id;
+            inPoint = cached.in_point_seconds;
             thumbnailUrl = cached.thumbnail_url;
           } else {
             // Search for a new clip
@@ -276,24 +278,24 @@ export const submitRenderJob = createServerFn({ method: "POST" })
               });
               if (result) {
                 found = result.chosenFile.url;
+                provider = result.pick.provider;
                 providerClipId = result.pick.provider_clip_id;
+                inPoint = result.inPoint;
                 thumbnailUrl = result.pick.thumbnail_url ?? null;
-                usedIds.add(result.pick.provider_clip_id);
+                usedIds.add(result.reservationKey);
               }
             }
             const selectedUrl = scene.selected_clips?.clip_candidates?.url;
-            const fallbackUrl =
-              selectedUrl && (project.niche !== "space" || isNasaClipUrl(selectedUrl))
-                ? selectedUrl
-                : null;
+            const fallbackUrl = selectedUrl ?? null;
             if (!found && !fallbackUrl) {
-              throw new Error(
-                project.niche === "space"
-                  ? `Scene ${scene.idx + 1} has no usable NASA footage. Retry footage matching.`
-                  : `Scene ${scene.idx + 1} has no selected clip fallback.`,
-              );
+              throw new Error(`Scene ${scene.idx + 1} has no selected clip fallback.`);
             }
             url = found ?? fallbackUrl!;
+            if (!found && scene.selected_clips) {
+              provider = scene.selected_clips.clip_candidates.provider;
+              providerClipId = scene.selected_clips.clip_candidates.provider_clip_id;
+              inPoint = Number(scene.selected_clips.in_point);
+            }
 
             // Queue this new assignment for persistence
           }
@@ -303,7 +305,9 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             scene_id: slot.sceneId,
             slice_index: slot.sliceIndex,
             clip_url: url,
+            provider,
             provider_clip_id: providerClipId,
+            in_point_seconds: inPoint,
             duration_seconds: slot.durationSeconds,
             timeline_start_seconds: slot.timelineStart,
             timeline_end_seconds: slot.timelineEnd,
@@ -311,8 +315,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           });
           clips.push({
             clip_url: url,
-            start: 0,
-            end: slot.durationSeconds,
+            start: inPoint,
+            end: inPoint + slot.durationSeconds,
           });
         }
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
@@ -326,7 +330,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         const { data: finalSlices } = await supabaseAdmin
           .from("render_clip_slices")
           .select(
-            "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+            "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
           )
           .eq("project_id", projectId);
         const finalCoverage = summarizeSliceCoverage(
@@ -354,10 +358,10 @@ export const submitRenderJob = createServerFn({ method: "POST" })
               `Missing fixed-duration clip for scene ${slot.sceneIdx + 1}, slice ${slot.sliceIndex + 1}.`,
             );
           }
-          return { clip_url: row.clip_url, start: 0, end: slot.durationSeconds };
+          const start = Number(row.in_point_seconds);
+          return { clip_url: row.clip_url, start, end: start + slot.durationSeconds };
         });
       }
-
     }
 
     const totalVisualDuration = clips.reduce((sum, clip) => sum + (clip.end - clip.start), 0);

@@ -210,6 +210,8 @@ export type Database = {
           last_error: string | null;
           last_error_at: string | null;
           last_used_at: string | null;
+          rate_limit_remaining: number | null;
+          rate_limit_reset_at: string | null;
           request_count: number;
         };
         Insert: {
@@ -220,6 +222,8 @@ export type Database = {
           last_error?: string | null;
           last_error_at?: string | null;
           last_used_at?: string | null;
+          rate_limit_remaining?: number | null;
+          rate_limit_reset_at?: string | null;
           request_count?: number;
         };
         Update: {
@@ -230,7 +234,36 @@ export type Database = {
           last_error?: string | null;
           last_error_at?: string | null;
           last_used_at?: string | null;
+          rate_limit_remaining?: number | null;
+          rate_limit_reset_at?: string | null;
           request_count?: number;
+        };
+        Relationships: [];
+      };
+      nasa_asset_cache: {
+        Row: {
+          cached_at: string;
+          duration_known: boolean;
+          duration_seconds: number | null;
+          files: Json;
+          nasa_id: string;
+          thumbnail_url: string | null;
+        };
+        Insert: {
+          cached_at?: string;
+          duration_known?: boolean;
+          duration_seconds?: number | null;
+          files?: Json;
+          nasa_id: string;
+          thumbnail_url?: string | null;
+        };
+        Update: {
+          cached_at?: string;
+          duration_known?: boolean;
+          duration_seconds?: number | null;
+          files?: Json;
+          nasa_id?: string;
+          thumbnail_url?: string | null;
         };
         Relationships: [];
       };
@@ -286,6 +319,7 @@ export type Database = {
           id: string;
           name: string;
           niche: string;
+          pipeline_cancel_requested_at: string | null;
           provider_job_id: string | null;
           status: string;
           updated_at: string;
@@ -300,6 +334,7 @@ export type Database = {
           id?: string;
           name?: string;
           niche?: string;
+          pipeline_cancel_requested_at?: string | null;
           provider_job_id?: string | null;
           status?: string;
           updated_at?: string;
@@ -314,6 +349,7 @@ export type Database = {
           id?: string;
           name?: string;
           niche?: string;
+          pipeline_cancel_requested_at?: string | null;
           provider_job_id?: string | null;
           status?: string;
           updated_at?: string;
@@ -362,7 +398,9 @@ export type Database = {
           created_at: string;
           duration_seconds: number;
           id: string;
+          in_point_seconds: number;
           project_id: string;
+          provider: string;
           provider_clip_id: string | null;
           scene_id: string;
           slice_index: number;
@@ -375,7 +413,9 @@ export type Database = {
           created_at?: string;
           duration_seconds: number;
           id?: string;
+          in_point_seconds?: number;
           project_id: string;
+          provider?: string;
           provider_clip_id?: string | null;
           scene_id: string;
           slice_index: number;
@@ -388,7 +428,9 @@ export type Database = {
           created_at?: string;
           duration_seconds?: number;
           id?: string;
+          in_point_seconds?: number;
           project_id?: string;
+          provider?: string;
           provider_clip_id?: string | null;
           scene_id?: string;
           slice_index?: number;
@@ -766,8 +808,21 @@ export type Database = {
         Returns: undefined;
       };
       increment_pexels_key_usage: { Args: { p_id: string }; Returns: undefined };
+      record_pexels_key_response: {
+        Args: { p_id: string; p_remaining: number | null; p_reset_at: string | null };
+        Returns: undefined;
+      };
       increment_provider_usage: {
         Args: { p_cache_hit: boolean; p_date: string; p_provider: string };
+        Returns: undefined;
+      };
+      increment_provider_usage_counts: {
+        Args: {
+          p_cache_hit_count: number;
+          p_date: string;
+          p_provider: string;
+          p_request_count: number;
+        };
         Returns: undefined;
       };
       is_admin: { Args: { _user_id: string }; Returns: boolean };

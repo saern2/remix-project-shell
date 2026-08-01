@@ -1,8 +1,60 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import type { StockSearchSession } from "@/lib/stock.server";
 
 const ProjectIdInput = z.object({ projectId: z.string().uuid() });
+
+class PipelineStoppedError extends Error {
+  constructor() {
+    super("Project processing stopped because the project was deleted.");
+    this.name = "PipelineStoppedError";
+  }
+}
+
+function isForeignKeyViolation(error: unknown): boolean {
+  return !!error && typeof error === "object" && "code" in error && error.code === "23503";
+}
+
+function isPipelineStopped(error: unknown): boolean {
+  return error instanceof PipelineStoppedError || isForeignKeyViolation(error);
+}
+
+function throwPipelineWriteError(error: unknown, fallback: string): void {
+  if (isForeignKeyViolation(error)) throw new PipelineStoppedError();
+  if (error && typeof error === "object" && "message" in error) {
+    throw new Error(String(error.message));
+  }
+  if (error) throw new Error(fallback);
+}
+
+async function assertPipelineWritable(projectId: string): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data, error } = await supabaseAdmin
+    .from("projects")
+    .select("id, pipeline_cancel_requested_at")
+    .eq("id", projectId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data || data.pipeline_cancel_requested_at) throw new PipelineStoppedError();
+}
+
+async function markProjectFailed(projectId: string, message: string): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  await supabaseAdmin
+    .from("projects")
+    .update({ status: "failed", error_message: message })
+    .eq("id", projectId)
+    .is("pipeline_cancel_requested_at", null);
+}
+
+function providerBreakdown(rows: Array<{ provider?: string | null }>): Record<string, number> {
+  return rows.reduce<Record<string, number>>((counts, row) => {
+    const provider = row.provider ?? "unknown";
+    counts[provider] = (counts[provider] ?? 0) + 1;
+    return counts;
+  }, {});
+}
 
 /**
  * Kick off the pipeline for a project that has an uploaded audio asset.
@@ -79,6 +131,7 @@ export const startPipeline = createServerFn({ method: "POST" })
         duration_sec: result.duration_sec,
       });
 
+      await assertPipelineWritable(projectId);
       const { error: updErr } = await supabaseAdmin
         .from("projects")
         .update({
@@ -90,12 +143,12 @@ export const startPipeline = createServerFn({ method: "POST" })
       if (updErr) throw new Error(updErr.message);
       return { ok: true, status: "generating_scenes" };
     } catch (err) {
+      if (isPipelineStopped(err)) {
+        console.info("[pipeline] project deleted while starting", { projectId });
+        throw new Error("Project processing stopped because the project was deleted.");
+      }
       const message = err instanceof Error ? err.message : "Failed to start pipeline.";
-      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-      await supabaseAdmin
-        .from("projects")
-        .update({ status: "failed", error_message: message })
-        .eq("id", projectId);
+      await markProjectFailed(projectId, message);
       throw new Error(message);
     }
   });
@@ -117,6 +170,7 @@ async function persistTranscriptAndScenes(
   },
 ) {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  await assertPipelineWritable(projectId);
 
   // Unconditionally clear any prior scenes for this project before
   // re-inserting. clip_candidates and selected_clips cascade off scenes,
@@ -138,6 +192,8 @@ async function persistTranscriptAndScenes(
     .limit(1)
     .maybeSingle();
 
+  await assertPipelineWritable(projectId);
+
   if (asset?.id && typeof completed.duration_sec === "number") {
     await supabaseAdmin
       .from("audio_assets")
@@ -157,6 +213,7 @@ async function persistTranscriptAndScenes(
     })
     .select("id")
     .single();
+  if (isForeignKeyViolation(tErr)) throw new PipelineStoppedError();
   if (tErr || !transcript) throw new Error(tErr?.message ?? "Failed to save transcript.");
 
   const sentences = completed.sentences.length
@@ -179,8 +236,9 @@ async function persistTranscriptAndScenes(
     status: "pending",
   }));
   if (sceneRows.length) {
+    await assertPipelineWritable(projectId);
     const { error: sErr } = await supabaseAdmin.from("scenes").insert(sceneRows);
-    if (sErr) throw new Error(sErr.message);
+    throwPipelineWriteError(sErr, "Failed to save scenes.");
   }
 }
 
@@ -257,17 +315,19 @@ async function advanceFromTranscribing(projectId: string, providerJobId: string 
       duration_sec: result.duration_sec,
     });
 
+    await assertPipelineWritable(projectId);
     await supabaseAdmin
       .from("projects")
       .update({ status: "generating_scenes", error_message: null })
       .eq("id", projectId);
     return { status: "generating_scenes", error_message: null };
   } catch (err) {
+    if (isPipelineStopped(err)) {
+      console.info("[pipeline] project deleted during transcription", { projectId });
+      return { status: "cancelled", error_message: null };
+    }
     const message = err instanceof Error ? err.message : "Transcription step failed.";
-    await supabaseAdmin
-      .from("projects")
-      .update({ status: "failed", error_message: message })
-      .eq("id", projectId);
+    await markProjectFailed(projectId, message);
     return { status: "failed", error_message: message };
   }
 }
@@ -275,9 +335,10 @@ async function advanceFromTranscribing(projectId: string, providerJobId: string 
 async function advanceFromGeneratingScenes(projectId: string) {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   try {
+    await assertPipelineWritable(projectId);
     const { data: scenes, error } = await supabaseAdmin
       .from("scenes")
-      .select("id, idx, text")
+      .select("id, project_id, transcript_id, idx, text, start_ts, end_ts, created_at")
       .eq("project_id", projectId)
       .order("idx", { ascending: true });
     if (error) throw new Error(error.message);
@@ -299,32 +360,40 @@ async function advanceFromGeneratingScenes(projectId: string) {
       category,
     );
 
-    for (let i = 0; i < scenes.length; i++) {
-      const { error: uErr } = await supabaseAdmin
-        .from("scenes")
-        .update({ visual_query: queries[i], status: "query_ready" })
-        .eq("id", scenes[i].id);
-      if (uErr) throw new Error(uErr.message);
-    }
+    await assertPipelineWritable(projectId);
+    const sceneUpdates = scenes.map((scene, index) => ({
+      ...scene,
+      visual_query: queries[index],
+      status: "query_ready",
+    }));
+    const { error: updateError } = await supabaseAdmin
+      .from("scenes")
+      .upsert(sceneUpdates, { onConflict: "id" });
+    if (isForeignKeyViolation(updateError)) throw new PipelineStoppedError();
+    if (updateError) throw new Error(updateError.message);
 
+    await assertPipelineWritable(projectId);
     await supabaseAdmin
       .from("projects")
       .update({ status: "matching_footage", error_message: null })
       .eq("id", projectId);
     return { status: "matching_footage", error_message: null };
   } catch (err) {
+    if (isPipelineStopped(err)) {
+      console.info("[pipeline] project deleted during visual-query generation", { projectId });
+      return { status: "cancelled", error_message: null };
+    }
     const message = err instanceof Error ? err.message : "Visual query generation failed.";
-    await supabaseAdmin
-      .from("projects")
-      .update({ status: "failed", error_message: message })
-      .eq("id", projectId);
+    await markProjectFailed(projectId, message);
     return { status: "failed", error_message: message };
   }
 }
 
 async function advanceFromMatchingFootage(projectId: string) {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  let stockSession: StockSearchSession | null = null;
   try {
+    await assertPipelineWritable(projectId);
     const { data: project, error: pErr } = await supabaseAdmin
       .from("projects")
       .select("id, aspect_ratio, clip_duration_seconds, niche")
@@ -358,11 +427,21 @@ async function advanceFromMatchingFootage(projectId: string) {
         ? Math.max(measuredAudioDuration, narrationEnd)
         : narrationEnd;
 
-    const { searchUniqueStockFootage, orientationForAspect, targetWidthForAspect } =
-      await import("@/lib/stock.server");
+    const {
+      createStockSearchSession,
+      searchUniqueStockFootage,
+      stockReservationKey,
+      orientationForAspect,
+      targetWidthForAspect,
+    } = await import("@/lib/stock.server");
     const orientation = orientationForAspect(project.aspect_ratio);
     const targetWidth = targetWidthForAspect(project.aspect_ratio);
     const projectNiche = project.niche;
+    stockSession = await createStockSearchSession(
+      scenes.map((scene) => scene.visual_query ?? ""),
+      orientation,
+      projectNiche,
+    );
 
     const fixedDuration =
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
@@ -380,19 +459,10 @@ async function advanceFromMatchingFootage(projectId: string) {
       const { data: existingSlices } = await supabaseAdmin
         .from("render_clip_slices")
         .select(
-          "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+          "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
         )
         .eq("project_id", projectId);
-      const eligibleExistingSlices =
-        project.niche === "space"
-          ? (existingSlices ?? []).filter((slice) => {
-              try {
-                return new URL(slice.clip_url).hostname.toLowerCase() === "images-assets.nasa.gov";
-              } catch {
-                return false;
-              }
-            })
-          : (existingSlices ?? []);
+      const eligibleExistingSlices = existingSlices ?? [];
 
       const startedAt = Date.now();
       const expectedSlots = buildExpectedSliceSlots(scenes, fixedDuration, audioDuration);
@@ -400,7 +470,9 @@ async function advanceFromMatchingFootage(projectId: string) {
         string,
         {
           clip_url: string;
+          provider: "pexels" | "pixabay" | "nasa";
           provider_clip_id: string | null;
+          in_point_seconds: number;
           duration_seconds: number;
           timeline_start_seconds: number;
           timeline_end_seconds: number;
@@ -410,17 +482,26 @@ async function advanceFromMatchingFootage(projectId: string) {
       const expectedSlotOrder = new Map(
         expectedSlots.map((slot, index) => [sliceKey(slot.sceneId, slot.sliceIndex), index]),
       );
-      const cachedProviderIds = new Set<string>();
+      const cachedReservations = new Set<string>();
       for (const row of [...eligibleExistingSlices].sort(
         (a, b) =>
           (expectedSlotOrder.get(sliceKey(a.scene_id, a.slice_index)) ?? Number.MAX_SAFE_INTEGER) -
           (expectedSlotOrder.get(sliceKey(b.scene_id, b.slice_index)) ?? Number.MAX_SAFE_INTEGER),
       )) {
-        if (row.provider_clip_id && cachedProviderIds.has(row.provider_clip_id)) continue;
-        if (row.provider_clip_id) cachedProviderIds.add(row.provider_clip_id);
+        const reservation = row.provider_clip_id
+          ? stockReservationKey(
+              row.provider as "pexels" | "pixabay" | "nasa",
+              row.provider_clip_id,
+              Number(row.in_point_seconds),
+            )
+          : null;
+        if (reservation && cachedReservations.has(reservation)) continue;
+        if (reservation) cachedReservations.add(reservation);
         sliceCache.set(sliceKey(row.scene_id, row.slice_index), {
           clip_url: row.clip_url,
+          provider: row.provider as "pexels" | "pixabay" | "nasa",
           provider_clip_id: row.provider_clip_id ?? null,
+          in_point_seconds: Number(row.in_point_seconds),
           duration_seconds: Number(row.duration_seconds),
           timeline_start_seconds: Number(row.timeline_start_seconds),
           timeline_end_seconds: Number(row.timeline_end_seconds),
@@ -440,7 +521,9 @@ async function advanceFromMatchingFootage(projectId: string) {
             scene_id: slot.sceneId,
             slice_index: slot.sliceIndex,
             clip_url: cached.clip_url,
+            provider: cached.provider,
             provider_clip_id: cached.provider_clip_id,
+            in_point_seconds: cached.in_point_seconds,
             duration_seconds: slot.durationSeconds,
             timeline_start_seconds: slot.timelineStart,
             timeline_end_seconds: slot.timelineEnd,
@@ -449,13 +532,20 @@ async function advanceFromMatchingFootage(projectId: string) {
         ];
       });
       if (alignedCachedRows.length > 0) {
-        await supabaseAdmin.from("render_clip_slices").upsert(alignedCachedRows, {
-          onConflict: "project_id,scene_id,slice_index",
-        });
+        const { error: alignedError } = await supabaseAdmin
+          .from("render_clip_slices")
+          .upsert(alignedCachedRows, {
+            onConflict: "project_id,scene_id,slice_index",
+          });
+        throwPipelineWriteError(alignedError, "Failed to align cached footage slices.");
       }
 
       const usedIds = new Set<string>(
-        [...sliceCache.values()].map((row) => row.provider_clip_id).filter((x): x is string => !!x),
+        [...sliceCache.values()].flatMap((row) =>
+          row.provider_clip_id
+            ? [stockReservationKey(row.provider, row.provider_clip_id, row.in_point_seconds)]
+            : [],
+        ),
       );
       const sceneById = new Map(scenes.map((scene) => [scene.id, scene]));
       const pendingSlots = expectedSlots.filter(
@@ -468,6 +558,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         clip_url: string;
         provider_clip_id: string | null;
         provider: "pexels" | "pixabay" | "nasa";
+        in_point_seconds: number;
         duration_seconds: number;
         timeline_start_seconds: number;
         timeline_end_seconds: number;
@@ -491,6 +582,7 @@ async function advanceFromMatchingFootage(projectId: string) {
           usedIds,
           seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
           niche: project.niche,
+          session: stockSession ?? undefined,
         });
         if (result) {
           const providerClipId = result.pick.provider_clip_id;
@@ -501,17 +593,17 @@ async function advanceFromMatchingFootage(projectId: string) {
             clip_url: result.chosenFile.url,
             provider_clip_id: providerClipId,
             provider: result.pick.provider,
+            in_point_seconds: result.inPoint,
             duration_seconds: slot.durationSeconds,
             timeline_start_seconds: slot.timelineStart,
             timeline_end_seconds: slot.timelineEnd,
             thumbnail_url: result.pick.thumbnail_url ?? null,
           };
           newSliceRows.push(row);
-          const { provider: _provider, ...sliceRow } = row;
-          void _provider;
-          await supabaseAdmin
+          const { error: sliceError } = await supabaseAdmin
             .from("render_clip_slices")
-            .upsert(sliceRow, { onConflict: "project_id,scene_id,slice_index" });
+            .upsert(row, { onConflict: "project_id,scene_id,slice_index" });
+          throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
           return;
         }
 
@@ -527,7 +619,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       const { data: finalSlices } = await supabaseAdmin
         .from("render_clip_slices")
         .select(
-          "scene_id, slice_index, clip_url, provider_clip_id, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+          "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
         )
         .eq("project_id", projectId);
       const allRows = finalSlices ?? [];
@@ -545,15 +637,7 @@ async function advanceFromMatchingFootage(projectId: string) {
           "scene_id",
           scenes.map((s) => s.id),
         );
-      const selectedSceneIds = new Set(
-        (selectedRows ?? [])
-          .filter((row) => {
-            const provider = (row as unknown as { clip_candidates: { provider: string } | null })
-              .clip_candidates?.provider;
-            return project.niche !== "space" || provider === "nasa";
-          })
-          .map((row) => row.scene_id),
-      );
+      const selectedSceneIds = new Set((selectedRows ?? []).map((row) => row.scene_id));
 
       for (const scene of scenes) {
         if (selectedSceneIds.has(scene.id)) {
@@ -565,16 +649,11 @@ async function advanceFromMatchingFootage(projectId: string) {
           .filter((row) => row.scene_id === scene.id)
           .sort((a, b) => a.slice_index - b.slice_index)[0];
         if (!firstSlot) continue;
-        const firstSlotKey = sliceKey(scene.id, firstSlot.slice_index);
-        const firstSlotProvider =
-          newSliceRows.find((row) => sliceKey(row.scene_id, row.slice_index) === firstSlotKey)
-            ?.provider ?? (project.niche === "space" ? "nasa" : "pexels");
-
         const { data: candidate } = await supabaseAdmin
           .from("clip_candidates")
           .insert({
             scene_id: scene.id,
-            provider: firstSlotProvider,
+            provider: firstSlot.provider,
             provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
             url: firstSlot.clip_url,
             thumbnail_url: firstSlot.thumbnail_url ?? null,
@@ -590,11 +669,13 @@ async function advanceFromMatchingFootage(projectId: string) {
             {
               scene_id: scene.id,
               clip_candidate_id: candidate.id,
-              in_point: 0,
-              out_point: Math.min(
-                Number(firstSlot.duration_seconds),
-                Math.max(fixedSceneDuration(scene), 1),
-              ),
+              in_point: Number(firstSlot.in_point_seconds),
+              out_point:
+                Number(firstSlot.in_point_seconds) +
+                Math.min(
+                  Number(firstSlot.duration_seconds),
+                  Math.max(fixedSceneDuration(scene), 1),
+                ),
             },
             { onConflict: "scene_id" },
           );
@@ -608,10 +689,21 @@ async function advanceFromMatchingFootage(projectId: string) {
         expectedSlices: coverage.expectedCount,
         cachedSlices: sliceCache.size,
         searchedSlices: newSliceRows.length,
+        providers: providerBreakdown(allRows),
+        distinctProviderClipIds: new Set(
+          allRows.map((row) => `${row.provider}:${row.provider_clip_id ?? "unknown"}`),
+        ).size,
+        distinctSourceMoments: new Set(
+          allRows.map(
+            (row) =>
+              `${row.provider}:${row.provider_clip_id ?? "unknown"}:${Number(row.in_point_seconds)}`,
+          ),
+        ).size,
         concurrency: FIXED_DURATION_CONCURRENCY,
         elapsedMs: Date.now() - startedAt,
       });
 
+      await assertPipelineWritable(projectId);
       await supabaseAdmin
         .from("projects")
         .update({ status: "ready", error_message: null })
@@ -623,19 +715,12 @@ async function advanceFromMatchingFootage(projectId: string) {
     // Existing selections (idempotent re-runs). Skip scenes already selected.
     const { data: existingSel } = await supabaseAdmin
       .from("selected_clips")
-      .select("scene_id, clip_candidates!inner(provider, provider_clip_id)")
+      .select("scene_id, in_point, clip_candidates!inner(provider, provider_clip_id)")
       .in(
         "scene_id",
         scenes.map((s) => s.id),
       );
-    const eligibleExistingSelections = (existingSel ?? []).filter((row) => {
-      const provider = (
-        row as unknown as {
-          clip_candidates: { provider: string; provider_clip_id: string } | null;
-        }
-      ).clip_candidates?.provider;
-      return project.niche !== "space" || provider === "nasa";
-    });
+    const eligibleExistingSelections = existingSel ?? [];
     const sceneOrder = new Map(scenes.map((scene, index) => [scene.id, index]));
     const alreadySelected = new Set<string>();
     const usedIds = new Set<string>();
@@ -644,13 +729,26 @@ async function advanceFromMatchingFootage(projectId: string) {
         (sceneOrder.get(a.scene_id) ?? Number.MAX_SAFE_INTEGER) -
         (sceneOrder.get(b.scene_id) ?? Number.MAX_SAFE_INTEGER),
     )) {
+      const selection = row as {
+        in_point: number;
+        clip_candidates: {
+          provider: "pexels" | "pixabay" | "nasa";
+          provider_clip_id: string;
+        } | null;
+      };
       const providerClipId = (
         row as {
           clip_candidates: { provider: string; provider_clip_id: string } | null;
         }
       ).clip_candidates?.provider_clip_id;
-      if (!providerClipId || usedIds.has(providerClipId)) continue;
-      usedIds.add(providerClipId);
+      if (!providerClipId || !selection.clip_candidates) continue;
+      const reservation = stockReservationKey(
+        selection.clip_candidates.provider,
+        providerClipId,
+        Number(selection.in_point),
+      );
+      if (usedIds.has(reservation)) continue;
+      usedIds.add(reservation);
       alreadySelected.add(row.scene_id);
     }
 
@@ -681,6 +779,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         usedIds,
         seed: `${projectId}:${scene.id}`,
         niche: projectNiche,
+        session: stockSession ?? undefined,
       });
       if (!result) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
@@ -709,8 +808,8 @@ async function advanceFromMatchingFootage(projectId: string) {
         {
           scene_id: scene.id,
           clip_candidate_id: candidate.id,
-          in_point: 0,
-          out_point: Math.max(visualDuration, 1),
+          in_point: result.inPoint,
+          out_point: result.inPoint + Math.max(visualDuration, 1),
         },
         { onConflict: "scene_id" },
       );
@@ -719,30 +818,74 @@ async function advanceFromMatchingFootage(projectId: string) {
       await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
     }
 
-    for (let i = 0; i < pending.length; i += CONCURRENCY) {
-      const batch = pending.slice(i, i + CONCURRENCY);
-      await Promise.all(batch.map((s) => processScene(s)));
-    }
+    const { asyncPool } = await import("@/lib/clip-slices.server");
+    const startedAt = Date.now();
+    await asyncPool(pending, CONCURRENCY, processScene);
 
     if (unmatchedSceneIds.size > 0) {
       throw new Error(
-        `Could not find unique stock footage for ${unmatchedSceneIds.size} scene(s). Retry matching to search again.`,
+        projectNiche === "space"
+          ? `NASA and Pexels could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, choose another niche or ask the operator to verify the Pexels key pool.`
+          : `Pexels could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify available Pexels keys.`,
       );
     }
 
+    const { data: completedSelections } = await supabaseAdmin
+      .from("selected_clips")
+      .select("in_point, clip_candidates!inner(provider, provider_clip_id)")
+      .in(
+        "scene_id",
+        scenes.map((scene) => scene.id),
+      );
+    const selectionEvidence = (completedSelections ?? []).map((row) => {
+      const candidate = (
+        row as unknown as {
+          in_point: number;
+          clip_candidates: { provider: string; provider_clip_id: string };
+        }
+      ).clip_candidates;
+      return { ...candidate, in_point: Number(row.in_point) };
+    });
+    console.info("[matching_footage:plain]", {
+      projectId,
+      scenes: scenes.length,
+      cachedSelections: alreadySelected.size,
+      searchedScenes: pending.length,
+      providers: providerBreakdown(selectionEvidence),
+      distinctProviderClipIds: new Set(
+        selectionEvidence.map((row) => `${row.provider}:${row.provider_clip_id}`),
+      ).size,
+      distinctSourceMoments: new Set(
+        selectionEvidence.map((row) => `${row.provider}:${row.provider_clip_id}:${row.in_point}`),
+      ).size,
+      concurrency: CONCURRENCY,
+      elapsedMs: Date.now() - startedAt,
+    });
+
+    await assertPipelineWritable(projectId);
     await supabaseAdmin
       .from("projects")
       .update({ status: "ready", error_message: null })
       .eq("id", projectId);
     return { status: "ready", error_message: null };
   } catch (err) {
+    if (isPipelineStopped(err)) {
+      console.info("[pipeline] project deleted during footage matching", { projectId });
+      return { status: "cancelled", error_message: null };
+    }
     const message = err instanceof Error ? err.message : "Stock footage matching failed.";
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin
-      .from("projects")
-      .update({ status: "failed", error_message: message })
-      .eq("id", projectId);
+    await markProjectFailed(projectId, message);
     return { status: "failed", error_message: message };
+  } finally {
+    if (stockSession) {
+      const { flushStockSearchSession } = await import("@/lib/stock.server");
+      await flushStockSearchSession(stockSession).catch((error) => {
+        console.warn("[stock] stage cache flush failed", {
+          projectId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
   }
 }
 
@@ -788,6 +931,7 @@ export const swapSceneClip = createServerFn({ method: "POST" })
       minDurationSec: minDuration,
       targetWidth: targetWidthForAspect(project.aspect_ratio),
       usedIds,
+      seed: `${scene.project_id}:${scene.id}:swap:${usedIds.length}`,
       niche: project.niche,
     });
     if (!result) throw new Error("No alternate clips available for this scene.");
@@ -814,8 +958,8 @@ export const swapSceneClip = createServerFn({ method: "POST" })
       {
         scene_id: scene.id,
         clip_candidate_id: candidate.id,
-        in_point: 0,
-        out_point: Math.min(pick.duration_sec, Math.max(sceneDuration, 1)),
+        in_point: result.inPoint,
+        out_point: result.inPoint + Math.min(pick.duration_sec, Math.max(sceneDuration, 1)),
       },
       { onConflict: "scene_id" },
     );

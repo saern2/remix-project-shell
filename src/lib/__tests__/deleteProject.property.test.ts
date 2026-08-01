@@ -86,6 +86,9 @@ vi.mock("@/integrations/supabase/client.server", () => ({
       }
       if (table === "projects") {
         return {
+          update: () => ({
+            eq: () => ({ error: null }),
+          }),
           delete: () => ({
             eq: () => {
               mockProjectsDeleteCalls.push(1);
@@ -207,26 +210,23 @@ describe("deleteProject property tests", () => {
     expect(capturedHandler).not.toBeNull();
 
     await fc.assert(
-      fc.asyncProperty(
-        fc.array(fc.uuid(), { minLength: 1, maxLength: 20 }),
-        async (jobIds) => {
-          _renderJobIds = jobIds;
-          capturedRenderRemoveArgs.length = 0;
+      fc.asyncProperty(fc.array(fc.uuid(), { minLength: 1, maxLength: 20 }), async (jobIds) => {
+        _renderJobIds = jobIds;
+        capturedRenderRemoveArgs.length = 0;
 
-          await callHandler();
+        await callHandler();
 
-          const expectedPaths = jobIds.map((id) => `${PROJECT_ID}/${id}.mp4`);
+        const expectedPaths = jobIds.map((id) => `${PROJECT_ID}/${id}.mp4`);
 
-          if (expectedPaths.length > 0) {
-            expect(capturedRenderRemoveArgs.length).toBeGreaterThan(0);
-            const removedPaths = capturedRenderRemoveArgs[0];
-            for (const expected of expectedPaths) {
-              expect(removedPaths).toContain(expected);
-            }
-            expect(removedPaths.length).toBe(expectedPaths.length);
+        if (expectedPaths.length > 0) {
+          expect(capturedRenderRemoveArgs.length).toBeGreaterThan(0);
+          const removedPaths = capturedRenderRemoveArgs[0];
+          for (const expected of expectedPaths) {
+            expect(removedPaths).toContain(expected);
           }
-        },
-      ),
+          expect(removedPaths.length).toBe(expectedPaths.length);
+        }
+      }),
       { numRuns: 100 },
     );
   });

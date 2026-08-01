@@ -6,9 +6,12 @@
 // parsing is deliberately defensive and every missing item has a deterministic
 // fallback query.
 
+import { asyncPool } from "@/lib/clip-slices.server";
+
 const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const MODEL = "google/gemini-2.5-flash";
 const BATCH_SIZE = 12;
+const BATCH_CONCURRENCY = 5;
 
 const SYSTEM_PROMPT = `You convert narration sentences into short, CONCRETE, visually-searchable stock-footage phrases (3-8 words each).
 
@@ -37,7 +40,7 @@ type SceneInput = { idx: number; text: string };
 
 export type VisualCategory = "war" | "crime" | "space";
 
-const CATEGORY_THEMES: Record<VisualCategory, string> = {
+export const CATEGORY_THEMES: Record<VisualCategory, string> = {
   war: "war military conflict",
   crime: "crime law enforcement",
   space: "space astronomy cosmos",
@@ -112,7 +115,8 @@ function extractBalancedJson(content: string): string | null {
   const source = stripCodeFence(content);
   const objectStart = source.indexOf("{");
   const arrayStart = source.indexOf("[");
-  const start = objectStart < 0 ? arrayStart : arrayStart < 0 ? objectStart : Math.min(objectStart, arrayStart);
+  const start =
+    objectStart < 0 ? arrayStart : arrayStart < 0 ? objectStart : Math.min(objectStart, arrayStart);
   if (start < 0) return null;
 
   const stack: string[] = [];
@@ -332,8 +336,10 @@ export async function generateVisualQueries(
   }));
 
   const map = new Map<number, string>();
-  for (let start = 0; start < items.length; start += BATCH_SIZE) {
-    const batch = items.slice(start, start + BATCH_SIZE);
+  const batches = Array.from({ length: Math.ceil(items.length / BATCH_SIZE) }, (_, index) =>
+    items.slice(index * BATCH_SIZE, (index + 1) * BATCH_SIZE),
+  );
+  await asyncPool(batches, BATCH_CONCURRENCY, async (batch) => {
     const batchMap = await callGatewayWithRetry(batch, category);
     for (const [idx, q] of batchMap) map.set(idx, q);
 
@@ -348,7 +354,7 @@ export async function generateVisualQueries(
         map.set(item.idx, fallbackVisualQuery(item.text, category));
       }
     }
-  }
+  });
 
   return items.map((item) => map.get(item.idx) ?? fallbackVisualQuery(item.text, category));
 }

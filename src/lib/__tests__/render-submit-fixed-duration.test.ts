@@ -40,6 +40,8 @@ vi.mock("@/integrations/supabase/auth-middleware", () => ({
 vi.mock("@/lib/stock.server", () => ({
   orientationForAspect: () => "portrait",
   targetWidthForAspect: () => 1080,
+  stockReservationKey: (provider: string, id: string, inPoint = 0) =>
+    provider === "nasa" ? `${provider}:${id}:${Math.floor(inPoint / 5)}` : `${provider}:${id}`,
   searchStockFootage: (...args: unknown[]) => searchStockFootage(...args),
 }));
 
@@ -173,11 +175,15 @@ describe("submitRenderJob fixed-duration fallback", () => {
       .mockReset()
       .mockResolvedValueOnce({
         chosenFile: { url: "https://videos.example.com/a.mp4" },
-        pick: { provider_clip_id: "pexels-a" },
+        pick: { provider: "pexels", provider_clip_id: "pexels-a", thumbnail_url: null },
+        inPoint: 0,
+        reservationKey: "pexels:pexels-a",
       })
       .mockResolvedValueOnce({
         chosenFile: { url: "https://videos.example.com/b.mp4" },
-        pick: { provider_clip_id: "pexels-b" },
+        pick: { provider: "pexels", provider_clip_id: "pexels-b", thumbnail_url: null },
+        inPoint: 0,
+        reservationKey: "pexels:pexels-b",
       });
     process.env.RENDER_WORKER_URL = "https://worker.example.com";
     process.env.RENDER_WORKER_API_KEY = "test-worker-key";
@@ -253,15 +259,21 @@ describe("submitRenderJob fixed-duration fallback", () => {
       .mockReset()
       .mockResolvedValueOnce({
         chosenFile: { url: "https://videos.example.com/a.mp4" },
-        pick: { provider_clip_id: "pexels-a" },
+        pick: { provider: "pexels", provider_clip_id: "pexels-a", thumbnail_url: null },
+        inPoint: 0,
+        reservationKey: "pexels:pexels-a",
       })
       .mockResolvedValueOnce({
         chosenFile: { url: "https://videos.example.com/b.mp4" },
-        pick: { provider_clip_id: "pexels-b" },
+        pick: { provider: "pexels", provider_clip_id: "pexels-b", thumbnail_url: null },
+        inPoint: 0,
+        reservationKey: "pexels:pexels-b",
       })
       .mockResolvedValueOnce({
         chosenFile: { url: "https://videos.example.com/c.mp4" },
-        pick: { provider_clip_id: "pexels-c" },
+        pick: { provider: "pexels", provider_clip_id: "pexels-c", thumbnail_url: null },
+        inPoint: 0,
+        reservationKey: "pexels:pexels-c",
       });
 
     const submitRenderJobHandler = capturedHandlers[0];

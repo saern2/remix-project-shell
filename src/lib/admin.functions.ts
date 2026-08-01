@@ -267,7 +267,7 @@ export const listPexelsKeys = createServerFn({ method: "GET" })
     const { data, error } = await supabaseAdmin
       .from("pexels_api_keys")
       .select(
-        "id, api_key, is_active, request_count, last_used_at, last_error, last_error_at, added_at",
+        "id, api_key, is_active, request_count, rate_limit_remaining, rate_limit_reset_at, last_used_at, last_error, last_error_at, added_at",
       )
       .order("added_at", { ascending: false });
     if (error) throw new Error(error.message);
@@ -295,7 +295,7 @@ export const deactivatePexelsKey = createServerFn({ method: "POST" })
 type UploadRow = {
   line: number;
   masked: string;
-  status: "valid" | "inserted" | "invalid" | "duplicate" | "error";
+  status: "valid" | "inserted" | "reactivated" | "invalid" | "unverified" | "duplicate" | "error";
   detail?: string;
 };
 
@@ -373,6 +373,10 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
+    const { uploadPexelsKeysResilient } = await import("@/lib/admin-pexels.functions");
+    return uploadPexelsKeysResilient({ data });
+
+    /* c8 ignore start -- retained temporarily for old server-function hash compatibility */
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
     // ── Step 1: Parse ──────────────────────────────────────────────────────
@@ -400,7 +404,7 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
         ok = res.ok;
         if (!ok) detail = `Pexels responded HTTP ${res.status}`;
       } catch (e) {
-        detail = e instanceof Error ? e.message : "Network error";
+        detail = (e as Error | undefined)?.message ?? "Network error";
       }
       if (ok) {
         validKeys.push(key);
@@ -450,7 +454,9 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
         last_error_at: new Date().toISOString(),
       })
       .eq("is_active", true);
-    if (deactivateErr) throw new Error(`Failed to deactivate old keys: ${deactivateErr.message}`);
+    if (deactivateErr) {
+      throw new Error(`Failed to deactivate old keys: ${(deactivateErr as Error).message}`);
+    }
 
     // ── Step 6: Insert all valid new keys as active ────────────────────────
     let insertedCount = 0;
@@ -460,7 +466,9 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
         .insert({ api_key: key, is_active: true });
       if (error) {
         const idx = results.findIndex((r) => r.masked === maskKey(key) && r.status === "valid");
-        if (idx >= 0) results[idx] = { ...results[idx], status: "error", detail: error.message };
+        if (idx >= 0) {
+          results[idx] = { ...results[idx], status: "error", detail: (error as Error).message };
+        }
       } else {
         const idx = results.findIndex((r) => r.masked === maskKey(key) && r.status === "valid");
         if (idx >= 0) results[idx] = { ...results[idx], status: "inserted" };
@@ -481,4 +489,5 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
       errors: results.filter((r) => r.status === "error").length,
       results,
     };
+    /* c8 ignore stop */
   });
