@@ -9,7 +9,13 @@ export const Route = createFileRoute("/_authenticated")({
     const { data, error } = await supabase.auth.getUser();
     if (error || !data.user) throw redirect({ to: "/auth" });
 
-    const gate = await getAccessGateStatus();
+    let gate: Awaited<ReturnType<typeof getAccessGateStatus>>;
+    try {
+      gate = await getAccessGateStatus();
+    } catch {
+      // Not approved / no verified client yet — send them to the gate screen.
+      throw redirect({ to: "/auth" });
+    }
     if (!gate.hasAccess) throw redirect({ to: "/auth" });
 
     return { user: data.user, profile: gate };
