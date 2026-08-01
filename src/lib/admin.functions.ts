@@ -1,9 +1,13 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import type { Database } from "@/integrations/supabase/types";
+
+type AdminContext = { supabase: SupabaseClient<Database>; userId: string };
 
 /** Reads the caller's own role row through their RLS-scoped client (own-profile policy). */
-async function isCallerAdmin(context: { supabase: any; userId: string }) {
+async function isCallerAdmin(context: AdminContext) {
   const { data, error } = await context.supabase
     .from("users")
     .select("role")
@@ -13,7 +17,7 @@ async function isCallerAdmin(context: { supabase: any; userId: string }) {
   return data?.role === "admin";
 }
 
-async function assertAdmin(context: { supabase: any; userId: string }) {
+async function assertAdmin(context: AdminContext) {
   if (!(await isCallerAdmin(context))) throw new Error("Forbidden.");
 }
 
@@ -65,8 +69,12 @@ export const getAdminOverview = createServerFn({ method: "GET" })
     const projects = projectsRes.data ?? [];
     const keys = keysRes.data ?? [];
 
-    const usersByStatus = { pending: 0, approved: 0, rejected: 0 } as Record<string, number>;
-    for (const u of users) usersByStatus[u.approval_status] = (usersByStatus[u.approval_status] ?? 0) + 1;
+    const usersByStatus = { pending: 0, approved: 0, rejected: 0, suspended: 0 } as Record<
+      string,
+      number
+    >;
+    for (const u of users)
+      usersByStatus[u.approval_status] = (usersByStatus[u.approval_status] ?? 0) + 1;
 
     const completed = jobs.filter((j) => j.status === "completed");
 
@@ -158,18 +166,18 @@ export const setUserApprovalStatus = createServerFn({ method: "POST" })
     z
       .object({
         userId: z.string().uuid(),
-        approvalStatus: z.enum(["pending", "approved", "rejected"]),
+        approvalStatus: z.enum(["pending", "approved", "rejected", "suspended"]),
       })
       .parse(input),
   )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
     // Self-action guard: no admin can reject their own account mid-session.
-    if (data.userId === context.userId && data.approvalStatus === "rejected") {
-      throw new Error("You cannot reject your own account.");
+    if (data.userId === context.userId && ["rejected", "suspended"].includes(data.approvalStatus)) {
+      throw new Error("You cannot remove access from your own account.");
     }
     // Primary admin guard: the primary admin account cannot be rejected.
-    if (data.approvalStatus === "rejected") {
+    if (["rejected", "suspended"].includes(data.approvalStatus)) {
       await assertNotPrimaryAdmin(data.userId);
     }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -178,6 +186,33 @@ export const setUserApprovalStatus = createServerFn({ method: "POST" })
       .update({ approval_status: data.approvalStatus })
       .eq("id", data.userId);
     if (error) throw new Error(error.message);
+    if (["rejected", "suspended"].includes(data.approvalStatus)) {
+      const now = new Date().toISOString();
+      const { data: secrets } = await supabaseAdmin
+        .from("user_access_secrets")
+        .update({
+          status: "revoked",
+          revoked_at: now,
+          revoked_by: context.userId,
+          revocation_reason: `Account ${data.approvalStatus}`,
+        })
+        .eq("user_id", data.userId)
+        .in("status", ["active", "exhausted"])
+        .select("id");
+      const secretIds = (secrets ?? []).map((secret) => secret.id);
+      if (secretIds.length > 0) {
+        await supabaseAdmin
+          .from("access_activations")
+          .update({ revoked_at: now })
+          .in("secret_id", secretIds)
+          .is("revoked_at", null);
+      }
+    }
+    await supabaseAdmin.from("access_security_events").insert({
+      event_type: `account_${data.approvalStatus}`,
+      user_id: data.userId,
+      actor_user_id: context.userId,
+    });
     return { ok: true as const };
   });
 
@@ -185,7 +220,9 @@ export const setUserApprovalStatus = createServerFn({ method: "POST" })
 export const setUserPlanTier = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
-    z.object({ userId: z.string().uuid(), planTier: z.enum(["free", "pro", "business"]) }).parse(input),
+    z
+      .object({ userId: z.string().uuid(), planTier: z.enum(["free", "pro", "business"]) })
+      .parse(input),
   )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
@@ -214,7 +251,10 @@ export const setUserRole = createServerFn({ method: "POST" })
       await assertNotPrimaryAdmin(data.userId);
     }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin.from("users").update({ role: data.role }).eq("id", data.userId);
+    const { error } = await supabaseAdmin
+      .from("users")
+      .update({ role: data.role })
+      .eq("id", data.userId);
     if (error) throw new Error(error.message);
     return { ok: true as const };
   });
@@ -226,7 +266,9 @@ export const listPexelsKeys = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data, error } = await supabaseAdmin
       .from("pexels_api_keys")
-      .select("id, api_key, is_active, request_count, last_used_at, last_error, last_error_at, added_at")
+      .select(
+        "id, api_key, is_active, request_count, last_used_at, last_error, last_error_at, added_at",
+      )
       .order("added_at", { ascending: false });
     if (error) throw new Error(error.message);
     return (data ?? []).map((k) => ({ ...k, api_key: maskKey(k.api_key) }));
@@ -265,8 +307,8 @@ type UploadRow = {
 function parsePexelsKeyCsv(csv: string): string[] {
   const HEADER_TOKENS = new Set(["api_key", "key", "apikey", "pexels_key"]);
   const tokens = csv
-    .split(/[\r\n,]+/)           // split on any combo of newlines and commas
-    .map((t) => t.trim().replace(/^["']|["']$/g, ""))  // strip quotes
+    .split(/[\r\n,]+/) // split on any combo of newlines and commas
+    .map((t) => t.trim().replace(/^["']|["']$/g, "")) // strip quotes
     .filter((t) => t.length > 0 && !HEADER_TOKENS.has(t.toLowerCase()));
   // Dedupe within the incoming list
   return [...new Set(tokens)];
@@ -279,7 +321,9 @@ function parsePexelsKeyCsv(csv: string): string[] {
  */
 export const previewPexelsKeys = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => z.object({ csv: z.string().min(1).max(200_000) }).parse(input))
+  .inputValidator((input: unknown) =>
+    z.object({ csv: z.string().min(1).max(200_000) }).parse(input),
+  )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -287,9 +331,7 @@ export const previewPexelsKeys = createServerFn({ method: "POST" })
     const parsed = parsePexelsKeyCsv(data.csv);
 
     // Load existing keys to identify duplicates in the preview
-    const { data: existing } = await supabaseAdmin
-      .from("pexels_api_keys")
-      .select("api_key");
+    const { data: existing } = await supabaseAdmin.from("pexels_api_keys").select("api_key");
     const existingSet = new Set((existing ?? []).map((k) => k.api_key));
 
     const preview = parsed.map((key, i) => ({
@@ -322,10 +364,12 @@ export const previewPexelsKeys = createServerFn({ method: "POST" })
 export const uploadPexelsKeys = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
-    z.object({
-      csv: z.string().min(1).max(200_000),
-      safetyThreshold: z.number().int().min(1).max(100).default(5),
-    }).parse(input),
+    z
+      .object({
+        csv: z.string().min(1).max(200_000),
+        safetyThreshold: z.number().int().min(1).max(100).default(5),
+      })
+      .parse(input),
   )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
@@ -335,9 +379,7 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
     const parsed = parsePexelsKeyCsv(data.csv);
 
     // ── Step 2: Deduplicate against existing DB keys ───────────────────────
-    const { data: existing } = await supabaseAdmin
-      .from("pexels_api_keys")
-      .select("api_key");
+    const { data: existing } = await supabaseAdmin.from("pexels_api_keys").select("api_key");
     const existingSet = new Set((existing ?? []).map((k) => k.api_key));
     const newKeys = parsed.filter((k) => !existingSet.has(k));
     const duplicateKeys = parsed.filter((k) => existingSet.has(k));
@@ -370,7 +412,12 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
 
     // Report duplicates in the results
     for (const key of duplicateKeys) {
-      results.push({ line: -1, masked: maskKey(key), status: "duplicate", detail: "Key already in pool" });
+      results.push({
+        line: -1,
+        masked: maskKey(key),
+        status: "duplicate",
+        detail: "Key already in pool",
+      });
     }
 
     const validCount = validKeys.length;

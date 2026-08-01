@@ -35,14 +35,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import { ArrowLeft, Loader2, Upload, ShieldCheck } from "lucide-react";
+import { AdminAccessPanel } from "@/components/admin-access-panel";
 
 export const Route = createFileRoute("/_authenticated/admin")({
   head: () => ({
@@ -98,6 +94,7 @@ function AdminPage() {
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="users">Users</TabsTrigger>
+          <TabsTrigger value="access">Access</TabsTrigger>
           <TabsTrigger value="keys">Pexels keys</TabsTrigger>
         </TabsList>
         <TabsContent value="overview" className="mt-4">
@@ -105,6 +102,9 @@ function AdminPage() {
         </TabsContent>
         <TabsContent value="users" className="mt-4">
           <UsersTab />
+        </TabsContent>
+        <TabsContent value="access" className="mt-4">
+          <AdminAccessPanel />
         </TabsContent>
         <TabsContent value="keys" className="mt-4">
           <KeysTab />
@@ -159,7 +159,11 @@ function OverviewTab() {
         <CardContent>
           <div className="flex h-40 items-end gap-1">
             {data.rendersPerDay.map((d) => (
-              <div key={d.date} className="flex flex-1 flex-col items-center gap-1" title={`${d.date}: ${d.count}`}>
+              <div
+                key={d.date}
+                className="flex flex-1 flex-col items-center gap-1"
+                title={`${d.date}: ${d.count}`}
+              >
                 <div
                   className="w-full rounded-sm bg-primary"
                   style={{ height: `${(d.count / max) * 100}%`, minHeight: d.count > 0 ? 4 : 1 }}
@@ -280,6 +284,7 @@ function UsersTab() {
               <SelectItem value="pending">Pending</SelectItem>
               <SelectItem value="approved">Approved</SelectItem>
               <SelectItem value="rejected">Rejected</SelectItem>
+              <SelectItem value="suspended">Suspended</SelectItem>
             </SelectContent>
           </Select>
         </CardHeader>
@@ -325,6 +330,32 @@ function UsersTab() {
                             <TooltipContent>Primary admin — protected account</TooltipContent>
                           </Tooltip>
                         )}
+
+                        {!rejectBlockReason ? (
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            disabled={busy === u.id || u.approval_status === "suspended"}
+                            onClick={() => {
+                              if (
+                                !window.confirm(
+                                  `Suspend ${u.email} and revoke every trusted browser?`,
+                                )
+                              )
+                                return;
+                              void run(
+                                u.id,
+                                () =>
+                                  approvalFn({
+                                    data: { userId: u.id, approvalStatus: "suspended" },
+                                  }),
+                                "User suspended and access revoked",
+                              );
+                            }}
+                          >
+                            Suspend
+                          </Button>
+                        ) : null}
                       </span>
                     </TableCell>
                     <TableCell>
@@ -356,7 +387,8 @@ function UsersTab() {
                           onClick={() =>
                             run(
                               u.id,
-                              () => approvalFn({ data: { userId: u.id, approvalStatus: "approved" } }),
+                              () =>
+                                approvalFn({ data: { userId: u.id, approvalStatus: "approved" } }),
                               "User approved",
                             )
                           }
@@ -384,7 +416,10 @@ function UsersTab() {
                             onClick={() =>
                               run(
                                 u.id,
-                                () => approvalFn({ data: { userId: u.id, approvalStatus: "rejected" } }),
+                                () =>
+                                  approvalFn({
+                                    data: { userId: u.id, approvalStatus: "rejected" },
+                                  }),
                                 "User rejected",
                               )
                             }
@@ -430,7 +465,10 @@ function UsersTab() {
                                 u.id,
                                 () =>
                                   roleFn({
-                                    data: { userId: u.id, role: u.role === "admin" ? "user" : "admin" },
+                                    data: {
+                                      userId: u.id,
+                                      role: u.role === "admin" ? "user" : "admin",
+                                    },
                                   }),
                                 u.role === "admin" ? "Admin removed" : "Admin granted",
                               )
@@ -462,7 +500,9 @@ function KeysTab() {
   // Phase 1: preview state
   const [pendingCsv, setPendingCsv] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
-  const [previewResult, setPreviewResult] = useState<Awaited<ReturnType<typeof preview>> | null>(null);
+  const [previewResult, setPreviewResult] = useState<Awaited<ReturnType<typeof preview>> | null>(
+    null,
+  );
   const [safetyThreshold, setSafetyThreshold] = useState(5);
 
   // Phase 2: upload state
@@ -520,15 +560,19 @@ function KeysTab() {
         <CardHeader>
           <CardTitle className="text-base">Upload keys (CSV)</CardTitle>
           <CardDescription>
-            Accepts newline-separated, comma-separated, or mixed format. Each key is tested
-            against the live Pexels API. Old active keys are only deactivated if the new batch
-            meets the safety threshold.
+            Accepts newline-separated, comma-separated, or mixed format. Each key is tested against
+            the live Pexels API. Old active keys are only deactivated if the new batch meets the
+            safety threshold.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex flex-wrap items-center gap-4">
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm">
-              {previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+              {previewing ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Upload className="h-4 w-4" />
+              )}
               {previewing ? "Parsing…" : "Choose CSV file"}
               <input
                 type="file"
@@ -575,7 +619,10 @@ function KeysTab() {
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => { setPreviewResult(null); setPendingCsv(null); }}
+                    onClick={() => {
+                      setPreviewResult(null);
+                      setPendingCsv(null);
+                    }}
                     disabled={uploading}
                   >
                     Cancel
@@ -588,8 +635,8 @@ function KeysTab() {
               </div>
               <p className="text-xs text-muted-foreground">
                 If ≥ {safetyThreshold} key{safetyThreshold !== 1 ? "s" : ""} pass Pexels validation,
-                all currently-active keys will be deactivated and the new ones activated.
-                If fewer pass, the old pool stays untouched.
+                all currently-active keys will be deactivated and the new ones activated. If fewer
+                pass, the old pool stays untouched.
               </p>
               <div className="max-h-48 overflow-y-auto">
                 <Table>
@@ -606,9 +653,11 @@ function KeysTab() {
                         <TableCell>{p.index}</TableCell>
                         <TableCell className="font-mono">{p.masked}</TableCell>
                         <TableCell>
-                          {p.isDuplicate
-                            ? <Badge variant="secondary">duplicate</Badge>
-                            : <Badge variant="default">new</Badge>}
+                          {p.isDuplicate ? (
+                            <Badge variant="secondary">duplicate</Badge>
+                          ) : (
+                            <Badge variant="default">new</Badge>
+                          )}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -634,7 +683,9 @@ function KeysTab() {
                 <span>Valid: {report.validCount}</span>
                 <span>Invalid: {report.invalid}</span>
                 <span>Duplicates: {report.duplicates}</span>
-                {report.errors > 0 && <span className="text-destructive">Errors: {report.errors}</span>}
+                {report.errors > 0 && (
+                  <span className="text-destructive">Errors: {report.errors}</span>
+                )}
               </div>
               <Table>
                 <TableHeader>
@@ -649,12 +700,17 @@ function KeysTab() {
                     <TableRow key={i}>
                       <TableCell className="font-mono">{r.masked}</TableCell>
                       <TableCell>
-                        <Badge variant={
-                          r.status === "inserted" ? "default"
-                          : r.status === "valid" ? "default"
-                          : r.status === "duplicate" ? "secondary"
-                          : "destructive"
-                        }>
+                        <Badge
+                          variant={
+                            r.status === "inserted"
+                              ? "default"
+                              : r.status === "valid"
+                                ? "default"
+                                : r.status === "duplicate"
+                                  ? "secondary"
+                                  : "destructive"
+                          }
+                        >
                           {r.status}
                         </Badge>
                       </TableCell>
@@ -704,9 +760,13 @@ function KeysTab() {
                       </Badge>
                     </TableCell>
                     <TableCell className="text-right">{k.request_count}</TableCell>
-                    <TableCell>{k.last_used_at ? new Date(k.last_used_at).toLocaleString() : "—"}</TableCell>
+                    <TableCell>
+                      {k.last_used_at ? new Date(k.last_used_at).toLocaleString() : "—"}
+                    </TableCell>
                     <TableCell className="text-muted-foreground">{k.last_error ?? "—"}</TableCell>
-                    <TableCell>{k.last_error_at ? new Date(k.last_error_at).toLocaleString() : "—"}</TableCell>
+                    <TableCell>
+                      {k.last_error_at ? new Date(k.last_error_at).toLocaleString() : "—"}
+                    </TableCell>
                     <TableCell className="text-right">
                       <Button
                         size="sm"

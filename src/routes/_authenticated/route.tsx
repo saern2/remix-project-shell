@@ -1,6 +1,7 @@
 import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
 import { supabase } from "@/integrations/supabase/client";
 import { AppShell } from "@/components/app-shell";
+import { getAccessGateStatus } from "@/lib/access.functions";
 
 export const Route = createFileRoute("/_authenticated")({
   ssr: false,
@@ -8,25 +9,10 @@ export const Route = createFileRoute("/_authenticated")({
     const { data, error } = await supabase.auth.getUser();
     if (error || !data.user) throw redirect({ to: "/auth" });
 
-    const { data: profile, error: profileError } = await supabase
-      .from("users")
-      .select("approval_status")
-      .eq("id", data.user.id)
-      .maybeSingle();
-    if (profileError) throw profileError;
+    const gate = await getAccessGateStatus();
+    if (!gate.hasAccess) throw redirect({ to: "/auth" });
 
-    const approvalStatus = profile?.approval_status;
-    if (approvalStatus !== "approved") {
-      await supabase.auth.signOut();
-      throw redirect({
-        to: "/auth",
-        search: {
-          approval: approvalStatus === "rejected" ? "rejected" : "pending",
-        },
-      });
-    }
-
-    return { user: data.user, profile };
+    return { user: data.user, profile: gate };
   },
   component: AuthenticatedLayout,
 });
