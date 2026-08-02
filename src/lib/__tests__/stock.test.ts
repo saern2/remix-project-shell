@@ -43,6 +43,7 @@ describe("stock footage diversity helpers", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     delete process.env.PEXELS_API_KEY;
+    delete process.env.PIXABAY_API_KEY;
   });
 
   it("does not collapse unrelated numeric Pexels ids into one family", () => {
@@ -54,9 +55,10 @@ describe("stock footage diversity helpers", () => {
     );
   });
 
-  it("falls back to niche-biased Pexels when both NASA searches are empty", async () => {
+  it("matches through NASA to Pexels when Pixabay is unconfigured", async () => {
     searchNasaFootage.mockResolvedValue([]);
     process.env.PEXELS_API_KEY = "test-key";
+    delete process.env.PIXABAY_API_KEY;
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
       async () =>
         new Response(
@@ -88,6 +90,7 @@ describe("stock footage diversity helpers", () => {
     expect(result?.pick.provider).toBe("pexels");
     expect(searchNasaFootage).toHaveBeenCalledTimes(2);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy.mock.calls.every(([url]) => String(url).includes("api.pexels.com"))).toBe(true);
     expect(String(fetchSpy.mock.calls[0][0])).toContain("space+astronomy+cosmos");
   });
 

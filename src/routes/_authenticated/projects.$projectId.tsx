@@ -6,6 +6,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
+import { isMissingPollResult, pollIntervalWhileActive } from "@/lib/polling-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -112,21 +113,28 @@ function ProjectDetail() {
 
   const projectQuery = useQuery({
     queryKey: ["project", projectId],
-    queryFn: async (): Promise<Project> => {
+    queryFn: async (): Promise<Project | null> => {
       const { data, error } = await supabase
         .from("projects")
         .select("id, name, status, error_message, created_at, updated_at, clip_duration_seconds")
         .eq("id", projectId)
-        .single();
+        .maybeSingle();
       if (error) throw error;
-      return data as Project;
+      return data ? (data as Project) : null;
     },
     // Refetch quickly while the pipeline is running.
-    refetchInterval: (query) =>
-      query.state.data && IN_PROGRESS.has(query.state.data.status) ? 3000 : false,
+    refetchInterval: (query) => pollIntervalWhileActive(query.state.data, IN_PROGRESS, 3000),
   });
 
   const project = projectQuery.data;
+  useEffect(() => {
+    if (!projectQuery.isSuccess || projectQuery.data !== null) return;
+    toast.info(
+      "This project no longer exists. It may have been deleted or removed by the 30-hour cleanup.",
+    );
+    void navigate({ to: "/dashboard", replace: true });
+  }, [navigate, projectQuery.data, projectQuery.isSuccess]);
+
   const isReady = project?.status === "ready" || project?.status === "completed";
 
   const scenesQuery = useQuery({
@@ -311,9 +319,12 @@ function ProjectDetail() {
       if (error) throw error;
       return data;
     },
-    refetchInterval: (q) => (q.state.data && RENDER_ACTIVE.has(q.state.data.status) ? 3000 : false),
+    refetchInterval: (q) => pollIntervalWhileActive(q.state.data, RENDER_ACTIVE, 3000),
   });
   const renderJob = renderJobQuery.data;
+  const renderJobId = renderJob?.id;
+  const renderJobStatus = renderJob?.status;
+  const renderJobOutputUrl = renderJob?.output_url;
   const canSubmitRender =
     project?.status === "ready" &&
     fixedSlicesComplete &&
@@ -336,12 +347,18 @@ function ProjectDetail() {
 
   // Poll worker while the current render job is active.
   useEffect(() => {
-    if (!renderJob || !RENDER_ACTIVE.has(renderJob.status)) return;
+    if (!renderJobId || !renderJobStatus || !RENDER_ACTIVE.has(renderJobStatus)) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
       try {
-        await runPollRender({ data: { jobId: renderJob.id } });
+        const result = await runPollRender({ data: { jobId: renderJobId } });
+        if (isMissingPollResult(result)) {
+          cancelled = true;
+          toast.info("This render job no longer exists.");
+          void navigate({ to: "/dashboard", replace: true });
+          return;
+        }
       } catch (err) {
         if (!cancelled) toast.error((err as Error).message);
       }
@@ -356,7 +373,7 @@ function ProjectDetail() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [renderJob?.id, renderJob?.status, projectId, queryClient, runPollRender]);
+  }, [renderJobId, renderJobStatus, projectId, queryClient, runPollRender, navigate]);
 
   // One-shot poll for completed jobs whose stored output_url is missing or is a
   // pre-signed upload URL (not a playback URL). This happens when:
@@ -365,15 +382,20 @@ function ProjectDetail() {
   // pollRenderJob's short-circuit path for completed jobs now re-signs the URL,
   // so a single call here is enough to get a fresh playback URL into the cache.
   useEffect(() => {
-    if (!renderJob) return;
-    if (renderJob.status !== "completed") return;
-    const needsResign = !renderJob.output_url || renderJob.output_url.includes("/upload/sign/");
+    if (!renderJobId || renderJobStatus !== "completed") return;
+    const needsResign = !renderJobOutputUrl || renderJobOutputUrl.includes("/upload/sign/");
     if (!needsResign) return;
 
     let cancelled = false;
     (async () => {
       try {
-        await runPollRender({ data: { jobId: renderJob.id } });
+        const result = await runPollRender({ data: { jobId: renderJobId } });
+        if (isMissingPollResult(result)) {
+          cancelled = true;
+          toast.info("This render job no longer exists.");
+          void navigate({ to: "/dashboard", replace: true });
+          return;
+        }
         if (!cancelled) {
           queryClient.invalidateQueries({ queryKey: ["render-job", projectId] });
         }
@@ -385,12 +407,13 @@ function ProjectDetail() {
       cancelled = true;
     };
   }, [
-    renderJob?.id,
-    renderJob?.output_url,
-    renderJob?.status,
+    renderJobId,
+    renderJobOutputUrl,
+    renderJobStatus,
     projectId,
     queryClient,
     runPollRender,
+    navigate,
   ]);
 
   // Poll the pipeline server function whenever the project is mid-flight.
@@ -403,7 +426,15 @@ function ProjectDetail() {
 
     const tick = async () => {
       try {
-        await runPoll({ data: { projectId } });
+        const result = await runPoll({ data: { projectId } });
+        if (isMissingPollResult(result)) {
+          cancelled = true;
+          toast.info(
+            "This project no longer exists. It may have been removed by the 30-hour cleanup.",
+          );
+          void navigate({ to: "/dashboard", replace: true });
+          return;
+        }
       } catch (err) {
         // Surface non-abort errors once; the query refetch will show the failed state.
         if (!cancelled) toast.error((err as Error).message);
@@ -421,7 +452,7 @@ function ProjectDetail() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [project?.status, projectId, queryClient, runPoll, project]);
+  }, [project?.status, projectId, queryClient, runPoll, project, navigate]);
 
   const progressPct = useMemo(() => {
     if (!project) return 0;

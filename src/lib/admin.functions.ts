@@ -77,6 +77,7 @@ export const getAdminOverview = createServerFn({ method: "GET" })
       usersByStatus[u.approval_status] = (usersByStatus[u.approval_status] ?? 0) + 1;
 
     const completed = jobs.filter((j) => j.status === "completed");
+    const activePexelsKeys = keys.filter((key) => key.is_active).length;
 
     // Renders per day, last 30 days.
     const days: { date: string; count: number }[] = [];
@@ -110,9 +111,31 @@ export const getAdminOverview = createServerFn({ method: "GET" })
       totalCompletedRenders: completed.length,
       rendersPerDay: days,
       topUsers,
+      providers: [
+        {
+          id: "nasa",
+          name: "NASA",
+          configured: true,
+          detail: "Public video library available",
+        },
+        {
+          id: "pexels",
+          name: "Pexels",
+          configured: activePexelsKeys > 0,
+          detail: `${activePexelsKeys} active key${activePexelsKeys === 1 ? "" : "s"}`,
+        },
+        {
+          id: "pixabay",
+          name: "Pixabay",
+          configured: Boolean(process.env.PIXABAY_API_KEY?.trim()),
+          detail: process.env.PIXABAY_API_KEY?.trim()
+            ? "API key configured"
+            : "API key not configured",
+        },
+      ],
       keyPool: {
         total: keys.length,
-        active: keys.filter((k) => k.is_active).length,
+        active: activePexelsKeys,
         withError: keys.filter((k) => k.last_error !== null).length,
         recentErrors: keys
           .filter((k) => k.last_error !== null)
@@ -272,6 +295,34 @@ export const listPexelsKeys = createServerFn({ method: "GET" })
       .order("added_at", { ascending: false });
     if (error) throw new Error(error.message);
     return (data ?? []).map((k) => ({ ...k, api_key: maskKey(k.api_key) }));
+  });
+
+export function isNeverSucceededPexelsKey(key: {
+  request_count: number | null;
+  last_error: string | null;
+}): boolean {
+  return Number(key.request_count) === 0 && /HTTP (?:401|403)\b/i.test(key.last_error ?? "");
+}
+
+export const pruneNeverSucceededPexelsKeys = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await assertAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: keys, error: loadError } = await supabaseAdmin
+      .from("pexels_api_keys")
+      .select("id, request_count, last_error");
+    if (loadError) throw new Error(loadError.message);
+    const ids = (keys ?? []).filter(isNeverSucceededPexelsKey).map((key) => key.id);
+    if (ids.length === 0) return { deleted: 0 };
+
+    const { data: deletedRows, error } = await supabaseAdmin
+      .from("pexels_api_keys")
+      .delete()
+      .in("id", ids)
+      .select("id");
+    if (error) throw new Error(error.message);
+    return { deleted: deletedRows?.length ?? 0 };
   });
 
 export const deactivatePexelsKey = createServerFn({ method: "POST" })

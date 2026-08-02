@@ -261,7 +261,12 @@ export const pollPipeline = createServerFn({ method: "POST" })
       .eq("id", projectId)
       .maybeSingle();
     if (projErr) throw new Error(projErr.message);
-    if (!project) throw new Error("Project not found.");
+    if (!project) {
+      return {
+        status: "not_found",
+        error_message: "This project no longer exists.",
+      };
+    }
     if (project.user_id !== userId) throw new Error("Forbidden.");
 
     if (project.status === "transcribing") {
@@ -398,8 +403,9 @@ async function advanceFromMatchingFootage(projectId: string) {
       .from("projects")
       .select("id, aspect_ratio, clip_duration_seconds, niche")
       .eq("id", projectId)
-      .single();
-    if (pErr || !project) throw new Error(pErr?.message ?? "Project not found.");
+      .maybeSingle();
+    if (pErr) throw new Error(pErr.message);
+    if (!project) throw new PipelineStoppedError();
 
     const { data: scenes, error } = await supabaseAdmin
       .from("scenes")
@@ -429,7 +435,6 @@ async function advanceFromMatchingFootage(projectId: string) {
 
     const {
       createStockSearchSession,
-      searchUniqueStockFootage,
       stockReservationKey,
       orientationForAspect,
       targetWidthForAspect,
@@ -567,47 +572,53 @@ async function advanceFromMatchingFootage(projectId: string) {
       const unmatchedSlots: typeof pendingSlots = [];
       const FIXED_DURATION_CONCURRENCY = 4;
 
+      const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
+      const fixedAssignments = await matchStockCorpus({
+        projectId,
+        demands: pendingSlots.flatMap((slot) => {
+          const scene = sceneById.get(slot.sceneId);
+          if (!scene?.visual_query) return [];
+          return [
+            {
+              id: sliceKey(slot.sceneId, slot.sliceIndex),
+              query: scene.visual_query,
+              minDurationSec: slot.durationSeconds,
+              seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
+            },
+          ];
+        }),
+        orientation,
+        targetWidth,
+        niche: project.niche,
+        usedIds,
+        session: stockSession,
+      });
+
       await asyncPool(pendingSlots, FIXED_DURATION_CONCURRENCY, async (slot) => {
-        const scene = sceneById.get(slot.sceneId);
-        if (!scene?.visual_query) {
+        const result = fixedAssignments.get(sliceKey(slot.sceneId, slot.sliceIndex));
+        if (!result) {
           unmatchedSlots.push(slot);
           return;
         }
-
-        const result = await searchUniqueStockFootage({
-          query: scene.visual_query,
-          orientation,
-          minDurationSec: slot.durationSeconds,
-          targetWidth,
-          usedIds,
-          seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
-          niche: project.niche,
-          session: stockSession ?? undefined,
-        });
-        if (result) {
-          const providerClipId = result.pick.provider_clip_id;
-          const row = {
-            project_id: projectId,
-            scene_id: slot.sceneId,
-            slice_index: slot.sliceIndex,
-            clip_url: result.chosenFile.url,
-            provider_clip_id: providerClipId,
-            provider: result.pick.provider,
-            in_point_seconds: result.inPoint,
-            duration_seconds: slot.durationSeconds,
-            timeline_start_seconds: slot.timelineStart,
-            timeline_end_seconds: slot.timelineEnd,
-            thumbnail_url: result.pick.thumbnail_url ?? null,
-          };
-          newSliceRows.push(row);
-          const { error: sliceError } = await supabaseAdmin
-            .from("render_clip_slices")
-            .upsert(row, { onConflict: "project_id,scene_id,slice_index" });
-          throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
-          return;
-        }
-
-        unmatchedSlots.push(slot);
+        const providerClipId = result.pick.provider_clip_id;
+        const row = {
+          project_id: projectId,
+          scene_id: slot.sceneId,
+          slice_index: slot.sliceIndex,
+          clip_url: result.chosenFile.url,
+          provider_clip_id: providerClipId,
+          provider: result.pick.provider,
+          in_point_seconds: result.inPoint,
+          duration_seconds: slot.durationSeconds,
+          timeline_start_seconds: slot.timelineStart,
+          timeline_end_seconds: slot.timelineEnd,
+          thumbnail_url: result.pick.thumbnail_url ?? null,
+        };
+        newSliceRows.push(row);
+        const { error: sliceError } = await supabaseAdmin
+          .from("render_clip_slices")
+          .upsert(row, { onConflict: "project_id,scene_id,slice_index" });
+        throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
       });
 
       if (unmatchedSlots.length > 0) {
@@ -710,8 +721,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         .eq("id", projectId);
       return { status: "ready", error_message: null };
     }
-
-    // ── Plain path (no fixed duration) — unchanged ────────────────────────
+    // Plain path (no fixed duration).
     // Existing selections (idempotent re-runs). Skip scenes already selected.
     const { data: existingSel } = await supabaseAdmin
       .from("selected_clips")
@@ -759,28 +769,35 @@ async function advanceFromMatchingFootage(projectId: string) {
     const CONCURRENCY = 5;
     const pending = scenes.filter((s) => !alreadySelected.has(s.id));
     const unmatchedSceneIds = new Set<string>();
+    const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
+    const plainAssignments = await matchStockCorpus({
+      projectId,
+      demands: pending.flatMap((scene) => {
+        if (!scene.visual_query) return [];
+        const visualDuration =
+          timelineSlots.get(scene.id)?.durationSeconds ??
+          Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
+        return [
+          {
+            id: scene.id,
+            query: scene.visual_query,
+            minDurationSec: Math.max(1, Math.ceil(visualDuration)),
+            seed: `${projectId}:${scene.id}`,
+          },
+        ];
+      }),
+      orientation,
+      targetWidth,
+      niche: projectNiche,
+      usedIds,
+      session: stockSession,
+    });
 
     async function processScene(scene: NonNullable<typeof scenes>[number]) {
-      const query = scene.visual_query;
-      if (!query) {
-        await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
-        unmatchedSceneIds.add(scene.id);
-        return;
-      }
       const visualDuration =
         timelineSlots.get(scene.id)?.durationSeconds ??
         Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
-      const minDuration = Math.max(1, Math.ceil(visualDuration));
-      const result = await searchUniqueStockFootage({
-        query,
-        orientation,
-        minDurationSec: minDuration,
-        targetWidth,
-        usedIds,
-        seed: `${projectId}:${scene.id}`,
-        niche: projectNiche,
-        session: stockSession ?? undefined,
-      });
+      const result = plainAssignments.get(scene.id);
       if (!result) {
         await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
         unmatchedSceneIds.add(scene.id);
@@ -825,8 +842,8 @@ async function advanceFromMatchingFootage(projectId: string) {
     if (unmatchedSceneIds.size > 0) {
       throw new Error(
         projectNiche === "space"
-          ? `NASA and Pexels could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, choose another niche or ask the operator to verify the Pexels key pool.`
-          : `Pexels could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify available Pexels keys.`,
+          ? `NASA, Pexels, and Pixabay could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`
+          : `Pexels and Pixabay could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`,
       );
     }
 

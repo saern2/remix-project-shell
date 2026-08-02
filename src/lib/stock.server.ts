@@ -11,6 +11,10 @@ export type StockVideo = {
   height: number;
   thumbnail_url: string | null;
   files: StockVideoFile[];
+  title?: string;
+  description?: string;
+  keywords?: string[];
+  has_captions?: boolean;
 };
 
 export type Orientation = "landscape" | "portrait" | "square";
@@ -18,21 +22,54 @@ export type ProjectNiche = "general" | "space";
 
 export interface StockProvider {
   readonly name: "pexels" | "pixabay";
-  search(query: string, orientation: Orientation, page: number): Promise<StockVideo[]>;
+  search(
+    query: string,
+    orientation: Orientation,
+    page: number,
+    session?: StockSearchSession,
+  ): Promise<StockVideo[]>;
 }
 
 const PEXELS_URL = "https://api.pexels.com/videos/search";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const SEEDED_TOP_CANDIDATES = 10;
 const NASA_IN_POINT_BUCKET_SECONDS = 5;
-const NASA_TAIL_MARGIN_SECONDS = 2;
+
 const SPACE_THEME_TERMS = CATEGORY_THEMES.space;
 
-type PoolKey = {
+export type PoolKey = {
   id: string;
   api_key: string;
   rate_limit_remaining: number | null;
   rate_limit_reset_at: string | null;
+};
+
+export class PexelsPoolDegradedError extends Error {
+  constructor(
+    readonly rejected: number,
+    readonly initial: number,
+  ) {
+    super(`Pexels key pool degraded: ${rejected} of ${initial} keys rejected mid-run`);
+    this.name = "PexelsPoolDegradedError";
+  }
+}
+
+export class StockRequestBudgetExceededError extends Error {
+  constructor(readonly limit: number) {
+    super(`Stock provider request budget exceeded (${limit} Pexels requests per project).`);
+    this.name = "StockRequestBudgetExceededError";
+  }
+}
+
+export type PexelsStagePool = {
+  configured: boolean;
+  keys: PoolKey[];
+  initialCount: number;
+  rejectedIds: Set<string>;
+  unavailableIds: Set<string>;
+  deactivationPromises: Map<string, Promise<void>>;
+  requestCount: number;
+  requestLimit: number;
 };
 
 export async function rotatePexelsKeysForRequest(opts: {
@@ -61,6 +98,16 @@ export async function rotatePexelsKeysForRequest(opts: {
 type CachedSearch = { results: StockVideo[]; cachedAt: string };
 type UsageCount = { requests: number; cacheHits: number };
 
+export type NasaRequestMetrics = {
+  searchRequests: number;
+  assetCalls: number;
+  metadataCalls: number;
+  metadataJsonFetches: number;
+  captionCalls: number;
+  assetCacheHits: number;
+  assetCacheMisses: number;
+};
+
 export type StockSearchSession = {
   cache: Map<string, CachedSearch>;
   inflight: Map<string, Promise<StockVideo[]>>;
@@ -75,6 +122,8 @@ export type StockSearchSession = {
     }
   >;
   usage: Map<string, UsageCount>;
+  pexelsPool: PexelsStagePool;
+  nasaMetrics?: NasaRequestMetrics;
 };
 
 export type StockSearchOptions = {
@@ -113,26 +162,6 @@ function buildPexelsUrl(query: string, orientation: Orientation, page: number): 
   return `${PEXELS_URL}?${params.toString()}`;
 }
 
-async function pexelsFetchFromEnv(
-  query: string,
-  orientation: Orientation,
-  page: number,
-): Promise<Response | null> {
-  const keys = parsePexelsKeys();
-  if (keys.length === 0) return null;
-  const url = buildPexelsUrl(query, orientation, page);
-  const firstIndex = seededIndex(`${query}:${orientation}:${page}`, keys.length);
-  for (let offset = 0; offset < keys.length; offset++) {
-    const key = keys[(firstIndex + offset) % keys.length];
-    const res = await fetch(url, { headers: { authorization: key } });
-    if (res.ok) return res;
-    if ([401, 403, 429].includes(res.status) || res.status >= 500) continue;
-    return res;
-  }
-  console.warn("[pexels-env] all configured keys are unavailable for this request");
-  return null;
-}
-
 async function loadActivePoolKeys(): Promise<{ configured: boolean; keys: PoolKey[] }> {
   try {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -155,15 +184,46 @@ async function loadActivePoolKeys(): Promise<{ configured: boolean; keys: PoolKe
       if (key.rate_limit_remaining == null || key.rate_limit_remaining >= 5) return true;
       return Number.isFinite(resetAt) && resetAt <= now;
     });
-    for (let i = keys.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [keys[i], keys[j]] = [keys[j], keys[i]];
-    }
+    keys.sort((a, b) => a.id.localeCompare(b.id));
     return { configured: allKeys.length > 0, keys };
   } catch (error) {
     console.error("[pexels-pool] pool lookup threw, falling back to env", error);
     return { configured: false, keys: [] };
   }
+}
+
+function stockRequestLimit(): number {
+  const configured = Number(process.env.STOCK_REQUEST_BUDGET ?? 120);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 120;
+}
+
+export function createPexelsStagePool(
+  keys: PoolKey[],
+  configured = true,
+  requestLimit = stockRequestLimit(),
+): PexelsStagePool {
+  return {
+    configured,
+    keys: [...keys],
+    initialCount: keys.length,
+    rejectedIds: new Set(),
+    unavailableIds: new Set(),
+    deactivationPromises: new Map(),
+    requestCount: 0,
+    requestLimit,
+  };
+}
+
+async function loadPexelsStagePool(): Promise<PexelsStagePool> {
+  const loaded = await loadActivePoolKeys();
+  if (loaded.configured) return createPexelsStagePool(loaded.keys, true);
+  const envKeys = parsePexelsKeys().map((api_key, index) => ({
+    id: `env-${index}`,
+    api_key,
+    rate_limit_remaining: null,
+    rate_limit_reset_at: null,
+  }));
+  return createPexelsStagePool(envKeys, false);
 }
 
 function pexelsResetAt(res: Response): string | null {
@@ -212,33 +272,81 @@ async function markKeyRateLimited(id: string, res: Response) {
   console.info("[pexels-pool] rotated rate-limited key", { keyId: id, resetAt });
 }
 
+export async function requestWithPexelsPool(
+  pool: PexelsStagePool,
+  url: string,
+  hooks: {
+    onDead?: (id: string, response: Response) => Promise<void>;
+    onRateLimited?: (id: string, response: Response) => Promise<void>;
+    onSuccess?: (id: string, response: Response) => Promise<void>;
+    onRequest?: () => void;
+  } = {},
+): Promise<Response | null> {
+  for (const key of pool.keys) {
+    if (pool.unavailableIds.has(key.id)) continue;
+    if (pool.requestCount >= pool.requestLimit) {
+      throw new StockRequestBudgetExceededError(pool.requestLimit);
+    }
+    pool.requestCount += 1;
+    hooks.onRequest?.();
+    const response = await fetch(url, { headers: { authorization: key.api_key } });
+    if (response.status === 401 || response.status === 403) {
+      const firstRejection = !pool.rejectedIds.has(key.id);
+      pool.unavailableIds.add(key.id);
+      if (firstRejection) {
+        pool.rejectedIds.add(key.id);
+        const write = hooks.onDead?.(key.id, response) ?? Promise.resolve();
+        pool.deactivationPromises.set(key.id, write);
+        await write;
+      }
+      if (pool.initialCount > 0 && pool.rejectedIds.size * 4 > pool.initialCount) {
+        throw new PexelsPoolDegradedError(pool.rejectedIds.size, pool.initialCount);
+      }
+      continue;
+    }
+    if (response.status === 429) {
+      pool.unavailableIds.add(key.id);
+      await hooks.onRateLimited?.(key.id, response);
+      continue;
+    }
+    if (response.ok) await hooks.onSuccess?.(key.id, response);
+    return response;
+  }
+  return null;
+}
+
 async function pexelsFetch(
   query: string,
   orientation: Orientation,
   page: number,
+  session?: StockSearchSession,
 ): Promise<Response | null> {
-  const pool = await loadActivePoolKeys();
-  if (!pool.configured) return pexelsFetchFromEnv(query, orientation, page);
+  const pool = session?.pexelsPool ?? (await loadPexelsStagePool());
   if (pool.keys.length === 0) {
-    console.warn("[pexels-pool] every active key is inside its rate-limit window");
+    console.warn("[pexels-pool] no usable key is available");
     return null;
   }
-  const url = buildPexelsUrl(query, orientation, page);
-  const response = await rotatePexelsKeysForRequest({
-    keys: pool.keys,
-    request: (apiKey) => fetch(url, { headers: { authorization: apiKey } }),
-    onDead: (id, rejected) => markKeyDead(id, `Pexels rejected key (HTTP ${rejected.status})`),
-    onRateLimited: markKeyRateLimited,
-    onSuccess: markKeyUsed,
+  const response = await requestWithPexelsPool(pool, buildPexelsUrl(query, orientation, page), {
+    onDead: pool.configured
+      ? (id, rejected) => markKeyDead(id, `Pexels rejected key (HTTP ${rejected.status})`)
+      : undefined,
+    onRateLimited: pool.configured ? markKeyRateLimited : undefined,
+    onSuccess: pool.configured ? markKeyUsed : undefined,
+    onRequest: () => {
+      if (!session) return;
+      const counts = session.usage.get("pexels") ?? { requests: 0, cacheHits: 0 };
+      counts.requests += 1;
+      session.usage.set("pexels", counts);
+    },
   });
-  if (!response) console.warn("[pexels-pool] no database key could serve this request");
+  if (!response) console.warn("[pexels-pool] no key could serve this request");
   return response;
 }
 
 export const pexelsProvider: StockProvider = {
   name: "pexels",
-  async search(query, orientation, page) {
-    const res = await pexelsFetch(query, orientation, page);
+  async search(query, orientation, page, session) {
+    const res = await pexelsFetch(query, orientation, page, session);
     if (!res) return [];
     if (!res.ok) {
       const detail = await res.text().catch(() => res.statusText);
@@ -313,17 +421,25 @@ export async function createStockSearchSession(
   orientation: Orientation,
   niche?: string | null,
 ): Promise<StockSearchSession> {
+  const pexelsPool = await loadPexelsStagePool();
   const session: StockSearchSession = {
     cache: new Map(),
     inflight: new Map(),
     pendingCache: new Map(),
     usage: new Map(),
+    pexelsPool,
+    nasaMetrics: {
+      searchRequests: 0,
+      assetCalls: 0,
+      metadataCalls: 0,
+      metadataJsonFetches: 0,
+      captionCalls: 0,
+      assetCacheHits: 0,
+      assetCacheMisses: 0,
+    },
   };
   const normalized = [...new Set(queries.map(normalizeStockQuery).filter(Boolean))];
-  const nasaQueries =
-    niche === "space"
-      ? [...new Set(normalized.flatMap((query) => [query, nasaFallbackQuery(query)]))]
-      : [];
+  const nasaQueries = niche === "space" ? [...new Set(normalized.flatMap(expandNasaQueries))] : [];
   const pexelsQueries = niche === "space" ? normalized.map(spaceBiasedPexelsQuery) : normalized;
   await Promise.all([
     prefetchCacheRows(session, "pexels", orientation, pexelsQueries),
@@ -367,19 +483,22 @@ export async function searchStockFootage(
   const normQuery = normalizeStockQuery(opts.query);
   if (!normQuery) return null;
   if (opts.niche === "space") {
-    const nasaQueries = [normQuery, nasaFallbackQuery(normQuery)].filter(
-      (query, index, all) => all.indexOf(query) === index,
-    );
-    for (const nasaQuery of nasaQueries) {
+    for (const nasaQuery of expandNasaQueries(normQuery)) {
       const result = await searchNasaWithCacheAndSelect({ ...opts, normQuery: nasaQuery });
       if (result) return result;
     }
-    return searchPexelsWithCacheAndSelect({
+    const pexels = await searchPexelsWithCacheAndSelect({
+      ...opts,
+      normQuery: spaceBiasedPexelsQuery(normQuery),
+    });
+    if (pexels) return pexels;
+    return searchPixabayWithCacheAndSelect({
       ...opts,
       normQuery: spaceBiasedPexelsQuery(normQuery),
     });
   }
-  return searchPexelsWithCacheAndSelect({ ...opts, normQuery });
+  const pexels = await searchPexelsWithCacheAndSelect({ ...opts, normQuery });
+  return pexels ?? searchPixabayWithCacheAndSelect({ ...opts, normQuery });
 }
 
 export async function searchUniqueStockFootage(
@@ -405,6 +524,51 @@ export async function searchUniqueStockFootage(
   return null;
 }
 
+export async function searchProviderCandidatePool(opts: {
+  provider: "pexels" | "pixabay" | "nasa";
+  query: string;
+  orientation: Orientation;
+  targetWidth: number;
+  seed?: string;
+  session: StockSearchSession;
+}): Promise<StockVideo[]> {
+  const normQuery = normalizeStockQuery(opts.query);
+  if (!normQuery) return [];
+
+  if (opts.provider === "nasa") {
+    const { searchNasaFootage } = await import("@/lib/nasaStock.server");
+    return getCachedOrSearch({
+      provider: "nasa",
+      query: normQuery,
+      orientation: "any",
+      session: opts.session,
+      search: () =>
+        searchNasaFootage(normQuery, {
+          targetWidth: opts.targetWidth,
+          seed: opts.seed,
+          metrics: opts.session.nasaMetrics,
+        }),
+    });
+  }
+
+  const provider =
+    opts.provider === "pexels"
+      ? pexelsProvider
+      : (await import("@/lib/pixabayStock.server")).pixabayProvider;
+  return getCachedOrSearch({
+    provider: opts.provider,
+    query: normQuery,
+    orientation: opts.orientation,
+    session: opts.session,
+    search: async () => {
+      const first = await provider.search(normQuery, opts.orientation, 1, opts.session);
+      if (first.length === 0) return [];
+      const second = await provider.search(normQuery, opts.orientation, 2, opts.session);
+      return dedupeVideos([...first, ...second]);
+    },
+  });
+}
+
 async function searchPexelsWithCacheAndSelect(
   opts: StockSearchOptions & { normQuery: string },
 ): Promise<StockSearchResult | null> {
@@ -414,9 +578,33 @@ async function searchPexelsWithCacheAndSelect(
     orientation: opts.orientation,
     session: opts.session,
     search: async () => {
-      const first = await pexelsProvider.search(opts.normQuery, opts.orientation, 1);
+      const first = await pexelsProvider.search(opts.normQuery, opts.orientation, 1, opts.session);
       if (first.length === 0) return [];
-      const second = await pexelsProvider.search(opts.normQuery, opts.orientation, 2);
+      const second = await pexelsProvider.search(opts.normQuery, opts.orientation, 2, opts.session);
+      return dedupeVideos([...first, ...second]);
+    },
+  });
+  return selectStockCandidate({ ...opts, results, requireMinDuration: false });
+}
+
+async function searchPixabayWithCacheAndSelect(
+  opts: StockSearchOptions & { normQuery: string },
+): Promise<StockSearchResult | null> {
+  const { pixabayProvider } = await import("@/lib/pixabayStock.server");
+  const results = await getCachedOrSearch({
+    provider: "pixabay",
+    query: opts.normQuery,
+    orientation: opts.orientation,
+    session: opts.session,
+    search: async () => {
+      const first = await pixabayProvider.search(opts.normQuery, opts.orientation, 1, opts.session);
+      if (first.length === 0) return [];
+      const second = await pixabayProvider.search(
+        opts.normQuery,
+        opts.orientation,
+        2,
+        opts.session,
+      );
       return dedupeVideos([...first, ...second]);
     },
   });
@@ -433,7 +621,11 @@ async function searchNasaWithCacheAndSelect(
     orientation: "any",
     session: opts.session,
     search: () =>
-      searchNasaFootage(opts.normQuery, { targetWidth: opts.targetWidth, seed: opts.seed }),
+      searchNasaFootage(opts.normQuery, {
+        targetWidth: opts.targetWidth,
+        seed: opts.seed,
+        metrics: opts.session?.nasaMetrics,
+      }),
   }).catch((error) => {
     console.warn("[nasa-stock] search failed", {
       query: opts.normQuery,
@@ -489,7 +681,9 @@ async function getCachedOrSearch(opts: {
   } finally {
     opts.session?.inflight.delete(key);
   }
-  if (ownsSearch) await recordUsage(opts.provider, false, opts.session);
+  if (ownsSearch && opts.provider === "nasa") {
+    await recordUsage(opts.provider, false, opts.session);
+  }
   const row = {
     provider: opts.provider,
     query: opts.query,
@@ -507,6 +701,17 @@ async function getCachedOrSearch(opts: {
     });
   }
   return results;
+}
+
+export async function prefetchStockProviderCache(
+  session: StockSearchSession,
+  provider: "pexels" | "pixabay" | "nasa",
+  orientation: Orientation | "any",
+  queries: string[],
+): Promise<void> {
+  await prefetchCacheRows(session, provider, orientation, [
+    ...new Set(queries.map(normalizeStockQuery).filter(Boolean)),
+  ]);
 }
 
 async function prefetchCacheRows(
@@ -593,15 +798,39 @@ export function selectStockCandidate(opts: {
   };
 }
 
-function nasaInPoint(video: StockVideo, requiredDuration: number, seed?: string): number {
-  if (video.provider !== "nasa" || video.duration_known === false) return 0;
-  const usableStart = video.duration_sec - requiredDuration - NASA_TAIL_MARGIN_SECONDS;
-  if (usableStart < NASA_IN_POINT_BUCKET_SECONDS) return 0;
-  const buckets = Math.floor(usableStart / NASA_IN_POINT_BUCKET_SECONDS) + 1;
-  return (
-    seededIndex(`${seed ?? "nasa"}:${video.provider_clip_id}:in-point`, buckets) *
-    NASA_IN_POINT_BUCKET_SECONDS
+export function buildNasaSourceWindows(
+  video: StockVideo,
+  requiredDuration: number,
+  seed?: string,
+  maxWindows = 6,
+): number[] {
+  if (video.provider !== "nasa" || video.duration_known === false) return [0];
+  const duration = Math.max(0, video.duration_sec);
+  const clipDuration = Math.max(1, requiredDuration);
+  const margin = duration * 0.1;
+  const firstStart =
+    Math.ceil(margin / NASA_IN_POINT_BUCKET_SECONDS) * NASA_IN_POINT_BUCKET_SECONDS;
+  const lastStart = duration - margin - clipDuration;
+  if (lastStart < firstStart) return duration >= clipDuration ? [0] : [];
+
+  const step =
+    Math.max(1, Math.ceil(clipDuration / NASA_IN_POINT_BUCKET_SECONDS)) *
+    NASA_IN_POINT_BUCKET_SECONDS;
+  const starts: number[] = [];
+  for (let start = firstStart; start <= lastStart + 0.001; start += step) {
+    starts.push(start);
+  }
+  if (starts.length === 0) return [0];
+  const offset = seededIndex(
+    `${seed ?? "nasa"}:${video.provider_clip_id}:window-order`,
+    starts.length,
   );
+  const ordered = [...starts.slice(offset), ...starts.slice(0, offset)];
+  return ordered.slice(0, Math.max(1, maxWindows));
+}
+
+function nasaInPoint(video: StockVideo, requiredDuration: number, seed?: string): number {
+  return buildNasaSourceWindows(video, requiredDuration, seed, 1)[0] ?? 0;
 }
 
 function normalizeStockQuery(query: string): string {
@@ -612,13 +841,45 @@ function spaceBiasedPexelsQuery(query: string): string {
   return normalizeStockQuery(`${query} ${SPACE_THEME_TERMS}`);
 }
 
-function nasaFallbackQuery(query: string): string {
-  if (/\b(planet|world|solar|orbit|star)\b/.test(query)) return "planet solar system";
-  if (/\b(galaxy|milky|deep space|cosmic)\b/.test(query)) return "deep space galaxy";
-  if (/\b(astronaut|rocket|launch|spacecraft|telescope)\b/.test(query)) {
-    return "space mission science";
-  }
-  return "space astronomy";
+const QUERY_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "as",
+  "at",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "of",
+  "on",
+  "the",
+  "to",
+  "with",
+]);
+
+export function stockQueryTokens(query: string): string[] {
+  return normalizeStockQuery(query)
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 1 && !QUERY_STOP_WORDS.has(token));
+}
+
+export function expandNasaQueries(query: string): string[] {
+  const normalized = normalizeStockQuery(query);
+  const tokens = stockQueryTokens(normalized);
+  if (tokens.length === 0) return normalized ? [normalized] : [];
+  const variants = [
+    normalized,
+    tokens.slice(0, 4).join(" "),
+    tokens.slice(-4).join(" "),
+    [...tokens]
+      .sort((a, b) => b.length - a.length || a.localeCompare(b))
+      .slice(0, 3)
+      .join(" "),
+  ];
+  return variants.filter((value, index) => value && variants.indexOf(value) === index);
 }
 
 function cacheKey(provider: string, query: string, orientation: string): string {

@@ -12,6 +12,7 @@ import {
   setUserPlanTier,
   setUserRole,
   deactivatePexelsKey,
+  pruneNeverSucceededPexelsKeys,
 } from "@/lib/admin.functions";
 import { revalidateAllPexelsKeys, uploadPexelsKeysResilient } from "@/lib/admin-pexels.functions";
 import { supabase } from "@/integrations/supabase/client";
@@ -37,7 +38,7 @@ import {
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "sonner";
-import { ArrowLeft, Loader2, RefreshCw, Upload, ShieldCheck } from "lucide-react";
+import { ArrowLeft, Loader2, RefreshCw, Upload, ShieldCheck, Trash2 } from "lucide-react";
 
 export const Route = createFileRoute("/_authenticated/admin")({
   head: () => ({
@@ -144,6 +145,31 @@ function OverviewTab() {
         <Stat label="Active keys" value={data.keyPool.active} />
         <Stat label="Keys with errors" value={data.keyPool.withError} />
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Stock providers</CardTitle>
+          <CardDescription>
+            Server-side provider availability for new matching runs.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 sm:grid-cols-3">
+          {data.providers.map((provider) => (
+            <div
+              key={provider.id}
+              className="flex items-center justify-between gap-3 rounded-md border p-3"
+            >
+              <div className="min-w-0">
+                <p className="font-medium">{provider.name}</p>
+                <p className="text-xs text-muted-foreground">{provider.detail}</p>
+              </div>
+              <Badge variant={provider.configured ? "default" : "outline"}>
+                {provider.configured ? "Active" : "Inactive"}
+              </Badge>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
@@ -490,6 +516,7 @@ function KeysTab() {
   const upload = useServerFn(uploadPexelsKeysResilient);
   const revalidate = useServerFn(revalidateAllPexelsKeys);
   const deactivate = useServerFn(deactivatePexelsKey);
+  const pruneNeverSucceeded = useServerFn(pruneNeverSucceededPexelsKeys);
 
   // Phase 1: preview state
   const [pendingCsv, setPendingCsv] = useState<string | null>(null);
@@ -502,6 +529,7 @@ function KeysTab() {
   // Phase 2: upload state
   const [uploading, setUploading] = useState(false);
   const [revalidating, setRevalidating] = useState(false);
+  const [pruning, setPruning] = useState(false);
   const [report, setReport] = useState<Awaited<ReturnType<typeof upload>> | null>(null);
 
   const { data, isPending, error } = useQuery({
@@ -723,28 +751,69 @@ function KeysTab() {
         <CardHeader>
           <div className="flex items-center justify-between gap-3">
             <CardTitle className="text-base">Key pool</CardTitle>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={revalidating || isPending || !data?.length}
-              onClick={async () => {
-                setRevalidating(true);
-                try {
-                  const result = await revalidate({});
-                  await qc.invalidateQueries({ queryKey: ["admin-pexels-keys"] });
-                  toast.success(
-                    `${result.active} active, ${result.inactive} inactive, ${result.unverified} unverified`,
-                  );
-                } catch (e) {
-                  toast.error(e instanceof Error ? e.message : "Revalidation failed");
-                } finally {
-                  setRevalidating(false);
-                }
-              }}
-            >
-              <RefreshCw className={`mr-2 h-4 w-4 ${revalidating ? "animate-spin" : ""}`} />
-              Revalidate all keys
-            </Button>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={pruning || isPending || !data?.length}
+                onClick={async () => {
+                  if (
+                    !window.confirm(
+                      "Permanently delete every never-succeeded Pexels key rejected with HTTP 401 or 403?",
+                    )
+                  ) {
+                    return;
+                  }
+                  setPruning(true);
+                  try {
+                    const result = await pruneNeverSucceeded({});
+                    await Promise.all([
+                      qc.invalidateQueries({ queryKey: ["admin-pexels-keys"] }),
+                      qc.invalidateQueries({ queryKey: ["admin-overview"] }),
+                    ]);
+                    toast.success(
+                      "Removed " +
+                        result.deleted +
+                        " never-succeeded key" +
+                        (result.deleted === 1 ? "" : "s"),
+                    );
+                  } catch (e) {
+                    toast.error(e instanceof Error ? e.message : "Pruning failed");
+                  } finally {
+                    setPruning(false);
+                  }
+                }}
+              >
+                {pruning ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Trash2 className="mr-2 h-4 w-4" />
+                )}
+                Prune rejected keys
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={revalidating || isPending || !data?.length}
+                onClick={async () => {
+                  setRevalidating(true);
+                  try {
+                    const result = await revalidate({});
+                    await qc.invalidateQueries({ queryKey: ["admin-pexels-keys"] });
+                    toast.success(
+                      `${result.active} active, ${result.inactive} inactive, ${result.unverified} unverified`,
+                    );
+                  } catch (e) {
+                    toast.error(e instanceof Error ? e.message : "Revalidation failed");
+                  } finally {
+                    setRevalidating(false);
+                  }
+                }}
+              >
+                <RefreshCw className={`mr-2 h-4 w-4 ${revalidating ? "animate-spin" : ""}`} />
+                Revalidate all keys
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="overflow-x-auto">
@@ -776,9 +845,15 @@ function KeysTab() {
                   <TableRow key={k.id}>
                     <TableCell className="font-mono">{k.api_key}</TableCell>
                     <TableCell>
-                      <Badge variant={k.is_active ? "default" : "destructive"}>
-                        {k.is_active ? "active" : "inactive"}
-                      </Badge>
+                      <div className="flex flex-wrap gap-2">
+                        <Badge variant={k.is_active ? "default" : "destructive"}>
+                          {k.is_active ? "active" : "inactive"}
+                        </Badge>
+                        {Number(k.request_count) === 0 &&
+                          /HTTP (?:401|403)\b/i.test(k.last_error ?? "") && (
+                            <Badge variant="outline">never succeeded</Badge>
+                          )}
+                      </div>
                     </TableCell>
                     <TableCell className="text-right">{k.request_count}</TableCell>
                     <TableCell className="text-right">

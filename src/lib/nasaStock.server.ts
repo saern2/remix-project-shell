@@ -1,15 +1,27 @@
-import type { StockVideo, StockVideoFile } from "@/lib/stock.server";
+import type { NasaRequestMetrics, StockVideo, StockVideoFile } from "@/lib/stock.server";
 
 const NASA_SEARCH_URL = "https://images-api.nasa.gov/search";
 const NASA_ASSET_URL = "https://images-api.nasa.gov/asset";
 const NASA_METADATA_URL = "https://images-api.nasa.gov/metadata";
-const NASA_PAGE_SIZE = 50;
-const NASA_RESOLVE_CONCURRENCY = 5;
+const NASA_CAPTIONS_URL = "https://images-api.nasa.gov/captions";
+const NASA_PAGE_SIZE = 100;
+const NASA_SEARCH_PAGES = 3;
+const NASA_RESOLVE_LIMIT = 12;
+const NASA_RESOLVE_CONCURRENCY = 2;
 const NASA_ASSET_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const NASA_RELEVANCE_FLOOR = 0.18;
 export const NASA_UNKNOWN_DURATION_SECONDS = 60 * 60;
 
+type NasaSearchData = {
+  nasa_id?: string;
+  title?: string;
+  description?: string;
+  keywords?: string[];
+  center?: string;
+};
+
 type NasaSearchItem = {
-  data?: Array<{ nasa_id?: string; title?: string }>;
+  data?: NasaSearchData[];
   links?: NasaLink[];
 };
 
@@ -31,7 +43,7 @@ type NasaAssetResponse = {
   collection?: { items?: Array<{ href?: string }> };
 };
 
-type NasaMetadataLocationResponse = { location?: string };
+type NasaLocationResponse = { location?: string };
 type NasaMetadata = Record<string, unknown>;
 type NasaTier = "small" | "medium" | "large" | "orig";
 
@@ -51,26 +63,48 @@ const NASA_TIER_SIZE: Record<NasaTier, { width: number; height: number }> = {
   orig: { width: 3840, height: 2160 },
 };
 
+const TALKING_HEAD_TERMS = [
+  "this week @nasa",
+  "asknasa",
+  "briefing",
+  "press conference",
+  "announcement",
+  "interview",
+  "behind the spacecraft",
+  "webcast",
+  "panel",
+];
+
+const VISUAL_CONTENT_TERMS = [
+  "simulation",
+  "visualization",
+  "animation",
+  "flyover",
+  "timelapse",
+  "concept",
+];
+
 export async function searchNasaFootage(
   query: string,
-  opts: { targetWidth: number; seed?: string },
+  opts: { targetWidth: number; seed?: string; metrics?: NasaRequestMetrics },
 ): Promise<StockVideo[]> {
   const normalizedQuery = query.trim();
   if (!normalizedQuery) return [];
 
-  const firstPage = await fetchNasaSearchPage(normalizedQuery, 1);
-  const totalHits = Number(firstPage.collection?.metadata?.total_hits ?? 0);
-  const maxPage = Math.max(1, Math.ceil(totalHits / NASA_PAGE_SIZE));
-  const seededPage = nasaPageForSeed(opts.seed ?? normalizedQuery, maxPage);
-  const extraPage = seededPage > 1 ? await fetchNasaSearchPage(normalizedQuery, seededPage) : null;
-
-  const items = dedupeSearchItems(
-    extraPage?.collection?.items ?? firstPage.collection?.items ?? [],
+  const pages = await Promise.all(
+    Array.from({ length: NASA_SEARCH_PAGES }, (_, index) =>
+      fetchNasaSearchPage(normalizedQuery, index + 1, opts.metrics),
+    ),
   );
-  if (items.length === 0) return [];
+  const allItems = dedupeSearchItems(pages.flatMap((page) => page.collection?.items ?? []));
+  const rankedItems = rankNasaSearchItems(normalizedQuery, allItems, opts.seed).slice(
+    0,
+    NASA_RESOLVE_LIMIT,
+  );
+  if (rankedItems.length === 0) return [];
 
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const nasaIds = items
+  const nasaIds = rankedItems
     .map((item) => item.data?.[0]?.nasa_id?.trim())
     .filter((id): id is string => !!id);
   const { data: cachedRows, error: cacheError } = await supabaseAdmin
@@ -82,7 +116,7 @@ export async function searchNasaFootage(
   }
 
   const cache = new Map(((cachedRows ?? []) as CachedNasaAsset[]).map((row) => [row.nasa_id, row]));
-  const resolved = new Array<StockVideo | null>(items.length).fill(null);
+  const resolved = new Array<StockVideo | null>(rankedItems.length).fill(null);
   const cacheWrites: Array<{
     nasa_id: string;
     files: never;
@@ -93,16 +127,19 @@ export async function searchNasaFootage(
   }> = [];
 
   await asyncPool(
-    items.map((item, index) => ({ item, index })),
+    rankedItems.map((item, index) => ({ item, index })),
     NASA_RESOLVE_CONCURRENCY,
     async ({ item, index }) => {
-      const nasaId = item.data?.[0]?.nasa_id?.trim();
+      const data = item.data?.[0] ?? {};
+      const nasaId = data.nasa_id?.trim();
       if (!nasaId) return;
       const thumbnail = selectThumbnailUrl(item.links);
       const cached = cache.get(nasaId);
+      const hasCaptions = await fetchNasaCaptionSignal(nasaId, opts.metrics);
       if (cached && Date.now() - new Date(cached.cached_at).getTime() < NASA_ASSET_CACHE_TTL_MS) {
         const files = parseCachedFiles(cached.files);
         if (files.length > 0) {
+          incrementMetric(opts.metrics, "assetCacheHits");
           resolved[index] = toStockVideo({
             nasaId,
             files,
@@ -110,15 +147,18 @@ export async function searchNasaFootage(
             durationKnown: cached.duration_known,
             thumbnail: cached.thumbnail_url ?? thumbnail,
             targetWidth: opts.targetWidth,
+            data,
+            hasCaptions,
           });
           return;
         }
       }
+      incrementMetric(opts.metrics, "assetCacheMisses");
 
       try {
         const [files, metadata] = await Promise.all([
-          fetchNasaFiles(nasaId),
-          fetchNasaMetadata(nasaId).catch((error) => {
+          fetchNasaFiles(nasaId, opts.metrics),
+          fetchNasaMetadata(nasaId, opts.metrics).catch((error) => {
             console.warn("[nasa-stock] metadata unavailable; keeping video with unknown duration", {
               nasaId,
               error: error instanceof Error ? error.message : String(error),
@@ -135,6 +175,8 @@ export async function searchNasaFootage(
           durationKnown: duration !== null,
           thumbnail,
           targetWidth: opts.targetWidth,
+          data,
+          hasCaptions,
         });
         cacheWrites.push({
           nasa_id: nasaId,
@@ -160,16 +202,47 @@ export async function searchNasaFootage(
     if (error) console.warn("[nasa-stock] asset cache write failed", { error: error.message });
   }
 
-  return resolved.filter((video): video is StockVideo => video !== null);
+  const candidates = resolved.filter((video): video is StockVideo => video !== null);
+  const scored = candidates
+    .map((video) => ({
+      video,
+      relevance: nasaRelevanceScore(normalizedQuery, video),
+      rankScore: scoreNasaCandidate(normalizedQuery, video),
+    }))
+    .sort(
+      (a, b) =>
+        b.rankScore - a.rankScore ||
+        seededTieBreak(opts.seed, a.video.provider_clip_id, b.video.provider_clip_id),
+    );
+  const accepted = scored.filter(({ relevance }) => relevance >= NASA_RELEVANCE_FLOOR);
+  const relevanceValues = scored.map(({ relevance }) => relevance).sort((a, b) => a - b);
+  console.info("[nasa-stock] relevance", {
+    query: normalizedQuery,
+    resolved: scored.length,
+    accepted: accepted.length,
+    rejected: scored.length - accepted.length,
+    min: roundScore(relevanceValues[0]),
+    median: roundScore(relevanceValues[Math.floor(relevanceValues.length / 2)]),
+    max: roundScore(relevanceValues.at(-1)),
+    talkingHeadPenalized: scored.filter(({ video }) => hasTalkingHeadSignals(video)).length,
+  });
+  return accepted.map(({ video }) => video);
 }
 
-async function fetchNasaSearchPage(query: string, page: number): Promise<NasaSearchResponse> {
+async function fetchNasaSearchPage(
+  query: string,
+  page: number,
+  metrics?: NasaRequestMetrics,
+): Promise<NasaSearchResponse> {
+  const keywords = queryTokens(query).slice(0, 5).join(",");
   const params = new URLSearchParams({
     q: query,
     media_type: "video",
     page_size: String(NASA_PAGE_SIZE),
     page: String(page),
   });
+  if (keywords) params.set("keywords", keywords);
+  incrementMetric(metrics, "searchRequests");
   const res = await fetch(`${NASA_SEARCH_URL}?${params.toString()}`);
   if (!res.ok) {
     throw new Error(`NASA search failed (${res.status}): ${await safeResponseText(res)}`);
@@ -182,6 +255,74 @@ export function nasaPageForSeed(seed: string, maxPage: number): number {
   return 1 + (stableHash(seed) % boundedPages);
 }
 
+export function nasaRelevanceScore(query: string, video: StockVideo): number {
+  const queryTerms = new Set(queryTokens(query));
+  if (queryTerms.size === 0) return 0;
+  const metadata = nasaMetadataText(video);
+  const metadataTerms = new Set(queryTokens(metadata));
+  const overlap = [...queryTerms].filter((term) => metadataTerms.has(term)).length;
+  let score = overlap / queryTerms.size;
+  if (metadata.toLowerCase().includes(query.trim().toLowerCase())) score += 0.2;
+  return Math.max(0, Math.min(1, score));
+}
+
+export function scoreNasaCandidate(query: string, video: StockVideo): number {
+  let score = nasaRelevanceScore(query, video);
+  const normalizedMetadata = nasaMetadataText(video).toLowerCase();
+  if (hasTalkingHeadSignals(video)) score -= 0.35;
+  if (video.has_captions) score -= 0.12;
+  if (
+    VISUAL_CONTENT_TERMS.some((term) => normalizedMetadata.includes(term)) ||
+    /^gsfc_.*_m\d+_/i.test(video.provider_clip_id)
+  ) {
+    score += 0.25;
+  }
+  return Math.max(0, Math.min(1, score));
+}
+
+export function rankNasaSearchItems(
+  query: string,
+  items: NasaSearchItem[],
+  seed?: string,
+): NasaSearchItem[] {
+  return [...items].sort((a, b) => {
+    const scoreDiff = scoreSearchData(query, b.data?.[0]) - scoreSearchData(query, a.data?.[0]);
+    if (scoreDiff !== 0) return scoreDiff;
+    return seededTieBreak(seed, a.data?.[0]?.nasa_id ?? "", b.data?.[0]?.nasa_id ?? "");
+  });
+}
+
+function nasaMetadataText(video: StockVideo): string {
+  return [video.title ?? "", video.description ?? "", ...(video.keywords ?? [])].join(" ");
+}
+
+function hasTalkingHeadSignals(video: StockVideo): boolean {
+  const metadata = nasaMetadataText(video).toLowerCase();
+  return TALKING_HEAD_TERMS.some((term) => metadata.includes(term));
+}
+
+function seededTieBreak(seed: string | undefined, a: string, b: string): number {
+  if (!seed) return a.localeCompare(b);
+  return stableHash([seed, a].join(":")) - stableHash([seed, b].join(":"));
+}
+
+function scoreSearchData(query: string, data?: NasaSearchData): number {
+  if (!data) return 0;
+  const video: StockVideo = {
+    provider: "nasa",
+    provider_clip_id: data.nasa_id ?? "",
+    duration_sec: 0,
+    width: 0,
+    height: 0,
+    thumbnail_url: null,
+    files: [],
+    title: data.title,
+    description: data.description,
+    keywords: data.keywords,
+  };
+  return scoreNasaCandidate(query, video);
+}
+
 function dedupeSearchItems(items: NasaSearchItem[]): NasaSearchItem[] {
   const seen = new Set<string>();
   return items.filter((item) => {
@@ -192,7 +333,11 @@ function dedupeSearchItems(items: NasaSearchItem[]): NasaSearchItem[] {
   });
 }
 
-async function fetchNasaFiles(nasaId: string): Promise<StockVideoFile[]> {
+async function fetchNasaFiles(
+  nasaId: string,
+  metrics?: NasaRequestMetrics,
+): Promise<StockVideoFile[]> {
+  incrementMetric(metrics, "assetCalls");
   const res = await fetch(`${NASA_ASSET_URL}/${encodeURIComponent(nasaId)}`);
   if (!res.ok) {
     throw new Error(`NASA asset lookup failed (${res.status}): ${await safeResponseText(res)}`);
@@ -216,13 +361,18 @@ export function nasaFileFromUrl(url: string): StockVideoFile {
   return { url: normalizeNasaAssetUrl(url), ...dimensions };
 }
 
-async function fetchNasaMetadata(nasaId: string): Promise<NasaMetadata> {
+async function fetchNasaMetadata(
+  nasaId: string,
+  metrics?: NasaRequestMetrics,
+): Promise<NasaMetadata> {
+  incrementMetric(metrics, "metadataCalls");
   const res = await fetch(`${NASA_METADATA_URL}/${encodeURIComponent(nasaId)}`);
   if (!res.ok) {
     throw new Error(`NASA metadata lookup failed (${res.status}): ${await safeResponseText(res)}`);
   }
-  const locationJson = (await res.json()) as NasaMetadataLocationResponse;
+  const locationJson = (await res.json()) as NasaLocationResponse;
   if (!locationJson.location) throw new Error("NASA metadata response did not include a location.");
+  incrementMetric(metrics, "metadataJsonFetches");
   const metadataRes = await fetch(normalizeNasaAssetUrl(locationJson.location));
   if (!metadataRes.ok) {
     throw new Error(
@@ -230,6 +380,25 @@ async function fetchNasaMetadata(nasaId: string): Promise<NasaMetadata> {
     );
   }
   return (await metadataRes.json()) as NasaMetadata;
+}
+
+async function fetchNasaCaptionSignal(
+  nasaId: string,
+  metrics?: NasaRequestMetrics,
+): Promise<boolean> {
+  incrementMetric(metrics, "captionCalls");
+  const res = await fetch(`${NASA_CAPTIONS_URL}/${encodeURIComponent(nasaId)}`);
+  if (res.status === 404) return false;
+  if (!res.ok) return false;
+  const payload = (await res.json().catch(() => null)) as NasaLocationResponse | null;
+  return typeof payload?.location === "string" && /\.(?:vtt|srt)(?:$|\?)/i.test(payload.location);
+}
+
+function incrementMetric(
+  metrics: NasaRequestMetrics | undefined,
+  key: keyof NasaRequestMetrics,
+): void {
+  if (metrics) metrics[key] += 1;
 }
 
 export function findNasaDurationSeconds(metadata: NasaMetadata): number | null {
@@ -273,6 +442,8 @@ function toStockVideo(opts: {
   durationKnown: boolean;
   thumbnail: string | null;
   targetWidth: number;
+  data: NasaSearchData;
+  hasCaptions: boolean;
 }): StockVideo {
   const files = [...opts.files].sort(
     (a, b) => fileWidthScore(a.width, opts.targetWidth) - fileWidthScore(b.width, opts.targetWidth),
@@ -286,6 +457,10 @@ function toStockVideo(opts: {
     height: files[0].height,
     thumbnail_url: opts.thumbnail,
     files,
+    title: opts.data.title,
+    description: opts.data.description,
+    keywords: opts.data.keywords,
+    has_captions: opts.hasCaptions,
   };
 }
 
@@ -320,6 +495,18 @@ function normalizeNasaAssetUrl(url: string): string {
   return new URL(
     url.replace(/^http:\/\/images-assets\.nasa\.gov/i, "https://images-assets.nasa.gov"),
   ).href;
+}
+
+function queryTokens(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 1);
+}
+
+function roundScore(score: number | undefined): number | null {
+  return score == null ? null : Math.round(score * 1000) / 1000;
 }
 
 function stableHash(input: string): number {

@@ -482,7 +482,16 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       .eq("id", data.jobId)
       .maybeSingle();
     if (jobErr) throw new Error(jobErr.message);
-    if (!job) throw new Error("Render job not found.");
+    if (!job) {
+      return {
+        status: "not_found",
+        progress_pct: 0,
+        output_url: null,
+        error: "This render job no longer exists.",
+        chunks_total: null,
+        chunks_completed: null,
+      };
+    }
     const projectUserId = (job as unknown as { projects: { user_id: string } }).projects.user_id;
     if (projectUserId !== userId) throw new Error("Forbidden.");
 
