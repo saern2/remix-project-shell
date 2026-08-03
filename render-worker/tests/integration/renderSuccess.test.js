@@ -47,7 +47,7 @@ const { assertVideoProperties, assertFileNonEmpty } = require('../helpers/ffprob
 function clipUrl(filename) {
   const p = path.join(FIXTURES, filename);
   if (!fs.existsSync(p)) {
-    throw new Error(`Fixture missing: ${p} — run: bash scripts/generate_test_clips.sh`);
+    throw new Error(`Fixture missing: ${p} â€” run: bash scripts/generate_test_clips.sh`);
   }
   return `file://${p}`;
 }
@@ -73,7 +73,7 @@ async function pollUntilDone(app, jobId, timeoutMs = POLL_TIMEOUT_MS) {
 }
 
 describe('Integration: Full render with mismatched-resolution inputs', () => {
-  let app, queue, worker;
+  let app, queue, workers;
 
   beforeAll(async () => {
     await fsp.mkdir(process.env.TEMP_DIR, { recursive: true });
@@ -82,14 +82,14 @@ describe('Integration: Full render with mismatched-resolution inputs', () => {
     // Import after env is set
     const queueModule = require('../../src/queue');
     queue = queueModule.getQueue();
-    worker = queueModule.startWorker();
+    workers = queueModule.startWorker();
 
     // Import app (server.js exports it, but we don't call listen())
     app = require('../../src/server');
   });
 
   afterAll(async () => {
-    if (worker) await worker.close();
+    if (workers) await Promise.all(workers.map((worker) => worker.close()));
     if (queue) await queue.close();
     // Clean up output files
     try { await fsp.rm(process.env.OUTPUT_DIR, { recursive: true, force: true }); } catch { /* ignore */ }

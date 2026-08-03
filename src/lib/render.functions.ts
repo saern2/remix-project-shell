@@ -257,7 +257,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           let thumbnailUrl: string | null = null;
 
           if (cached) {
-            // Reuse persisted assignment — no API call needed
+            // Reuse persisted assignment â€” no API call needed
             url = cached.clip_url;
             provider = cached.provider;
             providerClipId = cached.provider_clip_id;
@@ -497,7 +497,7 @@ export const pollRenderJob = createServerFn({ method: "POST" })
 
     // Short-circuit terminal states.
     // For completed jobs, always re-sign the playback URL from the known storage
-    // path rather than returning whatever is stored — the stored value may be a
+    // path rather than returning whatever is stored â€” the stored value may be a
     // pre-signed upload URL (written by the worker) or an expired playback URL.
     if (job.status === "completed" || job.status === "failed") {
       let outputUrl = job.output_url;
@@ -638,7 +638,7 @@ const ACTIVE_RENDER_STATUSES = [
 
 /**
  * Cancel a queued or active render job.
- * - Verifies ownership via render_jobs → projects join
+ * - Verifies ownership via render_jobs â†’ projects join
  * - Calls POST /jobs/:id/cancel on the render worker
  * - Updates render_jobs.status = 'cancelled' (only if still active)
  * - Updates projects.status = 'failed', error_message = 'Render was cancelled.'
@@ -666,8 +666,9 @@ export const cancelRenderJob = createServerFn({ method: "POST" })
       headers: { "X-Api-Key": workerKey() },
     });
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`Worker cancel failed (${res.status}): ${text.slice(0, 200)}`);
+      throw new Error(
+        "The render could not be cancelled. It may still be running; please try again.",
+      );
     }
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");

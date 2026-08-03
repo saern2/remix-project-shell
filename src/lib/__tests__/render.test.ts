@@ -4,18 +4,18 @@
  * Requirements: 3.9, 3.10
  *
  * Strategy: mock `createServerFn` to capture the handler function, then call
- * it directly with a mocked `{ data, context }` object — bypassing the
+ * it directly with a mocked `{ data, context }` object â€” bypassing the
  * TanStack Start runtime entirely.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// ─── Module-level captured handler ───────────────────────────────────────────
+// â”€â”€â”€ Module-level captured handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // We capture it via the mocked createServerFn chain before importing the module.
 
 let capturedHandler: ((args: { data: { jobId: string }; context: { supabase: unknown; userId: string } }) => Promise<unknown>) | null = null;
 
-// ─── Mock @tanstack/react-start ───────────────────────────────────────────────
+// â”€â”€â”€ Mock @tanstack/react-start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 vi.mock("@tanstack/react-start", () => {
   const builder = {
     middleware: () => builder,
@@ -30,15 +30,15 @@ vi.mock("@tanstack/react-start", () => {
   };
 });
 
-// ─── Mock requireSupabaseAuth ─────────────────────────────────────────────────
+// â”€â”€â”€ Mock requireSupabaseAuth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 vi.mock("@/integrations/supabase/auth-middleware", () => ({
   requireSupabaseAuth: {},
 }));
 
-// ─── Mock zod (inputValidator is no-op in our mock, so this is just insurance) ─
+// â”€â”€â”€ Mock zod (inputValidator is no-op in our mock, so this is just insurance) â”€
 // zod is a real dep and doesn't need mocking.
 
-// ─── supabaseAdmin mock (dynamic import) ─────────────────────────────────────
+// â”€â”€â”€ supabaseAdmin mock (dynamic import) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const mockRenderJobsUpdate = vi.fn();
 const mockProjectsUpdate = vi.fn();
 
@@ -66,17 +66,17 @@ vi.mock("@/integrations/supabase/client.server", () => ({
   },
 }));
 
-// ─── Set env vars for workerBase() / workerKey() ─────────────────────────────
+// â”€â”€â”€ Set env vars for workerBase() / workerKey() â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const WORKER_URL = "https://worker.example.com";
 const WORKER_KEY = "test-api-key";
 
-// ─── Load the module under test AFTER mocks are set up ───────────────────────
+// â”€â”€â”€ Load the module under test AFTER mocks are set up â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Dynamic import is used so module is loaded after vi.mock hoisting is complete.
 // We re-import each time via resetModules in beforeEach if needed; here a single
 // import is enough since the captured handler is module-scoped.
 import("../render.functions"); // trigger module load; handler capture happens at import time
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 describe("cancelRenderJob handler", () => {
   const JOB_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -118,10 +118,10 @@ describe("cancelRenderJob handler", () => {
     };
   }
 
-  /** Helper — runs the captured handler. Throws if handler was not captured. */
+  /** Helper â€” runs the captured handler. Throws if handler was not captured. */
   async function callHandler(data: { jobId: string }, context: ReturnType<typeof makeContext>) {
     if (!capturedHandler) {
-      throw new Error("Handler was not captured — check createServerFn mock");
+      throw new Error("Handler was not captured â€” check createServerFn mock");
     }
     return capturedHandler({ data, context });
   }
@@ -137,7 +137,7 @@ describe("cancelRenderJob handler", () => {
     delete process.env.RENDER_WORKER_API_KEY;
   });
 
-  // ─── Test 1: updates render_jobs.status to 'cancelled' on worker 200 ─────
+  // â”€â”€â”€ Test 1: updates render_jobs.status to 'cancelled' on worker 200 â”€â”€â”€â”€â”€
 
   it("updates render_jobs.status to 'cancelled' when worker returns 200", async () => {
     // Make sure module is loaded and handler captured
@@ -163,7 +163,7 @@ describe("cancelRenderJob handler", () => {
     expect(renderJobsUpdateArg.completed_at).toBeDefined();
   });
 
-  // ─── Test 2: updates projects.status to 'failed' with correct error_message
+  // â”€â”€â”€ Test 2: updates projects.status to 'failed' with correct error_message
 
   it("updates projects.status to 'failed' with error_message 'Render was cancelled.'", async () => {
     await import("../render.functions");
@@ -185,7 +185,7 @@ describe("cancelRenderJob handler", () => {
     expect(projectsUpdateArg.error_message).toBe("Render was cancelled.");
   });
 
-  // ─── Test 3: throws on non-200 worker response ────────────────────────────
+  // â”€â”€â”€ Test 3: throws on non-200 worker response â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   it("throws when the worker returns a non-200 response", async () => {
     await import("../render.functions");
@@ -198,7 +198,7 @@ describe("cancelRenderJob handler", () => {
     } as unknown as Response);
 
     await expect(callHandler({ jobId: JOB_ID }, makeContext())).rejects.toThrow(
-      /Worker cancel failed \(503\)/,
+      /The render could not be cancelled/,
     );
 
     // DB should NOT be updated on worker failure
@@ -206,7 +206,7 @@ describe("cancelRenderJob handler", () => {
     expect(mockProjectsUpdate).not.toHaveBeenCalled();
   });
 
-  // ─── Test 4: throws "Forbidden." when user_id does not match ──────────────
+  // â”€â”€â”€ Test 4: throws "Forbidden." when user_id does not match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   it('throws "Forbidden." when the authenticated user does not own the job', async () => {
     await import("../render.functions");
@@ -225,7 +225,7 @@ describe("cancelRenderJob handler", () => {
     expect(mockProjectsUpdate).not.toHaveBeenCalled();
   });
 
-  // ─── Test 5: calls fetch with correct URL and X-Api-Key header ────────────
+  // â”€â”€â”€ Test 5: calls fetch with correct URL and X-Api-Key header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   it("calls the worker cancel endpoint with the correct URL and X-Api-Key header", async () => {
     await import("../render.functions");

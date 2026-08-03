@@ -4,7 +4,7 @@
  * tests/integration/badUrl.test.js
  *
  * INTEGRATION TEST (b): A render with an unreachable clip URL fails cleanly
- * with a descriptive error — not a hang, not a generic "exit code 1".
+ * with a descriptive error â€” not a hang, not a generic "exit code 1".
  *
  * This covers the v1 debugging pain: "FFmpeg exited with code X" was useless.
  * Here we assert:
@@ -29,12 +29,12 @@ process.env.REDIS_URL = process.env.TEST_REDIS_URL || 'redis://localhost:6379';
 process.env.URL_ALLOWLIST = 'videos.pexels.com'; // restrictive allowlist for SSRF test
 process.env.TEMP_DIR = os.tmpdir() + '/int-test-badurl-tmp';
 process.env.OUTPUT_DIR = os.tmpdir() + '/int-test-badurl-out';
-process.env.JOB_TIMEOUT_SECONDS = '60'; // shorter timeout — bad URL should fail fast
+process.env.JOB_TIMEOUT_SECONDS = '60'; // shorter timeout â€” bad URL should fail fast
 process.env.MAX_CLIPS = '20';
 process.env.MAX_DURATION_SECONDS = '600';
 process.env.MAX_DOWNLOAD_BYTES = String(2 * 1024 * 1024 * 1024);
 process.env.DOWNLOAD_TIMEOUT_SECONDS = '10'; // 10s download timeout so the test runs fast
-process.env.JOB_ATTEMPTS = '1'; // no retries — fail immediately
+process.env.JOB_ATTEMPTS = '1'; // no retries â€” fail immediately
 process.env.JOB_BACKOFF_DELAY_MS = '0';
 process.env.WORKER_CONCURRENCY = '1';
 process.env.NODE_ENV = 'test';
@@ -48,7 +48,7 @@ const POLL_TIMEOUT_MS = 30_000;
 function clipUrl(filename) {
   const p = path.join(FIXTURES, filename);
   if (!fs.existsSync(p)) {
-    throw new Error(`Fixture missing: ${p} — run: bash scripts/generate_test_clips.sh`);
+    throw new Error(`Fixture missing: ${p} â€” run: bash scripts/generate_test_clips.sh`);
   }
   return `file://${p}`;
 }
@@ -70,7 +70,7 @@ async function pollUntilDone(app, jobId, timeoutMs = POLL_TIMEOUT_MS) {
 }
 
 describe('Integration: Bad URL fails cleanly, not with a hang', () => {
-  let app, queue, worker;
+  let app, queue, workers;
 
   beforeAll(async () => {
     await fsp.mkdir(process.env.TEMP_DIR, { recursive: true });
@@ -78,22 +78,22 @@ describe('Integration: Bad URL fails cleanly, not with a hang', () => {
 
     const queueModule = require('../../src/queue');
     queue = queueModule.getQueue();
-    worker = queueModule.startWorker();
+    workers = queueModule.startWorker();
     app = require('../../src/server');
   });
 
   afterAll(async () => {
-    if (worker) await worker.close();
+    if (workers) await Promise.all(workers.map((worker) => worker.close()));
     if (queue) await queue.close();
   });
 
   test(
-    'unreachable clip URL → job fails with descriptive error, no hang',
+    'unreachable clip URL â†’ job fails with descriptive error, no hang',
     async () => {
       const jobId = `badurl-unreachable-${Date.now()}`;
       const startTime = Date.now();
 
-      // localhost:19999 — nothing listening there
+      // localhost:19999 â€” nothing listening there
       const badClipUrl = 'http://localhost:19999/nonexistent-clip.mp4';
 
       const postRes = await request(app)
@@ -124,19 +124,19 @@ describe('Integration: Bad URL fails cleanly, not with a hang', () => {
       // Must fail, not hang or complete
       expect(finalStatus.status).toBe('failed');
 
-      // Error must be descriptive — not a generic "exit code" message
+      // Error must be descriptive â€” not a generic "exit code" message
       const errorText = finalStatus.error ?? '';
       expect(errorText.length).toBeGreaterThan(10);
       expect(errorText).not.toMatch(/^FFmpeg exited with code \d+$/);
 
-      // Must not hang for the full job timeout (60s) — should fail in < 20s
+      // Must not hang for the full job timeout (60s) â€” should fail in < 20s
       expect(elapsed).toBeLessThan(20_000);
     },
     POLL_TIMEOUT_MS + 5000
   );
 
   test(
-    'SSRF-blocked clip URL → job fails immediately with SSRF_BLOCK error',
+    'SSRF-blocked clip URL â†’ job fails immediately with SSRF_BLOCK error',
     async () => {
       const jobId = `badurl-ssrf-${Date.now()}`;
 

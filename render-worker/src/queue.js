@@ -1,93 +1,73 @@
 'use strict';
 
-/**
- * queue.js
- *
- * Creates and exports the BullMQ Queue and Worker.
- * Also exports a Redis connection helper for health checks.
- *
- * Job state machine:
- *   waiting → active → completed | failed
- * Status vocabulary (stored in job.data._status):
- *   waiting | downloading | rendering | completed | failed
- *
- * Stalled job detection:
- *   If the worker process is killed mid-job, BullMQ's stalledInterval
- *   detects that the active job heartbeat stopped and automatically
- *   moves it back to waiting (if attempts remain) or failed.
- *   This satisfies the "kill worker mid-render" requirement.
- */
-
-const os = require('os');
-const { Queue, Worker, QueueEvents, FlowProducer } = require('bullmq');
+const { Queue, Worker, FlowProducer } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('./config');
 const logger = require('./logger');
-const { processRenderJob, processStitchJob } = require('./renderJob');
+const { processRenderJob, processStitchJob, closeRenderConnections } = require('./renderJob');
 
 const QUEUE_NAME = 'render';
 const QUEUE_CHUNK = 'render-chunk';
 const QUEUE_STITCH = 'render-stitch';
 
-// ─── Redis connection ─────────────────────────────────────────────────────────
-
 function createRedisConnection() {
-  const conn = new IORedis(config.redisUrl, {
-    maxRetriesPerRequest: null, // required by BullMQ
+  const connection = new IORedis(config.redisUrl, {
+    maxRetriesPerRequest: null,
     enableReadyCheck: false,
     lazyConnect: false,
   });
-
-  conn.on('connect', () => logger.info('Redis connected'));
-  conn.on('error', (err) => logger.error({ err: err.message }, 'Redis error'));
-
-  return conn;
+  connection.on('connect', () => logger.info('Redis connected'));
+  connection.on('error', (err) => logger.error({ err: err.message }, 'Redis error'));
+  return connection;
 }
 
-let _redisConnection = null;
-
+let redisConnection = null;
 function getRedisConnection() {
-  if (!_redisConnection) _redisConnection = createRedisConnection();
-  return _redisConnection;
+  if (!redisConnection) redisConnection = createRedisConnection();
+  return redisConnection;
 }
 
-// ─── Queue ────────────────────────────────────────────────────────────────────
-
-const _queues = {};
-let _flowProducer = null;
+const queues = {};
+let flowProducer = null;
 
 function getQueue(name = QUEUE_NAME) {
-  if (!_queues[name]) {
-    _queues[name] = new Queue(name, {
+  if (!queues[name]) {
+    queues[name] = new Queue(name, {
       connection: createRedisConnection(),
       defaultJobOptions: {
         attempts: config.jobAttempts,
-        backoff: { type: 'exponential', delay: 1000 },
+        backoff: { type: 'exponential', delay: config.jobBackoffDelayMs },
         removeOnComplete: 100,
         removeOnFail: 500,
       },
     });
   }
-  return _queues[name];
+  return queues[name];
 }
 
 function getFlowProducer() {
-  if (!_flowProducer) {
-    _flowProducer = new FlowProducer({
-      connection: createRedisConnection(),
-    });
+  if (!flowProducer) {
+    flowProducer = new FlowProducer({ connection: createRedisConnection() });
   }
-  return _flowProducer;
+  return flowProducer;
 }
 
-// ─── Worker ───────────────────────────────────────────────────────────────────
+let workers = [];
+const workerTelemetry = {
+  stalledCount: 0,
+  stalledEvents: [],
+};
+const jobStartedAt = new Map();
 
-let _workers = [];
+function telemetryKey(queueName, jobId) {
+  return `${queueName}:${jobId}`;
+}
 
 function createWorker(queueName, processor, concurrency, timeoutMs) {
   const worker = new Worker(
     queueName,
     async (job) => {
+      jobStartedAt.set(telemetryKey(queueName, job.id), Date.now());
       logger.info({ jobId: job.id, queue: queueName }, 'Worker picked up job');
       return processor(job);
     },
@@ -96,68 +76,120 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
       concurrency,
       stalledInterval: config.bullStalledIntervalMs,
       lockDuration: timeoutMs + 30_000,
-      lockRenewTime: Math.floor(timeoutMs / 2),
-    }
+      lockRenewTime: config.bullLockRenewTimeMs,
+    },
   );
 
   worker.on('completed', (job, result) => {
+    jobStartedAt.delete(telemetryKey(queueName, job.id));
     logger.info({ jobId: job.id, result, queue: queueName }, 'Job completed');
   });
 
   worker.on('failed', (job, err) => {
+    if (job?.id) jobStartedAt.delete(telemetryKey(queueName, job.id));
     logger.error({ jobId: job?.id, err: err.message, queue: queueName }, 'Job failed');
   });
 
   worker.on('stalled', (jobId) => {
-    logger.warn({ jobId, queue: queueName }, 'Job stalled — will be retried or failed by BullMQ');
+    const key = telemetryKey(queueName, jobId);
+    const startedAt = jobStartedAt.get(key);
+    const elapsedMs = startedAt ? Date.now() - startedAt : null;
+    const event = { jobId, queue: queueName, elapsedMs, at: new Date().toISOString() };
+    workerTelemetry.stalledCount += 1;
+    workerTelemetry.stalledEvents.push(event);
+    if (workerTelemetry.stalledEvents.length > 100) workerTelemetry.stalledEvents.shift();
+    logger.warn(event, 'Job stalled - will be retried or failed by BullMQ');
   });
 
   worker.on('error', (err) => {
     logger.error({ err: err.message, queue: queueName }, 'Worker error');
   });
 
-  logger.info({ concurrency, queue: queueName }, 'BullMQ worker started');
+  logger.info(
+    { concurrency, queue: queueName, lockRenewTimeMs: config.bullLockRenewTimeMs },
+    'BullMQ worker started',
+  );
   return worker;
 }
 
 function startWorker() {
-  if (_workers.length > 0) return _workers;
+  if (workers.length > 0) return workers;
 
-  // Compute effective concurrency for the chunk worker once at startup.
-  // Caps the configured value to the number of available CPU cores so that
-  // simultaneous FFmpeg processes never exceed hardware capacity.
-  const effectiveConcurrency = Math.min(config.workerConcurrencyChunks, os.cpus().length);
+  const effectiveChunkConcurrency = Math.min(
+    config.workerConcurrencyChunks,
+    config.detectedCpuCount,
+  );
 
-  // Legacy/small-project queue
-  _workers.push(createWorker(QUEUE_NAME, processRenderJob, config.workerConcurrency, config.jobTimeoutSeconds * 1000));
+  workers.push(
+    createWorker(
+      QUEUE_NAME,
+      processRenderJob,
+      config.workerConcurrency,
+      config.jobTimeoutSeconds * 1000,
+    ),
+  );
+  workers.push(
+    createWorker(
+      QUEUE_CHUNK,
+      processRenderJob,
+      effectiveChunkConcurrency,
+      config.chunkTimeoutSeconds * 1000,
+    ),
+  );
+  workers.push(
+    createWorker(
+      QUEUE_STITCH,
+      processStitchJob,
+      config.workerConcurrencyStitches,
+      config.stitchTimeoutSeconds * 1000,
+    ),
+  );
 
-  // Chunk queue — uses bounded effectiveConcurrency
-  _workers.push(createWorker(QUEUE_CHUNK, processRenderJob, effectiveConcurrency, config.chunkTimeoutSeconds * 1000));
+  logger.info(
+    {
+      cpuCount: config.detectedCpuCount,
+      totalWorkerSlots: config.totalWorkerSlots,
+      ffmpegThreads: config.ffmpegThreads,
+      ffmpegMaxProcesses: config.ffmpegMaxProcesses,
+      legacyConcurrency: config.workerConcurrency,
+      chunkConcurrency: effectiveChunkConcurrency,
+      stitchConcurrency: config.workerConcurrencyStitches,
+    },
+    'Render worker resource budget',
+  );
 
-  // Stitch queue
-  _workers.push(createWorker(QUEUE_STITCH, processStitchJob, config.workerConcurrencyStitches, config.stitchTimeoutSeconds * 1000));
-
-  return _workers;
+  return workers;
 }
 
-// ─── Job status helper ────────────────────────────────────────────────────────
+async function stopWorkers() {
+  const current = workers;
+  workers = [];
+  await Promise.all(current.map((worker) => worker.close()));
+  await closeRenderConnections();
+}
 
-/**
- * Maps a BullMQ job to the status object returned by GET /jobs/:id.
- *
- * @param {import('bullmq').Job | null} job
- * @returns {object | null}
- */
+async function closeQueueResources() {
+  await Promise.all(Object.values(queues).map((queue) => queue.close()));
+  for (const name of Object.keys(queues)) delete queues[name];
+
+  if (flowProducer) {
+    await flowProducer.close();
+    flowProducer = null;
+  }
+
+  if (redisConnection) {
+    await redisConnection.quit();
+    redisConnection = null;
+  }
+}
+
 async function getJobStatus(job) {
   if (!job) return null;
 
-  const state = await job.getState(); // 'waiting' | 'active' | 'completed' | 'failed' | etc.
+  const state = await job.getState();
   const data = job.data ?? {};
-
-  // Overlay our finer-grained status from job.data._status
   let status = data._status ?? state;
 
-  // Normalise BullMQ states to our vocabulary
   if (state === 'active' && !data._status) status = 'rendering';
   if (state === 'waiting' || state === 'delayed') status = 'waiting';
 
@@ -168,19 +200,16 @@ async function getJobStatus(job) {
     output_url: data._outputUrl ?? null,
     error: data._error ?? (state === 'failed' ? (job.failedReason ?? 'Unknown error') : null),
     ffmpegStderr: data._ffmpegStderr ?? null,
-    attempts_made: job.attemptsMade,
+    attempts_made: job.attemptsStarted ?? job.attemptsMade,
     created_at: new Date(job.timestamp).toISOString(),
   };
 
-  // If this is a stitch job, calculate chunk progress
   if (data.is_stitch && typeof job.getDependenciesCount === 'function') {
     result.chunks_total = data.chunks_total || 0;
     try {
       const counts = await job.getDependenciesCount();
-      // "processed" means children that have successfully finished
       result.chunks_completed = counts.processed || 0;
-    } catch (err) {
-      // Fallback if counting fails
+    } catch {
       result.chunks_completed = 0;
     }
   }
@@ -188,12 +217,29 @@ async function getJobStatus(job) {
   return result;
 }
 
+function getWorkerTelemetry() {
+  return {
+    stalledCount: workerTelemetry.stalledCount,
+    stalledEvents: [...workerTelemetry.stalledEvents],
+  };
+}
+
+function resetWorkerTelemetry() {
+  workerTelemetry.stalledCount = 0;
+  workerTelemetry.stalledEvents = [];
+  jobStartedAt.clear();
+}
+
 module.exports = {
   getQueue,
   getFlowProducer,
   startWorker,
+  stopWorkers,
+  closeQueueResources,
   getRedisConnection,
   getJobStatus,
+  getWorkerTelemetry,
+  resetWorkerTelemetry,
   QUEUE_NAME,
   QUEUE_CHUNK,
   QUEUE_STITCH,

@@ -67,7 +67,7 @@ function stressClipPath(filename) {
   return p;
 }
 
-describe('Large filter graph — 50 clips (production scale)', () => {
+describe('Large filter graph â€” 50 clips (production scale)', () => {
   let outputPath;
 
   beforeAll(async () => {
@@ -123,7 +123,7 @@ describe('Large filter graph — 50 clips (production scale)', () => {
         fps: TARGET_FPS,
       });
     },
-    300_000 // 5 min timeout — 50 clips is a real workload
+    300_000 // 5 min timeout â€” 50 clips is a real workload
   );
 
   test(
@@ -152,7 +152,7 @@ describe('Large filter graph — 50 clips (production scale)', () => {
       const content = await fsp.readFile(scriptPath, 'utf8');
 
       // Must contain 50 normalisation filter chains
-      const normFilterCount = (content.match(/force_original_aspect_ratio=decrease/g) || []).length;
+      const normFilterCount = (content.match(/force_original_aspect_ratio=increase/g) || []).length;
       expect(normFilterCount).toBe(50);
 
       // Must contain a concat filter for all 50 inputs

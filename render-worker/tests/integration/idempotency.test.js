@@ -48,7 +48,7 @@ const POLL_TIMEOUT_MS = 120_000;
 function clipUrl(filename) {
   const p = path.join(FIXTURES, filename);
   if (!fs.existsSync(p)) {
-    throw new Error(`Fixture missing: ${p} — run: bash scripts/generate_test_clips.sh`);
+    throw new Error(`Fixture missing: ${p} â€” run: bash scripts/generate_test_clips.sh`);
   }
   return `file://${p}`;
 }
@@ -69,8 +69,8 @@ async function pollUntilDone(app, jobId, timeoutMs = POLL_TIMEOUT_MS) {
   throw new Error(`Timed out polling job ${jobId}`);
 }
 
-describe('Integration: Idempotency — duplicate job_id → single render', () => {
-  let app, queue, worker;
+describe('Integration: Idempotency â€” duplicate job_id â†’ single render', () => {
+  let app, queue, workers;
 
   beforeAll(async () => {
     await fsp.mkdir(process.env.TEMP_DIR, { recursive: true });
@@ -78,12 +78,12 @@ describe('Integration: Idempotency — duplicate job_id → single render', () =
 
     const queueModule = require('../../src/queue');
     queue = queueModule.getQueue();
-    worker = queueModule.startWorker();
+    workers = queueModule.startWorker();
     app = require('../../src/server');
   });
 
   afterAll(async () => {
-    if (worker) await worker.close();
+    if (workers) await Promise.all(workers.map((worker) => worker.close()));
     if (queue) await queue.close();
     try { await fsp.rm(process.env.OUTPUT_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
   });
@@ -91,7 +91,7 @@ describe('Integration: Idempotency — duplicate job_id → single render', () =
   test(
     'two concurrent POSTs with the same job_id produce exactly one render',
     async () => {
-      // Use a fixed job_id — both requests carry the same one
+      // Use a fixed job_id â€” both requests carry the same one
       const sharedJobId = `idempotency-test-${Date.now()}`;
 
       const payload = {

@@ -6,9 +6,9 @@
  * Express HTTP API for the render worker service.
  *
  * Routes:
- *   POST /jobs          – Validate + enqueue a render job
- *   GET  /jobs/:id      – Query job status (status, progress, stderr)
- *   GET  /health        – Liveness + Redis connectivity probe
+ *   POST /jobs          â€“ Validate + enqueue a render job
+ *   GET  /jobs/:id      â€“ Query job status (status, progress, stderr)
+ *   GET  /health        â€“ Liveness + Redis connectivity probe
  *
  * Authentication:
  *   All /jobs routes require X-Api-Key header matching WORKER_API_KEY.
@@ -16,7 +16,7 @@
  *
  * Idempotency:
  *   job_id from the payload is used as the BullMQ jobId.
- *   BullMQ silently ignores duplicate adds with the same jobId — no
+ *   BullMQ silently ignores duplicate adds with the same jobId â€” no
  *   double-processing, no error returned to the caller.
  */
 
@@ -29,11 +29,12 @@ const logger = require('./logger');
 const { getQueue, getJobStatus, getRedisConnection, startWorker, getFlowProducer, QUEUE_NAME, QUEUE_CHUNK, QUEUE_STITCH } = require('./queue');
 const { validatePayload } = require('./renderJob');
 const { buildChunkOpts, writeCancelFlag } = require('./pipelineReliability');
+const { cancelJobsByPrefix } = require('./cancelJobs');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// ─── Auth middleware ──────────────────────────────────────────────────────────
+// â”€â”€â”€ Auth middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function requireApiKey(req, res, next) {
   const key = req.headers['x-api-key'];
@@ -43,7 +44,7 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ─── POST /jobs ───────────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /jobs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.post('/jobs', requireApiKey, async (req, res) => {
   const payload = req.body;
@@ -133,7 +134,7 @@ app.post('/jobs', requireApiKey, async (req, res) => {
   }
 });
 
-// ─── GET /jobs/:id ────────────────────────────────────────────────────────────
+// â”€â”€â”€ GET /jobs/:id â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.get('/jobs/:id', requireApiKey, async (req, res) => {
   const jobId = req.params.id;
@@ -159,7 +160,7 @@ app.get('/jobs/:id', requireApiKey, async (req, res) => {
   }
 });
 
-// ─── POST /jobs/:id/cancel ────────────────────────────────────────────────────
+// â”€â”€â”€ POST /jobs/:id/cancel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.post('/jobs/:id/cancel', requireApiKey, async (req, res) => {
   const jobId = req.params.id;
@@ -172,55 +173,28 @@ app.post('/jobs/:id/cancel', requireApiKey, async (req, res) => {
       getQueue(QUEUE_STITCH),
     ];
 
-    // Collect all jobs across all queues whose ID starts with the parent jobId
-    const matchingJobs = [];
-    for (const queue of queues) {
-      // Fetch jobs in all relevant states
-      const [waiting, delayed, waitingChildren, active] = await Promise.all([
-        queue.getWaiting(),
-        queue.getDelayed(),
-        queue.getWaitingChildren(),
-        queue.getActive(),
-      ]);
+    const result = await cancelJobsByPrefix({
+      jobId,
+      queues,
+      redis,
+      writeCancelFlag,
+      logger,
+    });
 
-      const allJobs = [...waiting, ...delayed, ...waitingChildren, ...active];
-      for (const job of allJobs) {
-        if (job.id && job.id.startsWith(jobId)) {
-          matchingJobs.push(job);
-        }
-      }
-    }
-
-    if (matchingJobs.length === 0) {
-      return res.status(404).json({ error: 'Job not found', job_id: jobId });
-    }
-
-    for (const job of matchingJobs) {
-      const state = await job.getState();
-
-      if (state === 'active') {
-        try {
-          await writeCancelFlag(redis, job.id);
-        } catch (err) {
-          logger.error({ err: err.message, jobId: job.id }, 'Failed to write cancel flag');
-        }
-      } else if (state === 'waiting' || state === 'delayed' || state === 'waiting-children') {
-        try {
-          await job.remove();
-        } catch (err) {
-          logger.error({ err: err.message, jobId: job.id }, 'Failed to remove job from queue');
-        }
-      }
-    }
-
-    return res.status(200).json({ cancelled: true, job_id: jobId });
+    return res.status(200).json({
+      cancelled: true,
+      cancelled_count: result.cancelledCount,
+      matched_count: result.matchedCount,
+      vanished_count: result.vanishedCount,
+      job_id: jobId,
+    });
   } catch (err) {
     logger.error({ err: err.message, jobId }, 'Failed to cancel job');
     return res.status(500).json({ error: 'Failed to cancel job', detail: err.message });
   }
 });
 
-// ─── GET /health ──────────────────────────────────────────────────────────────
+// â”€â”€â”€ GET /health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.get('/health', async (_req, res) => {
   const health = { status: 'ok', redis: 'unknown', timestamp: new Date().toISOString() };
@@ -239,23 +213,23 @@ app.get('/health', async (_req, res) => {
   return res.status(statusCode).json(health);
 });
 
-// ─── 404 fallthrough ─────────────────────────────────────────────────────────
+// â”€â”€â”€ 404 fallthrough â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-// ─── Error handler ────────────────────────────────────────────────────────────
+// â”€â”€â”€ Error handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.use((err, _req, res, _next) => {
   logger.error({ err: err.message }, 'Unhandled error in request');
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ─── Bootstrap ────────────────────────────────────────────────────────────────
+// â”€â”€â”€ Bootstrap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
- * sweepOrphanedTempDirs — scans config.tempDir for directories whose mtime
+ * sweepOrphanedTempDirs â€” scans config.tempDir for directories whose mtime
  * is older than ORPHAN_AGE_MS and deletes them, logging bytes reclaimed.
  *
  * Any directory older than the threshold is guaranteed to be orphaned: no
@@ -311,7 +285,7 @@ async function sweepOrphanedTempDirs() {
     const ageMs = now - stat.mtimeMs;
     if (ageMs < ORPHAN_AGE_MS) continue;
 
-    // Directory is old enough to be orphaned — measure then delete
+    // Directory is old enough to be orphaned â€” measure then delete
     const bytes = await getDirSizeBytes(fullPath);
     try {
       await fsp.rm(fullPath, { recursive: true, force: true });
@@ -376,9 +350,11 @@ async function main() {
   process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-main().catch((err) => {
-  logger.error({ err: err.message }, 'Fatal startup error');
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    logger.error({ err: err.message }, 'Fatal startup error');
+    process.exit(1);
+  });
+}
 
 module.exports = app; // exported for supertest
