@@ -1,4 +1,5 @@
 import { CATEGORY_THEMES } from "@/lib/visual-queries.server";
+import type { MatchingProfile } from "@/lib/matching-profile";
 
 export type StockVideoFile = { url: string; width: number; height: number };
 
@@ -145,6 +146,8 @@ export type StockSearchSession = {
   usage: Map<string, UsageCount>;
   pexelsPool: PexelsStagePool;
   nasaMetrics?: NasaRequestMetrics;
+  /** Optional timing instrumentation (round 6 profiling). Measurement only. */
+  profile?: MatchingProfile;
 };
 
 export type StockSearchOptions = {
@@ -441,6 +444,7 @@ export async function createStockSearchSession(
   queries: string[],
   orientation: Orientation,
   niche?: string | null,
+  profile?: MatchingProfile,
 ): Promise<StockSearchSession> {
   const pexelsPool = await loadPexelsStagePool();
   const session: StockSearchSession = {
@@ -449,6 +453,7 @@ export async function createStockSearchSession(
     pendingCache: new Map(),
     usage: new Map(),
     pexelsPool,
+    profile,
     nasaMetrics: {
       searchRequests: 0,
       assetCalls: 0,
@@ -474,6 +479,8 @@ export async function createStockSearchSession(
 }
 
 export async function flushStockSearchSession(session: StockSearchSession): Promise<void> {
+  const profile = session.profile;
+  const flushStartedAt = Date.now();
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const rows = [...session.pendingCache.values()];
   if (rows.length > 0) {
@@ -494,6 +501,8 @@ export async function flushStockSearchSession(session: StockSearchSession): Prom
   );
   const usageError = usageResults.find((result) => result.error)?.error;
   if (usageError) console.warn("[stock] usage counter flush failed", usageError.message);
+  profile?.add("sessionFlush", Date.now() - flushStartedAt);
+  profile?.count("sessionFlushRows", rows.length);
   session.pendingCache.clear();
   session.usage.clear();
 }
@@ -681,19 +690,26 @@ async function getCachedOrSearch(opts: {
   }
   const hasCurrentPexelsBreadth =
     opts.provider !== "pexels" || cached == null || cached.results.length > 20;
+  const profile = opts.session?.profile;
   if (
     cached &&
     hasCurrentPexelsBreadth &&
     Date.now() - new Date(cached.cachedAt).getTime() < CACHE_TTL_MS
   ) {
+    profile?.count("searchCacheHits");
     await recordUsage(opts.provider, true, opts.session);
     return cached.results;
   }
   let searchPromise = opts.session?.inflight.get(key);
   const ownsSearch = !searchPromise;
   if (!searchPromise) {
-    searchPromise = opts.search();
+    profile?.count("searchCacheMisses");
+    // Single choke point for every provider (Pexels, Pixabay, NASA): all
+    // outbound provider HTTP for a search flows through here.
+    searchPromise = profile ? profile.time("providerSearch", () => opts.search()) : opts.search();
     opts.session?.inflight.set(key, searchPromise);
+  } else {
+    profile?.count("searchInflightJoins");
   }
 
   let results: StockVideo[];
@@ -742,14 +758,18 @@ async function prefetchCacheRows(
   queries: string[],
 ) {
   if (queries.length === 0) return;
+  const profile = session.profile;
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   for (let start = 0; start < queries.length; start += 75) {
+    profile?.count("cacheReadQueries");
+    const startedAt = Date.now();
     const { data, error } = await supabaseAdmin
       .from("stock_search_cache")
       .select("provider, query, orientation, results, cached_at")
       .eq("provider", provider)
       .eq("orientation", orientation)
       .in("query", queries.slice(start, start + 75));
+    profile?.add("cacheRead", Date.now() - startedAt);
     if (error) throw new Error(`Stock cache prefetch failed: ${error.message}`);
     for (const row of data ?? []) {
       session.cache.set(cacheKey(row.provider, row.query, row.orientation), {

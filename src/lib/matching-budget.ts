@@ -30,8 +30,8 @@
  * when the whole point is not to block other users.
  */
 
-const DEFAULT_MATCHING_TIME_BUDGET_MS = 12_000;
-const DEFAULT_MATCHING_SLICE_SIZE = 3;
+const DEFAULT_MATCHING_TIME_BUDGET_MS = 8_000;
+const DEFAULT_MATCHING_SLICE_SIZE = 2;
 
 /**
  * Wall-clock budget per matching_footage invocation, from MATCHING_TIME_BUDGET_MS.
@@ -58,19 +58,31 @@ export function matchingSliceSize(): number {
 }
 
 export type MatchingBudget = {
-  /** Milliseconds elapsed since the budget was created. */
+  /** Milliseconds elapsed since the budget was created (invocation start). */
   elapsedMs: () => number;
-  /**
-   * Whether another slice of work should be started.
-   *
-   * @param slicesCompleted how many slices have finished so far in this invocation
-   */
-  shouldStartAnotherSlice: (slicesCompleted: number) => boolean;
+  /** Records how long a completed slice took, feeding the projection guard. */
+  recordSlice: (durationMs: number) => void;
+  /** Whether another slice of work should be started. */
+  shouldStartAnotherSlice: () => boolean;
+  /** Slice accounting for logging: how many ran and how long they took in total. */
+  stats: () => { slices: number; sliceMs: number; setupMs: number };
 };
 
 /**
- * Creates a wall-clock budget. `now` is injectable so the decision logic can be
- * unit-tested with a mocked clock rather than real sleeps.
+ * Creates a wall-clock budget covering the WHOLE invocation.
+ *
+ * Create this at the top of the handler, before any setup work. The first
+ * deployed version started the clock at the slice loop, so per-invocation setup
+ * (session creation, stock_search_cache prefetch, project/scene/selection reads)
+ * fell outside the budget entirely — a 12s budget produced 15-19s invocations.
+ * Covering setup is what makes "budget + one slice" a true worst-case bound.
+ *
+ * Setup time is deliberately excluded from the slice average: elapsed time is
+ * used for the deadline, but the projection uses only measured slice durations,
+ * so a slow setup does not make slices look more expensive than they are.
+ *
+ * `now` is injectable so the decision logic can be unit-tested with a mocked
+ * clock rather than real sleeps.
  */
 export function createMatchingBudget({
   budgetMs,
@@ -80,19 +92,40 @@ export function createMatchingBudget({
   now?: () => number;
 }): MatchingBudget {
   const startedAt = now();
+  let slices = 0;
+  let sliceMs = 0;
+  let firstSliceStartedAt: number | null = null;
 
   return {
     elapsedMs: () => now() - startedAt,
 
-    shouldStartAnotherSlice(slicesCompleted: number): boolean {
-      // Forward-progress guarantee: always do at least one slice per invocation.
-      if (slicesCompleted <= 0) return true;
+    recordSlice(durationMs: number) {
+      if (firstSliceStartedAt === null) firstSliceStartedAt = now() - durationMs;
+      slices += 1;
+      sliceMs += Math.max(0, durationMs);
+    },
+
+    stats: () => ({
+      slices,
+      sliceMs,
+      // Everything before the first slice began: session creation, cache
+      // prefetch and the project/scene/selection reads.
+      setupMs: firstSliceStartedAt === null ? now() - startedAt : firstSliceStartedAt - startedAt,
+    }),
+
+    shouldStartAnotherSlice(): boolean {
+      // Forward-progress guarantee: always do at least one slice per invocation,
+      // even if setup alone already consumed the budget. Without this a slow
+      // setup would return matching_footage forever having done no work.
+      if (slices <= 0) return true;
 
       const elapsed = now() - startedAt;
       if (elapsed >= budgetMs) return false;
 
       // Projection guard: only start a slice we expect to finish in budget.
-      const averageSliceMs = elapsed / slicesCompleted;
+      // Uses measured slice cost, not elapsed/slices, so setup is not blamed
+      // on the slices.
+      const averageSliceMs = sliceMs / slices;
       return elapsed + averageSliceMs <= budgetMs;
     },
   };

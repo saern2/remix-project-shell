@@ -6,6 +6,7 @@ import {
   matchingSliceSize,
   matchingTimeBudgetMs,
 } from "@/lib/matching-budget";
+import { createMatchingProfile } from "@/lib/matching-profile";
 import type { StockSearchSession } from "@/lib/stock.server";
 
 const ProjectIdInput = z.object({ projectId: z.string().uuid() });
@@ -449,6 +450,15 @@ async function advanceFromMatchingFootage(projectId: string) {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   let stockSession: StockSearchSession | null = null;
 
+  // Budget covers the WHOLE invocation, including setup (session creation,
+  // cache prefetch, project/scene/selection reads). The first deployed version
+  // started the clock at the slice loop, leaving setup unbudgeted — a 12s budget
+  // produced 15-19s invocations in production.
+  const budgetMs = matchingTimeBudgetMs();
+  const sliceSize = matchingSliceSize();
+  const budget = createMatchingBudget({ budgetMs });
+  const profile = createMatchingProfile();
+
   // Single-flight guard: if a peer poll is already matching this project, do not
   // start duplicate work — return matching_footage so the client keeps polling.
   let lockHeld = false;
@@ -511,6 +521,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       scenes.map((scene) => scene.visual_query ?? ""),
       orientation,
       projectNiche,
+      profile,
     );
 
     const fixedDuration =
@@ -640,16 +651,10 @@ async function advanceFromMatchingFootage(projectId: string) {
       // Time-budgeted slice loop. matchStockCorpus cannot be preempted mid-call,
       // so the budget is checked between small slices rather than mid-flight.
       const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
-      const budgetMs = matchingTimeBudgetMs();
-      const sliceSize = matchingSliceSize();
-      const budget = createMatchingBudget({ budgetMs });
       let processedSlots = 0;
-      let slicesCompleted = 0;
 
-      while (
-        processedSlots < pendingSlots.length &&
-        budget.shouldStartAnotherSlice(slicesCompleted)
-      ) {
+      while (processedSlots < pendingSlots.length && budget.shouldStartAnotherSlice()) {
+        const sliceStartedAt = Date.now();
         const slice = pendingSlots.slice(processedSlots, processedSlots + sliceSize);
         const fixedAssignments = await matchStockCorpus({
           projectId,
@@ -693,14 +698,17 @@ async function advanceFromMatchingFootage(projectId: string) {
             thumbnail_url: result.pick.thumbnail_url ?? null,
           };
           newSliceRows.push(row);
+          const writeStartedAt = Date.now();
           const { error: sliceError } = await supabaseAdmin
             .from("render_clip_slices")
             .upsert(row, { onConflict: "project_id,scene_id,slice_index" });
+          profile.add("dbWrite", Date.now() - writeStartedAt);
+          profile.count("dbWriteSlices");
           throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
         });
 
         processedSlots += slice.length;
-        slicesCompleted += 1;
+        budget.recordSlice(Date.now() - sliceStartedAt);
       }
 
       if (unmatchedSlots.length > 0) {
@@ -715,10 +723,11 @@ async function advanceFromMatchingFootage(projectId: string) {
         console.info("[matching_footage:fixed-duration] budget spent, more pending", {
           projectId,
           scenesProcessed: processedSlots,
-          slices: slicesCompleted,
+          remaining: pendingSlots.length - processedSlots,
           elapsedMs: budget.elapsedMs(),
           budgetMs,
-          remaining: pendingSlots.length - processedSlots,
+          ...budget.stats(),
+          ...profile.summary(),
         });
         return { status: "matching_footage", error_message: null };
       }
@@ -726,10 +735,11 @@ async function advanceFromMatchingFootage(projectId: string) {
       console.info("[matching_footage:fixed-duration] final invocation", {
         projectId,
         scenesProcessed: processedSlots,
-        slices: slicesCompleted,
+        remaining: 0,
         elapsedMs: budget.elapsedMs(),
         budgetMs,
-        remaining: 0,
+        ...budget.stats(),
+        ...profile.summary(),
       });
 
       const { data: finalSlices } = await supabaseAdmin
@@ -817,6 +827,9 @@ async function advanceFromMatchingFootage(projectId: string) {
         ).size,
         concurrency: FIXED_DURATION_CONCURRENCY,
         elapsedMs: Date.now() - startedAt,
+        budgetMs,
+        ...budget.stats(),
+        ...profile.summary(),
       });
 
       await assertPipelineWritable(projectId);
@@ -891,6 +904,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       }
 
       const { pick, chosenFile } = result;
+      const writeStartedAt = Date.now();
       const { data: candidate, error: cErr } = await supabaseAdmin
         .from("clip_candidates")
         .insert({
@@ -919,19 +933,18 @@ async function advanceFromMatchingFootage(projectId: string) {
       if (sErr) throw new Error(sErr.message);
 
       await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
+      profile.add("dbWrite", Date.now() - writeStartedAt);
+      profile.count("dbWriteScenes");
     }
 
     const { asyncPool } = await import("@/lib/clip-slices.server");
     const startedAt = Date.now();
 
     // Time-budgeted slice loop (see fixed-duration path above for rationale).
-    const budgetMs = matchingTimeBudgetMs();
-    const sliceSize = matchingSliceSize();
-    const budget = createMatchingBudget({ budgetMs });
     let processedScenes = 0;
-    let slicesCompleted = 0;
 
-    while (processedScenes < pending.length && budget.shouldStartAnotherSlice(slicesCompleted)) {
+    while (processedScenes < pending.length && budget.shouldStartAnotherSlice()) {
+      const sliceStartedAt = Date.now();
       const slice = pending.slice(processedScenes, processedScenes + sliceSize);
       const plainAssignments = await matchStockCorpus({
         projectId,
@@ -958,7 +971,7 @@ async function advanceFromMatchingFootage(projectId: string) {
 
       await asyncPool(slice, CONCURRENCY, (scene) => processScene(scene, plainAssignments));
       processedScenes += slice.length;
-      slicesCompleted += 1;
+      budget.recordSlice(Date.now() - sliceStartedAt);
     }
 
     if (unmatchedSceneIds.size > 0) {
@@ -975,10 +988,11 @@ async function advanceFromMatchingFootage(projectId: string) {
       console.info("[matching_footage:plain] budget spent, more pending", {
         projectId,
         scenesProcessed: processedScenes,
-        slices: slicesCompleted,
+        remaining: pending.length - processedScenes,
         elapsedMs: budget.elapsedMs(),
         budgetMs,
-        remaining: pending.length - processedScenes,
+        ...budget.stats(),
+        ...profile.summary(),
       });
       return { status: "matching_footage", error_message: null };
     }
@@ -1013,6 +1027,9 @@ async function advanceFromMatchingFootage(projectId: string) {
       ).size,
       concurrency: CONCURRENCY,
       elapsedMs: Date.now() - startedAt,
+      budgetMs,
+      ...budget.stats(),
+      ...profile.summary(),
     });
 
     await assertPipelineWritable(projectId);

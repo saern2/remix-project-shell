@@ -124,19 +124,25 @@ export async function matchStockCorpus(
   const assignments = new Map<string, StockSearchResult>();
   const sourceUseCount = new Map<string, number>();
   const recentSources: string[] = [];
+  // Ranking/assignment is pure CPU over already-fetched pools; timed separately
+  // from provider HTTP so the breakdown shows which dominates.
+  const profile = opts.session.profile;
+  const timeAssign = <T>(fn: () => T): T => (profile ? profile.timeSync("assignment", fn) : fn());
 
   if (opts.niche === "space") {
     const nasaPools = await loadNasaPools(opts, buckets);
-    assignFromPools({
-      ...opts,
-      buckets,
-      demandToBucket,
-      pools: nasaPools,
-      assignments,
-      sourceUseCount,
-      recentSources,
-      provider: "nasa",
-    });
+    timeAssign(() =>
+      assignFromPools({
+        ...opts,
+        buckets,
+        demandToBucket,
+        pools: nasaPools,
+        assignments,
+        sourceUseCount,
+        recentSources,
+        provider: "nasa",
+      }),
+    );
   }
 
   let missing = opts.demands.filter((demand) => !assignments.has(demand.id));
@@ -148,16 +154,18 @@ export async function matchStockCorpus(
       "pexels",
       opts.niche === "space",
     );
-    assignFromPools({
-      ...opts,
-      buckets,
-      demandToBucket,
-      pools: pexelsPools,
-      assignments,
-      sourceUseCount,
-      recentSources,
-      provider: "pexels",
-    });
+    timeAssign(() =>
+      assignFromPools({
+        ...opts,
+        buckets,
+        demandToBucket,
+        pools: pexelsPools,
+        assignments,
+        sourceUseCount,
+        recentSources,
+        provider: "pexels",
+      }),
+    );
   }
 
   missing = opts.demands.filter((demand) => !assignments.has(demand.id));
@@ -169,16 +177,18 @@ export async function matchStockCorpus(
       "pixabay",
       opts.niche === "space",
     );
-    assignFromPools({
-      ...opts,
-      buckets,
-      demandToBucket,
-      pools: pixabayPools,
-      assignments,
-      sourceUseCount,
-      recentSources,
-      provider: "pixabay",
-    });
+    timeAssign(() =>
+      assignFromPools({
+        ...opts,
+        buckets,
+        demandToBucket,
+        pools: pixabayPools,
+        assignments,
+        sourceUseCount,
+        recentSources,
+        provider: "pixabay",
+      }),
+    );
   }
 
   console.info("[stock-corpus] assignment", {
