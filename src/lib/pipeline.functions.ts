@@ -27,11 +27,14 @@ const MATCHING_LOCK_TTL_MS = 90_000;
 async function claimMatchingLock(projectId: string): Promise<boolean> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const staleBefore = new Date(Date.now() - MATCHING_LOCK_TTL_MS).toISOString();
+  // Cancellation is intentionally NOT filtered here: a cancelled project should
+  // still claim the lock, enter the handler, and hit assertPipelineWritable, which
+  // returns `cancelled` and releases the lock — rather than being reported as
+  // matching_footage for a poll cycle.
   const { data, error } = await supabaseAdmin
     .from("projects")
     .update({ matching_lock_at: new Date().toISOString() })
     .eq("id", projectId)
-    .is("pipeline_cancel_requested_at", null)
     .or(`matching_lock_at.is.null,matching_lock_at.lt.${staleBefore}`)
     .select("id")
     .maybeSingle();
