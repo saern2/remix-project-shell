@@ -5,6 +5,7 @@ import {
   searchProviderCandidatePool,
   stockQueryTokens,
   stockReservationKey,
+  withinSourceDurationBudget,
   type Orientation,
   type ProjectNiche,
   type StockSearchResult,
@@ -191,6 +192,7 @@ export async function matchStockCorpus(
     nasaHttp: opts.session.nasaMetrics ?? null,
     nasaSearchCacheHits: opts.session.usage.get("nasa")?.cacheHits ?? 0,
     providers: countProviders(assignments),
+    sourceDuration: summarizeSelectedDurations(assignments),
   });
   return assignments;
 }
@@ -342,7 +344,14 @@ function selectGlobalCandidate(opts: {
   });
 
   if (options.length === 0) return null;
-  options.sort((a, b) => {
+  // Round 6, Issue 1: prefer sources within the scene's duration budget so a
+  // multi-minute clip is not downloaded for a few seconds of footage. Fall back
+  // to the full option set only when nothing fits the budget.
+  const budgetedOptions = options.filter((option) =>
+    withinSourceDurationBudget(option.video, opts.demand.minDurationSec),
+  );
+  const rankable = budgetedOptions.length > 0 ? budgetedOptions : options;
+  rankable.sort((a, b) => {
     if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
     const aRelevance = candidateRelevance(opts.demand.query, a.video);
     const bRelevance = candidateRelevance(opts.demand.query, b.video);
@@ -355,7 +364,7 @@ function selectGlobalCandidate(opts: {
     );
   });
 
-  const selected = options[0];
+  const selected = rankable[0];
   const files = [...selected.video.files].sort((a, b) => a.width - b.width);
   const chosenFile =
     files.find((file) => file.width >= opts.targetWidth) ?? files[files.length - 1];
@@ -441,6 +450,26 @@ function dedupeVideos(videos: StockVideo[]): StockVideo[] {
     seen.add(key);
     return true;
   });
+}
+
+// Distribution of the source-clip durations actually selected, so a matcher that
+// keeps choosing multi-minute sources for short scenes is visible in the logs
+// rather than only discoverable from FFmpeg input dumps (round 6, Issue 2b).
+function summarizeSelectedDurations(assignments: Map<string, StockSearchResult>) {
+  const durations = [...assignments.values()]
+    .map((result) => result.pick.duration_sec)
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  if (durations.length === 0) return { count: 0 };
+  const median = durations[Math.floor(durations.length / 2)];
+  const overBudget = durations.filter((value) => value > 120).length;
+  return {
+    count: durations.length,
+    minSec: Math.round(durations[0]),
+    medianSec: Math.round(median),
+    maxSec: Math.round(durations[durations.length - 1]),
+    overTwoMinutes: overBudget,
+  };
 }
 
 function countProviders(assignments: Map<string, StockSearchResult>) {

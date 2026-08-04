@@ -6,6 +6,8 @@ import {
   selectStockCandidate,
   searchStockFootage,
   searchUniqueStockFootage,
+  sourceDurationBudgetSeconds,
+  withinSourceDurationBudget,
   type StockSearchOptions,
   type StockSearchResult,
   type StockVideo,
@@ -199,6 +201,71 @@ describe("stock footage diversity helpers", () => {
     const usedIds = new Set<string>();
     expect(reserveProviderClipId(usedIds, "same-clip")).toBe(true);
     expect(reserveProviderClipId(usedIds, "same-clip")).toBe(false);
+  });
+});
+
+describe("source duration budget (round 6, Issue 1)", () => {
+  function pexelsVideo(id: string, durationSec: number): StockVideo {
+    return {
+      provider: "pexels",
+      provider_clip_id: id,
+      duration_sec: durationSec,
+      duration_known: true,
+      width: 1920,
+      height: 1080,
+      thumbnail_url: null,
+      files: [{ url: `https://videos.pexels.com/${id}.mp4`, width: 1920, height: 1080 }],
+    };
+  }
+
+  it("computes a budget that never drops below the floor", () => {
+    expect(sourceDurationBudgetSeconds(1)).toBe(30); // 1*6 < 30 → floor
+    expect(sourceDurationBudgetSeconds(10)).toBe(60); // 10*6 = 60
+  });
+
+  it("treats unknown-duration sources (e.g. NASA) as within budget", () => {
+    const nasa = { ...pexelsVideo("nasa-1", 9999), provider: "nasa" as const, duration_known: false };
+    expect(withinSourceDurationBudget(nasa, 4)).toBe(true);
+  });
+
+  it("classifies a 4-minute source as over budget for a 5-second scene", () => {
+    expect(withinSourceDurationBudget(pexelsVideo("long", 240), 5)).toBe(false);
+    expect(withinSourceDurationBudget(pexelsVideo("short", 15), 5)).toBe(true);
+  });
+
+  it("never selects an over-budget source when shorter candidates exist", () => {
+    // Index 0 is the longest (highest API relevance) but 4 minutes long; the rest
+    // are short. The 4-minute source must never be chosen across many seeds.
+    const candidates: StockVideo[] = [
+      pexelsVideo("long-240s", 240),
+      ...Array.from({ length: 9 }, (_, i) => pexelsVideo(`short-${i}`, 12 + i)),
+    ];
+    const picks = new Set(
+      Array.from({ length: 40 }, (_, i) =>
+        selectStockCandidate({
+          results: candidates,
+          minDurationSec: 5,
+          targetWidth: 1920,
+          usedIds: [],
+          seed: `project-${i}:scene-1`,
+        })?.pick.provider_clip_id,
+      ),
+    );
+    expect(picks.has("long-240s")).toBe(false);
+    expect(picks.size).toBeGreaterThan(1); // still varies across the short pool
+  });
+
+  it("falls back to a long source only when nothing fits the budget", () => {
+    const candidates = [pexelsVideo("long-a", 300), pexelsVideo("long-b", 280)];
+    const result = selectStockCandidate({
+      results: candidates,
+      minDurationSec: 5,
+      targetWidth: 1920,
+      usedIds: [],
+      seed: "project-x:scene-1",
+    });
+    expect(result).not.toBeNull();
+    expect(["long-a", "long-b"]).toContain(result?.pick.provider_clip_id);
   });
 });
 

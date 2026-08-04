@@ -18,6 +18,10 @@ vi.mock("../stock.server", () => ({
       .filter(Boolean),
   stockReservationKey: (provider: string, id: string, inPoint = 0) =>
     provider === "nasa" ? `${provider}:${id}:${inPoint}` : `${provider}:${id}`,
+  withinSourceDurationBudget: (
+    v: { duration_sec: number; duration_known?: boolean },
+    minDurationSec: number,
+  ) => v.duration_known === false || v.duration_sec <= Math.max(minDurationSec * 6, 30),
 }));
 
 import { clusterStockQueries, matchStockCorpus } from "../stock-corpus.server";

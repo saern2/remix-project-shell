@@ -35,6 +35,27 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const SEEDED_TOP_CANDIDATES = 10;
 const NASA_IN_POINT_BUCKET_SECONDS = 5;
 
+// Round 6, Issue 1 / 2b: a scene needs only a few seconds of footage, but the
+// stock APIs expose no file size — only width/height/duration. File size is
+// dominated by duration, so a multi-minute source for a five-second scene is the
+// 986 MB download. Prefer sources whose duration is within a budget of what the
+// scene needs, falling back to longer clips only when no shorter candidate exists.
+// This composes with the worker's hard MAX_CLIP_BYTES ceiling: selection avoids
+// oversized clips; the worker rejects any that still slip through.
+const SOURCE_DURATION_BUDGET_MULTIPLE = 6;
+const MIN_SOURCE_DURATION_BUDGET_SEC = 30;
+
+export function sourceDurationBudgetSeconds(minDurationSec: number): number {
+  return Math.max(minDurationSec * SOURCE_DURATION_BUDGET_MULTIPLE, MIN_SOURCE_DURATION_BUDGET_SEC);
+}
+
+export function withinSourceDurationBudget(video: StockVideo, minDurationSec: number): boolean {
+  // Unknown duration (e.g. some NASA assets) is not penalised — the NASA source
+  // window logic already bounds how much of it is used.
+  if (video.duration_known === false) return true;
+  return video.duration_sec <= sourceDurationBudgetSeconds(minDurationSec);
+}
+
 const SPACE_THEME_TERMS = CATEGORY_THEMES.space;
 
 export type PoolKey = {
@@ -783,7 +804,12 @@ export function selectStockCandidate(opts: {
   );
   if (opts.requireMinDuration && longEnough.length === 0) return null;
   const candidateMeta = longEnough.length > 0 ? longEnough : eligible;
-  const top = [...candidateMeta].sort((a, b) => a.index - b.index).slice(0, SEEDED_TOP_CANDIDATES);
+  // Prefer sources within the duration budget; fall back to all only if none fit.
+  const budgeted = candidateMeta.filter(({ video }) =>
+    withinSourceDurationBudget(video, opts.minDurationSec),
+  );
+  const preferredMeta = budgeted.length > 0 ? budgeted : candidateMeta;
+  const top = [...preferredMeta].sort((a, b) => a.index - b.index).slice(0, SEEDED_TOP_CANDIDATES);
   const selected = top[seededIndex(`${opts.seed ?? "stock"}:candidate`, top.length)];
   const pick = selected.video;
   const sortedFiles = [...pick.files].sort((a, b) => a.width - b.width);
