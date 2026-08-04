@@ -108,14 +108,14 @@ describe('config.js — validation: JOB_BACKOFF_DELAY_MS', () => {
     restoreEnv('JOB_BACKOFF_DELAY_MS', 'WORKER_API_KEY');
   });
 
-  it('throws when JOB_BACKOFF_DELAY_MS=0', () => {
+  it('does NOT throw when JOB_BACKOFF_DELAY_MS=0 (zero means retry immediately)', () => {
     process.env.JOB_BACKOFF_DELAY_MS = '0';
-    expect(() => loadConfig()).toThrow('JOB_BACKOFF_DELAY_MS must be > 0');
+    expect(() => loadConfig()).not.toThrow();
   });
 
   it('throws when JOB_BACKOFF_DELAY_MS is negative', () => {
     process.env.JOB_BACKOFF_DELAY_MS = '-500';
-    expect(() => loadConfig()).toThrow('JOB_BACKOFF_DELAY_MS must be > 0');
+    expect(() => loadConfig()).toThrow('JOB_BACKOFF_DELAY_MS must be >= 0');
   });
 
   it('does not throw when JOB_BACKOFF_DELAY_MS=100', () => {

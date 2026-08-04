@@ -30,6 +30,12 @@ const { getQueue, getJobStatus, getRedisConnection, startWorker, getFlowProducer
 const { validatePayload } = require('./renderJob');
 const { buildChunkOpts, writeCancelFlag } = require('./pipelineReliability');
 const { cancelJobsByPrefix } = require('./cancelJobs');
+const {
+  getInFlightProjects,
+  chooseFairnessSlot,
+  chunkPriority,
+  withFairnessAllocation,
+} = require('./fairScheduling');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -69,59 +75,74 @@ app.post('/jobs', requireApiKey, async (req, res) => {
       const job = await queue.add('render', payload, { jobId });
       isNew = job.timestamp > Date.now() - 2000;
     } else {
-      const stitchQueue = getQueue(QUEUE_STITCH);
-      const activeStitches = await stitchQueue.getActive();
-      const activeProjectsCount = activeStitches.filter(j => j.data.user_id && j.data.user_id === payload.user_id).length;
-      
       const chunks = [];
       for (let i = 0; i < payload.clips.length; i += config.chunkSize) {
         chunks.push(payload.clips.slice(i, i + config.chunkSize));
       }
 
       const flowProducer = getFlowProducer();
-      
-      // Calculate priority: chunk index + (active projects * 1000)
-      const basePriority = (activeProjectsCount * 1000);
-
       const { audio_url, ...chunkPayloadBase } = payload;
 
-      const chunkJobs = chunks.map((chunk, index) => {
-        return {
-          name: 'render-chunk',
-          queueName: QUEUE_CHUNK,
+      // Round-robin fair scheduling across concurrent projects.
+      // Counts in-flight projects by distinct parent job IDs with incomplete
+      // children (stitch waiting-children + chunk waiting + active).
+      // No user_id filter — fairness is across all projects, not per user.
+      // Intended interleaving: each project gets its chunks interleaved with
+      // other projects' chunks at equal priority rather than being starved
+      // behind the first project's full chunk set.
+      const flowJob = await withFairnessAllocation(async () => {
+        const stitchQ = getQueue(QUEUE_STITCH);
+        const chunkQ = getQueue(QUEUE_CHUNK);
+        const inFlightProjects = await getInFlightProjects(stitchQ, chunkQ);
+
+        let slot;
+        try {
+          slot = chooseFairnessSlot(inFlightProjects, config.fairnessPriorityStride);
+        } catch {
+          // More concurrent projects than stride allows — fall back gracefully
+          slot = inFlightProjects.size;
+        }
+
+        const chunkJobs = chunks.map((chunk, index) => {
+          return {
+            name: 'render-chunk',
+            queueName: QUEUE_CHUNK,
+            data: {
+              ...chunkPayloadBase,
+              clips: chunk,
+              chunk_index: index,
+              chunks_total: chunks.length,
+              is_chunk: true,
+              _fairness_slot: slot,
+            },
+            opts: {
+              jobId: `${jobId}-chunk-${index}`,
+              priority: chunkPriority(index, slot, config.fairnessPriorityStride),
+              ...buildChunkOpts(chunk, config),
+            }
+          };
+        });
+
+        const flowTree = {
+          name: 'render-stitch',
+          queueName: QUEUE_STITCH,
           data: {
-            ...chunkPayloadBase,
-            clips: chunk,
-            chunk_index: index,
+            ...payload,
             chunks_total: chunks.length,
-            is_chunk: true,
+            is_stitch: true,
+            _fairness_slot: slot,
           },
           opts: {
-            jobId: `${jobId}-chunk-${index}`,
-            priority: basePriority + index + 1, // lower number = higher priority
-            ...buildChunkOpts(chunk, config),
-          }
+            jobId: `${jobId}-stitch`,
+          },
+          children: chunkJobs
         };
+
+        return flowProducer.add(flowTree);
       });
 
-      const flowTree = {
-        name: 'render-stitch',
-        queueName: QUEUE_STITCH,
-        data: {
-          ...payload,
-          chunks_total: chunks.length,
-          is_stitch: true,
-        },
-        opts: {
-          jobId: `${jobId}-stitch`,
-        },
-        children: chunkJobs
-      };
-
-      const flowJob = await flowProducer.add(flowTree);
       isNew = flowJob.job.timestamp > Date.now() - 2000;
     }
-
     logger.info({ jobId, isNew, isChunked }, 'Job enqueued');
 
     return res.status(isNew ? 202 : 200).json({
