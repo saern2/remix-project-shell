@@ -5,6 +5,49 @@ import type { StockSearchSession } from "@/lib/stock.server";
 
 const ProjectIdInput = z.object({ projectId: z.string().uuid() });
 
+// Round 6, Issue 6 / Issue B: bound the matching_footage stage so no single poll
+// invocation runs long enough to saturate the serverless runtime, and prevent
+// concurrent polls from starting duplicate work.
+//
+// MATCHING_BATCH_SIZE — scenes/slots matched per poll. The stage is idempotent
+//   (already-selected scenes and cached slices are skipped), so remaining work
+//   resumes on the next poll. Keep this small enough that one matchStockCorpus
+//   call over the batch stays well under the runtime's request budget.
+// MATCHING_LOCK_TTL_MS — how long a claimed lock is honoured before it is treated
+//   as stale (holder crashed). Must comfortably exceed one batch's wall-clock.
+const MATCHING_BATCH_SIZE = 25;
+const MATCHING_LOCK_TTL_MS = 90_000;
+
+/**
+ * Atomically claim the per-project matching lock. Returns true if this poll now
+ * owns the lock, false if a peer holds a fresh one (in which case the caller
+ * should return status matching_footage and let the peer finish). The UPDATE is
+ * a single atomic row operation, so exactly one of two racing polls wins.
+ */
+async function claimMatchingLock(projectId: string): Promise<boolean> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const staleBefore = new Date(Date.now() - MATCHING_LOCK_TTL_MS).toISOString();
+  const { data, error } = await supabaseAdmin
+    .from("projects")
+    .update({ matching_lock_at: new Date().toISOString() })
+    .eq("id", projectId)
+    .is("pipeline_cancel_requested_at", null)
+    .or(`matching_lock_at.is.null,matching_lock_at.lt.${staleBefore}`)
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return !!data;
+}
+
+async function releaseMatchingLock(projectId: string): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  await supabaseAdmin
+    .from("projects")
+    .update({ matching_lock_at: null })
+    .eq("id", projectId)
+    .then(undefined, () => undefined);
+}
+
 class PipelineStoppedError extends Error {
   constructor() {
     super("Project processing stopped because the project was deleted.");
@@ -397,6 +440,20 @@ async function advanceFromGeneratingScenes(projectId: string) {
 async function advanceFromMatchingFootage(projectId: string) {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   let stockSession: StockSearchSession | null = null;
+
+  // Single-flight guard: if a peer poll is already matching this project, do not
+  // start duplicate work — return matching_footage so the client keeps polling.
+  let lockHeld = false;
+  try {
+    lockHeld = await claimMatchingLock(projectId);
+  } catch (err) {
+    if (isPipelineStopped(err)) return { status: "cancelled", error_message: null };
+    throw err;
+  }
+  if (!lockHeld) {
+    return { status: "matching_footage", error_message: null };
+  }
+
   try {
     await assertPipelineWritable(projectId);
     const { data: project, error: pErr } = await supabaseAdmin
@@ -556,6 +613,9 @@ async function advanceFromMatchingFootage(projectId: string) {
       const pendingSlots = expectedSlots.filter(
         (slot) => !sliceCache.has(sliceKey(slot.sceneId, slot.sliceIndex)),
       );
+      // Bound this invocation to one batch; remaining slots resume on the next
+      // poll (cached slices above are skipped, so this is idempotent).
+      const batchSlots = pendingSlots.slice(0, MATCHING_BATCH_SIZE);
       const newSliceRows: Array<{
         project_id: string;
         scene_id: string;
@@ -575,7 +635,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
       const fixedAssignments = await matchStockCorpus({
         projectId,
-        demands: pendingSlots.flatMap((slot) => {
+        demands: batchSlots.flatMap((slot) => {
           const scene = sceneById.get(slot.sceneId);
           if (!scene?.visual_query) return [];
           return [
@@ -594,7 +654,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         session: stockSession,
       });
 
-      await asyncPool(pendingSlots, FIXED_DURATION_CONCURRENCY, async (slot) => {
+      await asyncPool(batchSlots, FIXED_DURATION_CONCURRENCY, async (slot) => {
         const result = fixedAssignments.get(sliceKey(slot.sceneId, slot.sliceIndex));
         if (!result) {
           unmatchedSlots.push(slot);
@@ -625,6 +685,18 @@ async function advanceFromMatchingFootage(projectId: string) {
         throw new Error(
           `Could not match stock footage for ${unmatchedSlots.length} fixed-duration slot(s): ${describeMissingSlots(unmatchedSlots)}. Try a different category or clip duration, then retry matching.`,
         );
+      }
+
+      // More slots remain — stay in matching_footage so the next poll continues.
+      if (pendingSlots.length > batchSlots.length) {
+        await assertPipelineWritable(projectId);
+        console.info("[matching_footage:fixed-duration] batch complete, more pending", {
+          projectId,
+          processedThisPoll: batchSlots.length,
+          remaining: pendingSlots.length - batchSlots.length,
+          elapsedMs: Date.now() - startedAt,
+        });
+        return { status: "matching_footage", error_message: null };
       }
 
       const { data: finalSlices } = await supabaseAdmin
@@ -768,11 +840,14 @@ async function advanceFromMatchingFootage(projectId: string) {
     );
     const CONCURRENCY = 5;
     const pending = scenes.filter((s) => !alreadySelected.has(s.id));
+    // Bound this invocation to one batch; already-selected scenes are skipped on
+    // re-entry, so the remaining scenes resume on the next poll.
+    const batch = pending.slice(0, MATCHING_BATCH_SIZE);
     const unmatchedSceneIds = new Set<string>();
     const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
     const plainAssignments = await matchStockCorpus({
       projectId,
-      demands: pending.flatMap((scene) => {
+      demands: batch.flatMap((scene) => {
         if (!scene.visual_query) return [];
         const visualDuration =
           timelineSlots.get(scene.id)?.durationSeconds ??
@@ -837,7 +912,7 @@ async function advanceFromMatchingFootage(projectId: string) {
 
     const { asyncPool } = await import("@/lib/clip-slices.server");
     const startedAt = Date.now();
-    await asyncPool(pending, CONCURRENCY, processScene);
+    await asyncPool(batch, CONCURRENCY, processScene);
 
     if (unmatchedSceneIds.size > 0) {
       throw new Error(
@@ -845,6 +920,18 @@ async function advanceFromMatchingFootage(projectId: string) {
           ? `NASA, Pexels, and Pixabay could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`
           : `Pexels and Pixabay could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`,
       );
+    }
+
+    // More scenes remain — stay in matching_footage so the next poll continues.
+    if (pending.length > batch.length) {
+      await assertPipelineWritable(projectId);
+      console.info("[matching_footage:plain] batch complete, more pending", {
+        projectId,
+        processedThisPoll: batch.length,
+        remaining: pending.length - batch.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return { status: "matching_footage", error_message: null };
     }
 
     const { data: completedSelections } = await supabaseAdmin
@@ -903,6 +990,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         });
       });
     }
+    if (lockHeld) await releaseMatchingLock(projectId);
   }
 }
 
