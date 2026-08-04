@@ -55,7 +55,7 @@ class Semaphore {
   }
 }
 
-const cdnSemaphore = new Semaphore(config.globalCdnConcurrency || 15);
+const cdnSemaphore = new Semaphore(config.globalCdnConcurrency || 4);
 
 function isCdnUrl(urlStr) {
   try {
@@ -143,100 +143,173 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
   }
 
   let abortHandler;
+  const startTime = Date.now();
   try {
     return await new Promise((resolve, reject) => {
       let bytesWritten = 0;
+      let expectedBytes = null;
       let finished = false;
-      const timeoutMs = config.downloadTimeoutSeconds * 1000;
+      let activeReq = null;
+      let lastProgressTime = Date.now();
 
-    // Track abort signal
-    if (signal?.aborted) {
-      return reject(new Error('Download aborted before start'));
-    }
+      // Stall timeout: abort only when no bytes have arrived for stallMs, so a
+      // slow-but-progressing transfer is allowed to finish (round 6, Issue 3).
+      // maxMs is an absolute backstop regardless of progress.
+      const stallMs = Math.max(1000, config.downloadStallTimeoutSeconds * 1000);
+      const maxMs = Math.max(stallMs, config.downloadMaxSeconds * 1000);
 
-    function doRequest(requestUrl, redirectCount = 0) {
-      if (redirectCount > 5) {
-        return reject(new Error(`Too many redirects for URL: ${url}`));
+      let stallTimer = null;
+      let maxTimer = null;
+
+      const clearTimers = () => {
+        if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+        if (maxTimer) { clearTimeout(maxTimer); maxTimer = null; }
+      };
+
+      // Reject with a message that distinguishes "nothing ever arrived" from
+      // "90% complete when the clock ran out" (round 6, Issue 3.4).
+      const failWith = (reason) => {
+        if (finished) return;
+        finished = true;
+        clearTimers();
+        try { activeReq?.destroy(); } catch { /* already destroyed */ }
+        const elapsedMs = Date.now() - startTime;
+        const mbps = elapsedMs > 0 ? (bytesWritten / (1024 * 1024)) / (elapsedMs / 1000) : 0;
+        reject(new Error(
+          `Download ${reason} for ${url}: received ${bytesWritten} of ` +
+          `${expectedBytes ?? 'unknown'} bytes in ${elapsedMs}ms (${mbps.toFixed(2)} MB/s)`
+        ));
+      };
+
+      const armStallTimer = () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+          const idleS = Math.round((Date.now() - lastProgressTime) / 1000);
+          failWith(`stalled (no bytes for ${idleS}s)`);
+        }, stallMs);
+        stallTimer.unref?.();
+      };
+
+      if (signal?.aborted) {
+        return reject(new Error('Download aborted before start'));
       }
 
-      const parsedReq = new URL(requestUrl);
-      const mod = parsedReq.protocol === 'https:' ? https : http;
+      // A single abort handler for this download — destroys whichever request is
+      // currently active (survives redirects without leaking listeners).
+      abortHandler = () => failWith('aborted');
+      signal?.addEventListener('abort', abortHandler);
 
-      const req = mod.get(requestUrl, { signal }, (res) => {
-        // Handle redirects
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          const redirectUrl = new URL(res.headers.location, requestUrl).href;
-          try { assertAllowedUrl(redirectUrl); } catch (e) { return reject(e); }
-          res.resume(); // consume and discard redirect body
-          return doRequest(redirectUrl, redirectCount + 1);
+      maxTimer = setTimeout(
+        () => failWith(`exceeded absolute ceiling of ${config.downloadMaxSeconds}s`),
+        maxMs,
+      );
+      maxTimer.unref?.();
+      armStallTimer();
+
+      function doRequest(requestUrl, redirectCount = 0) {
+        if (redirectCount > 5) {
+          finished = true;
+          clearTimers();
+          return reject(new Error(`Too many redirects for URL: ${url}`));
         }
 
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          res.resume();
-          return reject(new Error(`HTTP ${res.statusCode} downloading: ${url}`));
-        }
+        const parsedReq = new URL(requestUrl);
+        const mod = parsedReq.protocol === 'https:' ? https : http;
 
-        // Pre-check Content-Length
-        const cl = parseInt(res.headers['content-length'] ?? '0', 10);
-        if (cl > maxBytes) {
-          res.destroy();
-          return reject(new Error(
-            `Download rejected: Content-Length ${cl} exceeds limit ${maxBytes} for: ${url}`
-          ));
-        }
-
-        const writeStream = fs.createWriteStream(destPath);
-
-        res.on('data', (chunk) => {
-          bytesWritten += chunk.length;
-          if (bytesWritten > maxBytes) {
-            res.destroy();
-            writeStream.destroy();
-            if (!finished) {
-              finished = true;
-              reject(new Error(`Download exceeded max size ${maxBytes} bytes for: ${url}`));
+        const req = mod.get(requestUrl, {}, (res) => {
+          // Handle redirects
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            const redirectUrl = new URL(res.headers.location, requestUrl).href;
+            try { assertAllowedUrl(redirectUrl); } catch (e) {
+              if (!finished) { finished = true; clearTimers(); reject(e); }
+              return;
             }
+            res.resume(); // consume and discard redirect body
+            return doRequest(redirectUrl, redirectCount + 1);
           }
-        });
 
-        pipeline(res, writeStream)
-          .then(() => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            res.resume();
             if (!finished) {
               finished = true;
-              logger.debug({ url, destPath, bytesWritten }, 'Download complete');
-              resolve(bytesWritten);
+              clearTimers();
+              reject(new Error(`HTTP ${res.statusCode} downloading: ${url}`));
             }
-          })
-          .catch((err) => {
+            return;
+          }
+
+          // Pre-check Content-Length against the ceiling. This is where an
+          // oversized source clip (e.g. a 986 MB variant) is rejected fast with
+          // a clear message instead of timing out mid-transfer (round 6, Issue 1.5).
+          const cl = parseInt(res.headers['content-length'] ?? '0', 10);
+          expectedBytes = Number.isFinite(cl) && cl > 0 ? cl : null;
+          if (cl > maxBytes) {
+            res.destroy();
             if (!finished) {
               finished = true;
-              reject(new Error(`Stream error downloading ${url}: ${err.message}`));
+              clearTimers();
+              reject(new Error(
+                `Download rejected: Content-Length ${cl} exceeds per-file limit ${maxBytes} for: ${url}`
+              ));
+            }
+            return;
+          }
+
+          const writeStream = fs.createWriteStream(destPath);
+
+          res.on('data', (chunk) => {
+            bytesWritten += chunk.length;
+            lastProgressTime = Date.now();
+            armStallTimer();
+            if (bytesWritten > maxBytes) {
+              res.destroy();
+              writeStream.destroy();
+              if (!finished) {
+                finished = true;
+                clearTimers();
+                reject(new Error(`Download exceeded max size ${maxBytes} bytes for: ${url}`));
+              }
             }
           });
-      });
 
-      // Timeout
-      const timer = setTimeout(() => {
-        req.destroy(new Error(`Download timed out after ${timeoutMs}ms for: ${url}`));
-      }, timeoutMs);
+          pipeline(res, writeStream)
+            .then(() => {
+              if (!finished) {
+                finished = true;
+                clearTimers();
+                const elapsedMs = Date.now() - startTime;
+                const mbps = elapsedMs > 0
+                  ? (bytesWritten / (1024 * 1024)) / (elapsedMs / 1000)
+                  : 0;
+                logger.info(
+                  { url, destPath, bytes: bytesWritten, elapsedMs, mbps: Number(mbps.toFixed(2)) },
+                  'Download complete',
+                );
+                resolve(bytesWritten);
+              }
+            })
+            .catch((err) => {
+              if (!finished) {
+                finished = true;
+                clearTimers();
+                reject(new Error(`Stream error downloading ${url}: ${err.message}`));
+              }
+            });
+        });
 
-      req.on('error', (err) => {
-        clearTimeout(timer);
-        if (!finished) {
-          finished = true;
-          reject(new Error(`Network error downloading ${url}: ${err.message}`));
-        }
-      });
+        activeReq = req;
 
-      req.on('close', () => clearTimeout(timer));
+        req.on('error', (err) => {
+          if (!finished) {
+            finished = true;
+            clearTimers();
+            reject(new Error(`Network error downloading ${url}: ${err.message}`));
+          }
+        });
+      }
 
-      // Wire abort signal — handler captured in outer scope for cleanup in finally
-      abortHandler = () => req.destroy(new Error('Download aborted'));
-      signal?.addEventListener('abort', abortHandler);
-    }
-
-    doRequest(url);
-  });
+      doRequest(url);
+    });
   } finally {
     if (abortHandler && signal) {
       signal.removeEventListener('abort', abortHandler);
@@ -357,45 +430,99 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
   let totalBytes = 0;
   const clipPaths = new Map();
 
-  const downloadTask = async (url, destPath) => {
-    const bytes = await downloadFile(url, destPath, { signal });
-    totalBytes += bytes;
-    if (totalBytes > config.maxDownloadBytes) {
-      throw new Error(`Total download size exceeds limit of ${config.maxDownloadBytes} bytes`);
+  // ── Abort fan-out (round 6, Issue 5) ────────────────────────────────────────
+  // Give each download its own child AbortController and attach exactly ONE
+  // listener to the parent signal, which aborts every active child. This keeps
+  // the parent's listener count at 1 regardless of how many clips download
+  // concurrently, instead of one listener per in-flight download (which tripped
+  // MaxListenersExceededWarning on every chunk start).
+  const childControllers = new Set();
+  const onParentAbort = () => {
+    for (const c of childControllers) {
+      try { c.abort(); } catch { /* already aborted */ }
+    }
+  };
+  if (signal) signal.addEventListener('abort', onParentAbort, { once: true });
+
+  const downloadTask = async (url, destPath, maxBytes) => {
+    const child = new AbortController();
+    if (signal?.aborted) child.abort();
+    childControllers.add(child);
+    try {
+      const bytes = await downloadFile(url, destPath, { maxBytes, signal: child.signal });
+      totalBytes += bytes;
+      if (totalBytes > config.maxDownloadBytes) {
+        throw new Error(`Total download size exceeds limit of ${config.maxDownloadBytes} bytes`);
+      }
+      return bytes;
+    } finally {
+      childControllers.delete(child);
     }
   };
 
-  const tasks = [];
+  try {
+    const tasks = [];
 
-  // Audio task
-  let audioPath = null;
-  if (audioUrl) {
-    tasks.push(async () => {
-      let audioExt = '.mp3';
-      try { audioExt = path.extname(new URL(audioUrl).pathname) || '.mp3'; } catch {}
-      audioPath = path.join(tempDir, `audio${audioExt}`);
-      await downloadTask(audioUrl, audioPath);
-    });
-  }
+    // Audio task — audio uses the generous whole-job ceiling, not the per-clip one.
+    let audioPath = null;
+    if (audioUrl) {
+      tasks.push(async () => {
+        let audioExt = '.mp3';
+        try { audioExt = path.extname(new URL(audioUrl).pathname) || '.mp3'; } catch {}
+        audioPath = path.join(tempDir, `audio${audioExt}`);
+        await downloadTask(audioUrl, audioPath, config.maxDownloadBytes);
+      });
+    }
 
-  // Fallback clips tasks
-  for (const i of fallbackIndices) {
-    tasks.push(async () => {
+    // ── Intra-batch URL de-duplication (round 6, Issue 4.2) ───────────────────
+    // Two clips in the same chunk that need the same source URL share a single
+    // download rather than fetching it twice. The first index owning a URL does
+    // the fetch; the rest reuse its local path once it lands.
+    const urlToPrimaryIndex = new Map();
+    let dedupedDownloads = 0;
+    const primaryIndices = [];
+    for (const i of fallbackIndices) {
       const { clip_url } = clips[i];
-      let ext = '.mp4';
-      try { ext = path.extname(new URL(clip_url).pathname) || '.mp4'; } catch {}
-      const destPath = path.join(tempDir, `clip_${i}${ext}`);
-      
-      await downloadTask(clip_url, destPath);
-      clipPaths.set(i, destPath);
-    });
+      if (urlToPrimaryIndex.has(clip_url)) {
+        dedupedDownloads += 1;
+        continue;
+      }
+      urlToPrimaryIndex.set(clip_url, i);
+      primaryIndices.push(i);
+    }
+
+    for (const i of primaryIndices) {
+      tasks.push(async () => {
+        const { clip_url } = clips[i];
+        let ext = '.mp4';
+        try { ext = path.extname(new URL(clip_url).pathname) || '.mp4'; } catch {}
+        const destPath = path.join(tempDir, `clip_${i}${ext}`);
+        await downloadTask(clip_url, destPath, config.maxClipBytes);
+        // Point every index that shares this URL at the single downloaded file.
+        for (const j of fallbackIndices) {
+          if (clips[j].clip_url === clip_url) clipPaths.set(j, destPath);
+        }
+      });
+    }
+
+    // The global CDN semaphore is the real cap on concurrent transfers; keep the
+    // local pool no wider than that so we don't spin up idle child controllers.
+    const poolConcurrency = Math.max(1, config.globalCdnConcurrency || 4);
+    await asyncPool(poolConcurrency, tasks, (t) => t());
+
+    logger.info(
+      {
+        totalBytes,
+        fallbackCount: fallbackIndices.length,
+        uniqueDownloads: primaryIndices.length,
+        dedupedDownloads,
+      },
+      'Required assets downloaded',
+    );
+    return { clipPaths, audioPath };
+  } finally {
+    if (signal) signal.removeEventListener('abort', onParentAbort);
   }
-
-  // Execute concurrently with max 8 parallel downloads
-  await asyncPool(8, tasks, (t) => t());
-
-  logger.info({ totalBytes, fallbackCount: fallbackIndices.length }, 'Required assets downloaded');
-  return { clipPaths, audioPath };
 }
 
 module.exports = { downloadFile, downloadAll, preFlightCheckUrl, assertAllowedUrl, asyncPool };

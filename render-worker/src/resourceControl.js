@@ -142,11 +142,17 @@ async function readyChunkOutput(outputPath) {
 function abortableSleep(ms, signal) {
   if (signal?.aborted) return Promise.reject(new Error('Operation aborted while waiting for chunk lease'));
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
     const onAbort = () => {
       clearTimeout(timer);
       reject(new Error('Operation aborted while waiting for chunk lease'));
     };
+    const timer = setTimeout(() => {
+      // Remove the abort listener on the normal path too — otherwise each poll
+      // iteration leaks a listener on the (long-lived, per-phase) signal until it
+      // is GC'd, which compounds the MaxListenersExceededWarning (round 6, Issue 5).
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
