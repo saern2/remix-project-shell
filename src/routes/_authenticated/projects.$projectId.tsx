@@ -6,7 +6,11 @@ import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
-import { isMissingPollResult, pollIntervalWhileActive } from "@/lib/polling-state";
+import {
+  isMissingPollResult,
+  nextPollDelayMs,
+  pollIntervalWhileActive,
+} from "@/lib/polling-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -423,8 +427,10 @@ function ProjectDetail() {
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let consecutiveErrors = 0;
 
     const tick = async () => {
+      let hadError = false;
       try {
         const result = await runPoll({ data: { projectId } });
         if (isMissingPollResult(result)) {
@@ -435,15 +441,21 @@ function ProjectDetail() {
           void navigate({ to: "/dashboard", replace: true });
           return;
         }
+        consecutiveErrors = 0;
       } catch (err) {
-        // Surface non-abort errors once; the query refetch will show the failed state.
-        if (!cancelled) toast.error((err as Error).message);
+        hadError = true;
+        consecutiveErrors += 1;
+        // Surface the error only on the first failure of a streak; the query
+        // refetch will show the failed state and repeated toasts would be noise.
+        if (!cancelled && consecutiveErrors === 1) toast.error((err as Error).message);
       }
       if (!cancelled) {
         // React Query is refetching the project row on its own interval;
         // just invalidate to pick up the new status.
         queryClient.invalidateQueries({ queryKey: ["project", projectId] });
-        timer = setTimeout(tick, 4000);
+        // Back off on consecutive errors so a struggling matching invocation is
+        // not piled on by fixed-interval retries (round 6, Issue 6).
+        timer = setTimeout(tick, nextPollDelayMs(hadError ? consecutiveErrors : 0));
       }
     };
     tick();
