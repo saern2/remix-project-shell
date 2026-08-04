@@ -1,6 +1,11 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import {
+  createMatchingBudget,
+  matchingSliceSize,
+  matchingTimeBudgetMs,
+} from "@/lib/matching-budget";
 import type { StockSearchSession } from "@/lib/stock.server";
 
 const ProjectIdInput = z.object({ projectId: z.string().uuid() });
@@ -9,13 +14,13 @@ const ProjectIdInput = z.object({ projectId: z.string().uuid() });
 // invocation runs long enough to saturate the serverless runtime, and prevent
 // concurrent polls from starting duplicate work.
 //
-// MATCHING_BATCH_SIZE — scenes/slots matched per poll. The stage is idempotent
-//   (already-selected scenes and cached slices are skipped), so remaining work
-//   resumes on the next poll. Keep this small enough that one matchStockCorpus
-//   call over the batch stays well under the runtime's request budget.
+// Work per invocation is bounded by WALL-CLOCK TIME, not a scene count. A fixed
+// 25-scene batch measured 38-44s in production and blocked unrelated requests
+// (isAdmin peaked at 17,235ms while matching ran; auth calls that did not overlap
+// a long match stayed at a 1.5s median). See matching-budget.ts.
+//
 // MATCHING_LOCK_TTL_MS — how long a claimed lock is honoured before it is treated
-//   as stale (holder crashed). Must comfortably exceed one batch's wall-clock.
-const MATCHING_BATCH_SIZE = 25;
+//   as stale (holder crashed). Must comfortably exceed one invocation's budget.
 const MATCHING_LOCK_TTL_MS = 90_000;
 
 /**
@@ -616,9 +621,6 @@ async function advanceFromMatchingFootage(projectId: string) {
       const pendingSlots = expectedSlots.filter(
         (slot) => !sliceCache.has(sliceKey(slot.sceneId, slot.sliceIndex)),
       );
-      // Bound this invocation to one batch; remaining slots resume on the next
-      // poll (cached slices above are skipped, so this is idempotent).
-      const batchSlots = pendingSlots.slice(0, MATCHING_BATCH_SIZE);
       const newSliceRows: Array<{
         project_id: string;
         scene_id: string;
@@ -635,54 +637,71 @@ async function advanceFromMatchingFootage(projectId: string) {
       const unmatchedSlots: typeof pendingSlots = [];
       const FIXED_DURATION_CONCURRENCY = 4;
 
+      // Time-budgeted slice loop. matchStockCorpus cannot be preempted mid-call,
+      // so the budget is checked between small slices rather than mid-flight.
       const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
-      const fixedAssignments = await matchStockCorpus({
-        projectId,
-        demands: batchSlots.flatMap((slot) => {
-          const scene = sceneById.get(slot.sceneId);
-          if (!scene?.visual_query) return [];
-          return [
-            {
-              id: sliceKey(slot.sceneId, slot.sliceIndex),
-              query: scene.visual_query,
-              minDurationSec: slot.durationSeconds,
-              seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
-            },
-          ];
-        }),
-        orientation,
-        targetWidth,
-        niche: project.niche,
-        usedIds,
-        session: stockSession,
-      });
+      const budgetMs = matchingTimeBudgetMs();
+      const sliceSize = matchingSliceSize();
+      const budget = createMatchingBudget({ budgetMs });
+      let processedSlots = 0;
+      let slicesCompleted = 0;
 
-      await asyncPool(batchSlots, FIXED_DURATION_CONCURRENCY, async (slot) => {
-        const result = fixedAssignments.get(sliceKey(slot.sceneId, slot.sliceIndex));
-        if (!result) {
-          unmatchedSlots.push(slot);
-          return;
-        }
-        const providerClipId = result.pick.provider_clip_id;
-        const row = {
-          project_id: projectId,
-          scene_id: slot.sceneId,
-          slice_index: slot.sliceIndex,
-          clip_url: result.chosenFile.url,
-          provider_clip_id: providerClipId,
-          provider: result.pick.provider,
-          in_point_seconds: result.inPoint,
-          duration_seconds: slot.durationSeconds,
-          timeline_start_seconds: slot.timelineStart,
-          timeline_end_seconds: slot.timelineEnd,
-          thumbnail_url: result.pick.thumbnail_url ?? null,
-        };
-        newSliceRows.push(row);
-        const { error: sliceError } = await supabaseAdmin
-          .from("render_clip_slices")
-          .upsert(row, { onConflict: "project_id,scene_id,slice_index" });
-        throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
-      });
+      while (
+        processedSlots < pendingSlots.length &&
+        budget.shouldStartAnotherSlice(slicesCompleted)
+      ) {
+        const slice = pendingSlots.slice(processedSlots, processedSlots + sliceSize);
+        const fixedAssignments = await matchStockCorpus({
+          projectId,
+          demands: slice.flatMap((slot) => {
+            const scene = sceneById.get(slot.sceneId);
+            if (!scene?.visual_query) return [];
+            return [
+              {
+                id: sliceKey(slot.sceneId, slot.sliceIndex),
+                query: scene.visual_query,
+                minDurationSec: slot.durationSeconds,
+                seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
+              },
+            ];
+          }),
+          orientation,
+          targetWidth,
+          niche: project.niche,
+          usedIds,
+          session: stockSession,
+        });
+
+        await asyncPool(slice, FIXED_DURATION_CONCURRENCY, async (slot) => {
+          const result = fixedAssignments.get(sliceKey(slot.sceneId, slot.sliceIndex));
+          if (!result) {
+            unmatchedSlots.push(slot);
+            return;
+          }
+          const providerClipId = result.pick.provider_clip_id;
+          const row = {
+            project_id: projectId,
+            scene_id: slot.sceneId,
+            slice_index: slot.sliceIndex,
+            clip_url: result.chosenFile.url,
+            provider_clip_id: providerClipId,
+            provider: result.pick.provider,
+            in_point_seconds: result.inPoint,
+            duration_seconds: slot.durationSeconds,
+            timeline_start_seconds: slot.timelineStart,
+            timeline_end_seconds: slot.timelineEnd,
+            thumbnail_url: result.pick.thumbnail_url ?? null,
+          };
+          newSliceRows.push(row);
+          const { error: sliceError } = await supabaseAdmin
+            .from("render_clip_slices")
+            .upsert(row, { onConflict: "project_id,scene_id,slice_index" });
+          throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
+        });
+
+        processedSlots += slice.length;
+        slicesCompleted += 1;
+      }
 
       if (unmatchedSlots.length > 0) {
         throw new Error(
@@ -691,16 +710,27 @@ async function advanceFromMatchingFootage(projectId: string) {
       }
 
       // More slots remain — stay in matching_footage so the next poll continues.
-      if (pendingSlots.length > batchSlots.length) {
+      if (processedSlots < pendingSlots.length) {
         await assertPipelineWritable(projectId);
-        console.info("[matching_footage:fixed-duration] batch complete, more pending", {
+        console.info("[matching_footage:fixed-duration] budget spent, more pending", {
           projectId,
-          processedThisPoll: batchSlots.length,
-          remaining: pendingSlots.length - batchSlots.length,
-          elapsedMs: Date.now() - startedAt,
+          scenesProcessed: processedSlots,
+          slices: slicesCompleted,
+          elapsedMs: budget.elapsedMs(),
+          budgetMs,
+          remaining: pendingSlots.length - processedSlots,
         });
         return { status: "matching_footage", error_message: null };
       }
+
+      console.info("[matching_footage:fixed-duration] final invocation", {
+        projectId,
+        scenesProcessed: processedSlots,
+        slices: slicesCompleted,
+        elapsedMs: budget.elapsedMs(),
+        budgetMs,
+        remaining: 0,
+      });
 
       const { data: finalSlices } = await supabaseAdmin
         .from("render_clip_slices")
@@ -843,35 +873,13 @@ async function advanceFromMatchingFootage(projectId: string) {
     );
     const CONCURRENCY = 5;
     const pending = scenes.filter((s) => !alreadySelected.has(s.id));
-    // Bound this invocation to one batch; already-selected scenes are skipped on
-    // re-entry, so the remaining scenes resume on the next poll.
-    const batch = pending.slice(0, MATCHING_BATCH_SIZE);
     const unmatchedSceneIds = new Set<string>();
     const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
-    const plainAssignments = await matchStockCorpus({
-      projectId,
-      demands: batch.flatMap((scene) => {
-        if (!scene.visual_query) return [];
-        const visualDuration =
-          timelineSlots.get(scene.id)?.durationSeconds ??
-          Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
-        return [
-          {
-            id: scene.id,
-            query: scene.visual_query,
-            minDurationSec: Math.max(1, Math.ceil(visualDuration)),
-            seed: `${projectId}:${scene.id}`,
-          },
-        ];
-      }),
-      orientation,
-      targetWidth,
-      niche: projectNiche,
-      usedIds,
-      session: stockSession,
-    });
 
-    async function processScene(scene: NonNullable<typeof scenes>[number]) {
+    async function processScene(
+      scene: NonNullable<typeof scenes>[number],
+      plainAssignments: Awaited<ReturnType<typeof matchStockCorpus>>,
+    ) {
       const visualDuration =
         timelineSlots.get(scene.id)?.durationSeconds ??
         Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
@@ -915,7 +923,43 @@ async function advanceFromMatchingFootage(projectId: string) {
 
     const { asyncPool } = await import("@/lib/clip-slices.server");
     const startedAt = Date.now();
-    await asyncPool(batch, CONCURRENCY, processScene);
+
+    // Time-budgeted slice loop (see fixed-duration path above for rationale).
+    const budgetMs = matchingTimeBudgetMs();
+    const sliceSize = matchingSliceSize();
+    const budget = createMatchingBudget({ budgetMs });
+    let processedScenes = 0;
+    let slicesCompleted = 0;
+
+    while (processedScenes < pending.length && budget.shouldStartAnotherSlice(slicesCompleted)) {
+      const slice = pending.slice(processedScenes, processedScenes + sliceSize);
+      const plainAssignments = await matchStockCorpus({
+        projectId,
+        demands: slice.flatMap((scene) => {
+          if (!scene.visual_query) return [];
+          const visualDuration =
+            timelineSlots.get(scene.id)?.durationSeconds ??
+            Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
+          return [
+            {
+              id: scene.id,
+              query: scene.visual_query,
+              minDurationSec: Math.max(1, Math.ceil(visualDuration)),
+              seed: `${projectId}:${scene.id}`,
+            },
+          ];
+        }),
+        orientation,
+        targetWidth,
+        niche: projectNiche,
+        usedIds,
+        session: stockSession,
+      });
+
+      await asyncPool(slice, CONCURRENCY, (scene) => processScene(scene, plainAssignments));
+      processedScenes += slice.length;
+      slicesCompleted += 1;
+    }
 
     if (unmatchedSceneIds.size > 0) {
       throw new Error(
@@ -926,13 +970,15 @@ async function advanceFromMatchingFootage(projectId: string) {
     }
 
     // More scenes remain — stay in matching_footage so the next poll continues.
-    if (pending.length > batch.length) {
+    if (processedScenes < pending.length) {
       await assertPipelineWritable(projectId);
-      console.info("[matching_footage:plain] batch complete, more pending", {
+      console.info("[matching_footage:plain] budget spent, more pending", {
         projectId,
-        processedThisPoll: batch.length,
-        remaining: pending.length - batch.length,
-        elapsedMs: Date.now() - startedAt,
+        scenesProcessed: processedScenes,
+        slices: slicesCompleted,
+        elapsedMs: budget.elapsedMs(),
+        budgetMs,
+        remaining: pending.length - processedScenes,
       });
       return { status: "matching_footage", error_message: null };
     }
