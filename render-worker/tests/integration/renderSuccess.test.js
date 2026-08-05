@@ -22,7 +22,12 @@ const fs = require('fs');
 
 // Set env before any imports
 process.env.WORKER_API_KEY = 'test-api-key-12345';
-process.env.REDIS_URL = process.env.TEST_REDIS_URL || 'redis://localhost:6379';
+// Each integration file starts its OWN BullMQ workers on the SAME queue names.
+// Sharing one Redis database therefore lets them steal each other's jobs — a
+// 156-clip job picked up by a worker configured with MAX_CLIPS=20 fails
+// validation, and an SSRF job picked up by a worker with an empty allowlist is
+// never blocked. A database per file keeps the queues genuinely separate.
+process.env.REDIS_URL = process.env.TEST_REDIS_URL || 'redis://localhost:6379/1';
 process.env.URL_ALLOWLIST = '';
 process.env.TEMP_DIR = os.tmpdir() + '/int-test-success-tmp';
 process.env.OUTPUT_DIR = os.tmpdir() + '/int-test-success-out';

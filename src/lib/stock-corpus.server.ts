@@ -22,7 +22,32 @@ export type StockDemand = {
   query: string;
   minDurationSec: number;
   seed: string;
+  /**
+   * Position on the timeline. Only the last-resort reuse tier reads it, and it
+   * is what makes "never adjacent, maximise distance" expressible at all.
+   */
+  sceneIndex?: number;
 };
+
+/**
+ * Where a source has already been used in this project: which in-point windows
+ * are taken, and at which timeline positions.
+ *
+ * Rebuilt from persisted selections on every invocation, so it describes the
+ * WHOLE project rather than the current slice — which is the point.
+ */
+export type SourceUsage = Map<string, { windows: Set<number>; sceneIndexes: number[] }>;
+
+/** Which tier supplied a scene's clip. Reported so degradation is never silent. */
+export type AssignmentTier = "unique" | "alternate-window" | "distant-reuse";
+
+/**
+ * Minimum timeline distance between two uses of the same source. Adjacent reuse
+ * reads as a glitch; a dozen scenes apart reads as a motif.
+ */
+export const MIN_REUSE_SCENE_DISTANCE = 8;
+/** Absolute floor. Below this a repeat is visible as a repeat, so we would rather fail. */
+export const NEVER_REUSE_WITHIN = 2;
 
 export type StockQueryBucket = {
   id: string;
@@ -39,6 +64,22 @@ type MatchCorpusOptions = {
   niche?: ProjectNiche | string | null;
   usedIds: Set<string>;
   session: StockSearchSession;
+  /**
+   * The project-wide corpus. When present, matchStockCorpus assigns from it and
+   * performs NO searches of its own — clustering and provider work already
+   * happened once, for the whole project, in the corpus phase.
+   */
+  corpus?: Array<StockQueryBucket & { candidates: StockVideo[] }>;
+  /** Project-wide source usage, for the degradation tiers. */
+  sourceUsage?: SourceUsage;
+  /** Called for every scene that could not be matched uniquely. */
+  onFallback?: (event: {
+    demandId: string;
+    tier: AssignmentTier;
+    reason: string;
+    sourceKey: string;
+    sceneDistance: number | null;
+  }) => void;
 };
 
 const MIN_RELEVANCE = 0.18;
@@ -102,6 +143,12 @@ export function clusterStockQueries(
 export async function matchStockCorpus(
   opts: MatchCorpusOptions,
 ): Promise<Map<string, StockSearchResult>> {
+  // ── Corpus-backed path (round 8) ─────────────────────────────────────────
+  // The pools were clustered and searched ONCE for the whole project. Assignment
+  // therefore ranks across every bucket rather than the handful belonging to this
+  // slice — the property whose loss made late scenes unmatchable.
+  if (opts.corpus) return assignFromProjectCorpus(opts, opts.corpus);
+
   const buckets = clusterStockQueries(opts.demands);
   const providerQueries = buckets.map((bucket) =>
     opts.niche === "space" ? [bucket.query, "space astronomy cosmos"].join(" ") : bucket.query,
@@ -422,6 +469,304 @@ function selectGlobalCandidate(opts: {
     reservationKey: selected.reservationKey,
     fallbackUrls: fallbackRenditions(selected.video.files, chosenFile),
   };
+}
+
+// ─── Corpus-backed assignment with graded degradation (round 8) ──────────────
+
+/**
+ * Assigns every demand from the WHOLE project corpus.
+ *
+ * Three tiers, tried strictly in order, and only ever falling to the next when
+ * the one above is exhausted:
+ *
+ *   1. unique          — a source not used anywhere in this project
+ *   2. alternate-window— a different, non-overlapping in-point of a used source
+ *   3. distant-reuse   — the same window again, as far from its other uses as
+ *                        the timeline allows, and never adjacent
+ *
+ * Failing 145 scenes because 5 could not be unique is the wrong trade: a project
+ * with three distant repeats beats a project that does not exist. Every descent
+ * is reported through onFallback so degradation is visible, never silent.
+ */
+function assignFromProjectCorpus(
+  opts: MatchCorpusOptions,
+  corpus: Array<StockQueryBucket & { candidates: StockVideo[] }>,
+): Map<string, StockSearchResult> {
+  const assignments = new Map<string, StockSearchResult>();
+  const sourceUsage: SourceUsage = opts.sourceUsage ?? new Map();
+  const recentSources: string[] = [];
+
+  const buckets: StockQueryBucket[] = corpus.map(({ id, query, tokens, demandIds }) => ({
+    id,
+    query,
+    tokens,
+    demandIds,
+  }));
+  const pools = new Map<string, StockVideo[]>(corpus.map((b) => [b.id, b.candidates]));
+
+  const demandToBucket = new Map<string, StockQueryBucket>();
+  for (const bucket of buckets) {
+    for (const demandId of bucket.demandIds) demandToBucket.set(demandId, bucket);
+  }
+  // A demand the persisted clustering does not know about (a scene added after
+  // the corpus was built) still needs a home: give it the closest bucket by
+  // token overlap rather than dropping it.
+  for (const demand of opts.demands) {
+    if (demandToBucket.has(demand.id) || buckets.length === 0) continue;
+    const tokens = stockQueryTokens(demand.query);
+    const nearest = [...buckets].sort(
+      (a, b) => jaccard(tokens, b.tokens) - jaccard(tokens, a.tokens) || a.id.localeCompare(b.id),
+    )[0];
+    demandToBucket.set(demand.id, nearest);
+  }
+
+  const tierCounts: Record<AssignmentTier, number> = {
+    unique: 0,
+    "alternate-window": 0,
+    "distant-reuse": 0,
+  };
+
+  for (const demand of opts.demands) {
+    const candidates = candidateVideosForDemand(demand, demandToBucket, buckets, pools);
+    const ownBucket = demandToBucket.get(demand.id);
+    const primaryCandidateKeys = new Set(
+      (ownBucket ? (pools.get(ownBucket.id) ?? []) : []).map(
+        (video) => `${video.provider}:${video.provider_clip_id}`,
+      ),
+    );
+
+    const selected = selectWithDegradation({
+      demand,
+      candidates,
+      primaryCandidateKeys,
+      targetWidth: opts.targetWidth,
+      usedIds: opts.usedIds,
+      sourceUsage,
+      recentSources,
+    });
+    if (!selected) continue;
+
+    const { result, tier, reason, sceneDistance } = selected;
+    opts.usedIds.add(result.reservationKey);
+    assignments.set(demand.id, { ...result, tier });
+
+    const sourceKey = `${result.pick.provider}:${result.pick.provider_clip_id}`;
+    const usage = sourceUsage.get(sourceKey) ?? { windows: new Set<number>(), sceneIndexes: [] };
+    usage.windows.add(windowIndexFor(result.inPoint, demand.minDurationSec));
+    if (demand.sceneIndex != null) usage.sceneIndexes.push(demand.sceneIndex);
+    sourceUsage.set(sourceKey, usage);
+
+    recentSources.push(sourceKey);
+    if (recentSources.length > RECENT_SOURCE_WINDOW) recentSources.shift();
+
+    tierCounts[tier] += 1;
+    if (tier !== "unique") {
+      opts.onFallback?.({ demandId: demand.id, tier, reason, sourceKey, sceneDistance });
+      console.warn("[stock-corpus] scene matched below the unique tier", {
+        projectId: opts.projectId,
+        sceneId: demand.id,
+        sceneIndex: demand.sceneIndex ?? null,
+        tier,
+        reason,
+        sourceKey,
+        inPointSec: Number(result.inPoint.toFixed(3)),
+        sceneDistance,
+      });
+    }
+  }
+
+  console.info("[stock-corpus] corpus assignment", {
+    projectId: opts.projectId,
+    demands: opts.demands.length,
+    matched: assignments.size,
+    unmatched: opts.demands.length - assignments.size,
+    buckets: buckets.length,
+    corpusCandidates: corpus.reduce((sum, b) => sum + b.candidates.length, 0),
+    tiers: tierCounts,
+    providers: countProviders(assignments),
+    sourceDuration: summarizeSelectedDurations(assignments),
+  });
+  return assignments;
+}
+
+/** Which non-overlapping window of a source an in-point falls in. */
+function windowIndexFor(inPoint: number, minDurationSec: number): number {
+  const span = Math.max(1, minDurationSec);
+  return Math.floor(inPoint / span);
+}
+
+type TieredSelection = {
+  result: StockSearchResult;
+  tier: AssignmentTier;
+  reason: string;
+  sceneDistance: number | null;
+};
+
+function selectWithDegradation(opts: {
+  demand: StockDemand;
+  candidates: StockVideo[];
+  primaryCandidateKeys: Set<string>;
+  targetWidth: number;
+  usedIds: Set<string>;
+  sourceUsage: SourceUsage;
+  recentSources: string[];
+}): TieredSelection | null {
+  // Tier 1: an untouched source. The normal case, and the only one that needs no
+  // explanation in the logs.
+  const unique = selectGlobalCandidate({
+    demand: opts.demand,
+    candidates: opts.candidates.filter(
+      (video) => !opts.sourceUsage.has(`${video.provider}:${video.provider_clip_id}`),
+    ),
+    primaryCandidateKeys: opts.primaryCandidateKeys,
+    targetWidth: opts.targetWidth,
+    usedIds: opts.usedIds,
+    sourceUseCount: new Map(),
+    recentSources: opts.recentSources,
+  });
+  if (unique)
+    return { result: unique, tier: "unique", reason: "unused source", sceneDistance: null };
+
+  // Tier 2: a different moment of a source already in the project. Visually a
+  // different shot, so it costs far less than a repeat.
+  const alternate = selectAlternateWindow(opts);
+  if (alternate) return alternate;
+
+  // Tier 3: an outright repeat, placed as far from its other uses as possible.
+  return selectDistantReuse(opts);
+}
+
+/** Ranks candidates the way tier 1 does, so degraded picks are still relevant. */
+function rankForDemand(demand: StockDemand, videos: StockVideo[]): StockVideo[] {
+  return [...videos].sort(
+    (a, b) =>
+      candidateRelevance(demand.query, b) - candidateRelevance(demand.query, a) ||
+      stableHash(`${demand.seed}:${a.provider}:${a.provider_clip_id}`) -
+        stableHash(`${demand.seed}:${b.provider}:${b.provider_clip_id}`),
+  );
+}
+
+function buildResult(
+  video: StockVideo,
+  inPoint: number,
+  targetWidth: number,
+  reservationKey: string,
+  candidates: StockVideo[],
+): StockSearchResult | null {
+  const chosenFile = selectRenditionForTarget(video.files, targetWidth);
+  if (!chosenFile) return null;
+  return {
+    pick: video,
+    chosenFile,
+    candidates,
+    inPoint,
+    reservationKey,
+    fallbackUrls: fallbackRenditions(video.files, chosenFile),
+  };
+}
+
+function selectAlternateWindow(opts: {
+  demand: StockDemand;
+  candidates: StockVideo[];
+  targetWidth: number;
+  usedIds: Set<string>;
+  sourceUsage: SourceUsage;
+}): TieredSelection | null {
+  const span = Math.max(1, opts.demand.minDurationSec);
+  for (const video of rankForDemand(opts.demand, opts.candidates)) {
+    const sourceKey = `${video.provider}:${video.provider_clip_id}`;
+    const usage = opts.sourceUsage.get(sourceKey);
+    if (!usage) continue; // tier 1 already had its chance at unused sources
+    // A window only exists if the source is genuinely long enough to hold one
+    // that does not overlap what is already in use.
+    if (video.duration_known === false) continue;
+    const totalWindows = Math.floor(video.duration_sec / span);
+    for (let window = 0; window < totalWindows; window++) {
+      if (usage.windows.has(window)) continue;
+      const inPoint = window * span;
+      const reservationKey = `${sourceKey}:w${window}`;
+      if (opts.usedIds.has(reservationKey)) continue;
+      const distance = nearestSceneDistance(usage.sceneIndexes, opts.demand.sceneIndex);
+      // A different moment of the same clip still looks like the same location;
+      // keep it off adjacent scenes.
+      if (distance != null && distance < NEVER_REUSE_WITHIN) continue;
+      const result = buildResult(video, inPoint, opts.targetWidth, reservationKey, opts.candidates);
+      if (!result) continue;
+      return {
+        result,
+        tier: "alternate-window",
+        reason: `no unused source remained; took window ${window} of ${totalWindows}`,
+        sceneDistance: distance,
+      };
+    }
+  }
+  return null;
+}
+
+function selectDistantReuse(opts: {
+  demand: StockDemand;
+  candidates: StockVideo[];
+  targetWidth: number;
+  usedIds: Set<string>;
+  sourceUsage: SourceUsage;
+}): TieredSelection | null {
+  type Option = { video: StockVideo; distance: number; relevance: number };
+  const options: Option[] = [];
+
+  for (const video of opts.candidates) {
+    const sourceKey = `${video.provider}:${video.provider_clip_id}`;
+    const usage = opts.sourceUsage.get(sourceKey);
+    if (!usage) continue;
+    const distance = nearestSceneDistance(usage.sceneIndexes, opts.demand.sceneIndex);
+    // Unknown positions cannot be shown to be far apart, so they are not eligible
+    // for a tier whose entire justification is distance.
+    if (distance == null) continue;
+    if (distance < NEVER_REUSE_WITHIN) continue;
+    options.push({ video, distance, relevance: candidateRelevance(opts.demand.query, video) });
+  }
+  if (options.length === 0) return null;
+
+  // Distance first — that is the whole point of the tier — then relevance, then
+  // a seeded tie-break so the choice is deterministic.
+  options.sort(
+    (a, b) =>
+      b.distance - a.distance ||
+      b.relevance - a.relevance ||
+      stableHash(`${opts.demand.seed}:${a.video.provider_clip_id}`) -
+        stableHash(`${opts.demand.seed}:${b.video.provider_clip_id}`),
+  );
+
+  const best = options[0];
+  const sourceKey = `${best.video.provider}:${best.video.provider_clip_id}`;
+  const usage = opts.sourceUsage.get(sourceKey)!;
+  const span = Math.max(1, opts.demand.minDurationSec);
+  const window = [...usage.windows][0] ?? 0;
+  const result = buildResult(
+    best.video,
+    window * span,
+    opts.targetWidth,
+    `${sourceKey}:reuse${opts.demand.sceneIndex ?? assignments_reuse_counter++}`,
+    opts.candidates,
+  );
+  if (!result) return null;
+  return {
+    result,
+    tier: "distant-reuse",
+    reason:
+      best.distance >= MIN_REUSE_SCENE_DISTANCE
+        ? `no unique source or free window remained; reused a source ${best.distance} scenes away`
+        : `no unique source or free window remained; closest available reuse was ${best.distance} scenes away (below the ${MIN_REUSE_SCENE_DISTANCE}-scene preference)`,
+    sceneDistance: best.distance,
+  };
+}
+
+/** Counter of last resort for demands with no timeline position. */
+let assignments_reuse_counter = 0;
+
+/** Distance from this scene to the nearest previous use, or null if unknowable. */
+function nearestSceneDistance(sceneIndexes: number[], sceneIndex?: number): number | null {
+  if (sceneIndex == null || sceneIndexes.length === 0) return null;
+  return Math.min(...sceneIndexes.map((index) => Math.abs(index - sceneIndex)));
 }
 
 function candidateVideosForDemand(

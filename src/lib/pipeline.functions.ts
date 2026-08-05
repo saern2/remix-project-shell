@@ -234,6 +234,13 @@ async function persistTranscriptAndScenes(
       .delete()
       .eq("project_id", projectId);
     if (delErr) throw new Error(delErr.message);
+
+    // The corpus is clustered against a specific set of scenes and stores their
+    // ids. Regenerating scenes invalidates it entirely — keeping it would leave
+    // buckets pointing at rows that no longer exist, so assignment would fall
+    // back to nearest-bucket for every scene and quietly lose its clustering.
+    const { clearProjectCorpus } = await import("@/lib/stock-corpus-store.server");
+    await clearProjectCorpus(projectId);
   }
 
   const { data: asset } = await supabaseAdmin
@@ -446,6 +453,45 @@ async function advanceFromGeneratingScenes(projectId: string) {
   }
 }
 
+/** A scene that had to be matched below the unique tier. */
+type FallbackEvent = {
+  demandId: string;
+  tier: "unique" | "alternate-window" | "distant-reuse";
+  reason: string;
+  sourceKey: string;
+  sceneDistance: number | null;
+};
+
+/**
+ * Reconstructs project-wide source usage from what is already persisted.
+ *
+ * The degradation tiers need to know, for the WHOLE project, which sources are
+ * spoken for, which of their windows are taken, and where on the timeline they
+ * sit. Slices only ever see their own scenes, so this is rebuilt from the
+ * durable rows on every invocation.
+ */
+function buildSourceUsage(
+  rows: Array<{
+    provider: string;
+    providerClipId: string | null;
+    inPoint: number;
+    sceneIndex: number | undefined;
+    minDurationSec: number;
+  }>,
+): Map<string, { windows: Set<number>; sceneIndexes: number[] }> {
+  const usage = new Map<string, { windows: Set<number>; sceneIndexes: number[] }>();
+  for (const row of rows) {
+    if (!row.providerClipId) continue;
+    const key = `${row.provider}:${row.providerClipId}`;
+    const entry = usage.get(key) ?? { windows: new Set<number>(), sceneIndexes: [] };
+    const span = Math.max(1, row.minDurationSec);
+    entry.windows.add(Math.floor(Math.max(0, row.inPoint) / span));
+    if (row.sceneIndex != null) entry.sceneIndexes.push(row.sceneIndex);
+    usage.set(key, entry);
+  }
+  return usage;
+}
+
 async function advanceFromMatchingFootage(projectId: string) {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   let stockSession: StockSearchSession | null = null;
@@ -585,6 +631,93 @@ async function advanceFromMatchingFootage(projectId: string) {
     const targetWidth = targetWidthForAspect(project.aspect_ratio);
     const projectNiche = project.niche;
 
+    // ── Project-wide corpus phase (round 8) ──────────────────────────────────
+    // Round 6 sliced matching AND, accidentally, clustering: each slice built its
+    // own buckets and searched its own queries, so 145 scenes produced ~145
+    // cluster queries (244 cache misses against 33 hits) and assignment could
+    // only see its own slice's pools. Project-wide uniqueness then drained those
+    // small pools until late scenes had nothing left — a 145-scene project
+    // failing because 5 scenes could not be unique.
+    //
+    // The corpus is now clustered once over every scene and built incrementally
+    // under the same time budget. Assignment does not begin until it is complete,
+    // so it never runs against a partial pool.
+    const { ensureProjectBuckets, loadProjectCorpus, pendingCorpusWork, buildCorpusCell } =
+      await import("@/lib/stock-corpus-store.server");
+
+    const corpusProviders: Array<"pexels" | "pixabay" | "nasa"> =
+      projectNiche === "space" ? ["nasa", "pexels", "pixabay"] : ["pexels", "pixabay"];
+
+    /** Every scene's visual query — read only when the corpus must be clustered. */
+    const loadAllDemands = async () => {
+      const startedAt = Date.now();
+      const { data, error: queryError } = await supabaseAdmin
+        .from("scenes")
+        .select("id, idx, visual_query")
+        .eq("project_id", projectId)
+        .order("idx", { ascending: true });
+      profile.add("sceneRead", Date.now() - startedAt);
+      if (queryError) throw new Error(queryError.message);
+      return (data ?? []).flatMap((row) =>
+        row.visual_query
+          ? [
+              {
+                id: row.id,
+                query: row.visual_query,
+                minDurationSec: 1,
+                seed: `${projectId}:${row.id}`,
+                sceneIndex: row.idx,
+              },
+            ]
+          : [],
+      );
+    };
+
+    /**
+     * Builds the corpus until it is complete or the budget runs out.
+     * Returns null while still building — the caller must return
+     * matching_footage and let the next invocation continue.
+     */
+    const prepareCorpus = async () => {
+      const corpusStartedAt = Date.now();
+      let corpus = await loadProjectCorpus(projectId);
+      if (corpus.length === 0) {
+        corpus = await ensureProjectBuckets(projectId, await loadAllDemands());
+      }
+      profile.add("corpusLoad", Date.now() - corpusStartedAt);
+
+      let pending = pendingCorpusWork(corpus, corpusProviders);
+      profile.count("corpusCellsPending", pending.length);
+      if (pending.length === 0) return { corpus, complete: true as const, remaining: 0 };
+
+      stockSession = stockSession ?? (await createStockSearchSession(profile));
+      const byId = new Map(corpus.map((bucket) => [bucket.id, bucket]));
+
+      while (pending.length > 0 && budget.shouldStartAnotherSlice()) {
+        const cellStartedAt = Date.now();
+        const { bucket, provider } = pending[0];
+        const updated = await buildCorpusCell({
+          projectId,
+          bucket: byId.get(bucket.id) ?? bucket,
+          provider,
+          orientation,
+          targetWidth,
+          niche: projectNiche,
+          session: stockSession,
+        });
+        byId.set(updated.id, updated);
+        profile.count("corpusCellsBuilt");
+        budget.recordSlice(Date.now() - cellStartedAt);
+        pending = pendingCorpusWork([...byId.values()], corpusProviders);
+      }
+
+      const rebuilt = [...byId.values()];
+      if (pending.length > 0) {
+        return { corpus: rebuilt, complete: false as const, remaining: pending.length };
+      }
+      return { corpus: rebuilt, complete: true as const, remaining: 0 };
+    };
+
     const fixedDuration =
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
@@ -717,10 +850,38 @@ async function advanceFromMatchingFootage(projectId: string) {
       const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
       let processedSlots = 0;
 
-      // Created last, and only if there is work: session setup loads the Pexels
-      // key pool (now snapshot-cached) and nothing else. Cache prefetching is
-      // matchStockCorpus's job, scoped to the slice it is about to search.
-      stockSession = await createStockSearchSession(profile);
+      stockSession = stockSession ?? (await createStockSearchSession(profile));
+
+      // The corpus must be whole before a single scene is assigned.
+      const corpusState = await prepareCorpus();
+      if (!corpusState.complete) {
+        await assertPipelineWritable(projectId);
+        const telemetry = matchingTelemetry({
+          scenesProcessed: 0,
+          remaining: pendingSlots.length,
+        });
+        console.info("[matching_footage:fixed-duration] building corpus", {
+          projectId,
+          corpusBuckets: corpusState.corpus.length,
+          corpusCellsRemaining: corpusState.remaining,
+          ...telemetry,
+        });
+        return { status: "matching_footage", error_message: null, matching: telemetry };
+      }
+
+      // Timeline position for every scene, so the last-resort reuse tier can
+      // maximise distance and refuse anything adjacent.
+      const sceneIndexById = new Map(scenes.map((scene, index) => [scene.id, index]));
+      const sourceUsage = buildSourceUsage(
+        eligibleExistingSlices.map((row) => ({
+          provider: row.provider as string,
+          providerClipId: row.provider_clip_id,
+          inPoint: Number(row.in_point_seconds),
+          sceneIndex: sceneIndexById.get(row.scene_id),
+          minDurationSec: Number(row.duration_seconds),
+        })),
+      );
+      const fallbackEvents: FallbackEvent[] = [];
 
       while (processedSlots < pendingSlots.length && budget.shouldStartAnotherSlice()) {
         const sliceStartedAt = Date.now();
@@ -736,6 +897,7 @@ async function advanceFromMatchingFootage(projectId: string) {
                 query: visualQuery,
                 minDurationSec: slot.durationSeconds,
                 seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
+                sceneIndex: sceneIndexById.get(slot.sceneId),
               },
             ];
           }),
@@ -744,6 +906,9 @@ async function advanceFromMatchingFootage(projectId: string) {
           niche: project.niche,
           usedIds,
           session: stockSession,
+          corpus: corpusState.corpus,
+          sourceUsage,
+          onFallback: (event) => fallbackEvents.push(event),
         });
 
         await asyncPool(slice, FIXED_DURATION_CONCURRENCY, async (slot) => {
@@ -779,13 +944,21 @@ async function advanceFromMatchingFootage(projectId: string) {
           throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
         });
 
+        for (const event of fallbackEvents.splice(0)) {
+          profile.count(
+            event.tier === "alternate-window" ? "fallbackAlternateWindow" : "fallbackDistantReuse",
+          );
+        }
         processedSlots += slice.length;
         budget.recordSlice(Date.now() - sliceStartedAt);
       }
 
       if (unmatchedSlots.length > 0) {
+        // Reaching here means the corpus held nothing usable for these slots —
+        // not merely nothing unique. Uniqueness now degrades through two further
+        // tiers before a scene is allowed to fail (round 8).
         throw new Error(
-          `Could not match stock footage for ${unmatchedSlots.length} fixed-duration slot(s): ${describeMissingSlots(unmatchedSlots)}. Try a different category or clip duration, then retry matching.`,
+          `No stock footage at all could be found for ${unmatchedSlots.length} slot(s): ${describeMissingSlots(unmatchedSlots)}. Try a different category or clip duration, then retry matching.`,
         );
       }
 
@@ -1054,9 +1227,40 @@ async function advanceFromMatchingFootage(projectId: string) {
     // Time-budgeted slice loop (see fixed-duration path above for rationale).
     let processedScenes = 0;
 
-    // Created last, and only if there is work: session setup loads the Pexels
-    // key pool (now snapshot-cached) and nothing else.
-    stockSession = await createStockSearchSession(profile);
+    stockSession = stockSession ?? (await createStockSearchSession(profile));
+
+    const corpusState = await prepareCorpus();
+    if (!corpusState.complete) {
+      await assertPipelineWritable(projectId);
+      const telemetry = matchingTelemetry({ scenesProcessed: 0, remaining: pending.length });
+      console.info("[matching_footage:plain] building corpus", {
+        projectId,
+        corpusBuckets: corpusState.corpus.length,
+        corpusCellsRemaining: corpusState.remaining,
+        ...telemetry,
+      });
+      return { status: "matching_footage", error_message: null, matching: telemetry };
+    }
+
+    const sceneIndexById = new Map(scenes.map((scene, index) => [scene.id, index]));
+    const sourceUsage = buildSourceUsage(
+      eligibleExistingSelections.flatMap((row) => {
+        const candidate = (
+          row as { clip_candidates: { provider: string; provider_clip_id: string } | null }
+        ).clip_candidates;
+        if (!candidate) return [];
+        return [
+          {
+            provider: candidate.provider,
+            providerClipId: candidate.provider_clip_id,
+            inPoint: Number((row as { in_point: number }).in_point),
+            sceneIndex: sceneIndexById.get(row.scene_id),
+            minDurationSec: 1,
+          },
+        ];
+      }),
+    );
+    const fallbackEvents: FallbackEvent[] = [];
 
     while (processedScenes < pending.length && budget.shouldStartAnotherSlice()) {
       const sliceStartedAt = Date.now();
@@ -1075,6 +1279,7 @@ async function advanceFromMatchingFootage(projectId: string) {
               query: visualQuery,
               minDurationSec: Math.max(1, Math.ceil(visualDuration)),
               seed: `${projectId}:${scene.id}`,
+              sceneIndex: sceneIndexById.get(scene.id),
             },
           ];
         }),
@@ -1083,18 +1288,30 @@ async function advanceFromMatchingFootage(projectId: string) {
         niche: projectNiche,
         usedIds,
         session: stockSession,
+        corpus: corpusState.corpus,
+        sourceUsage,
+        onFallback: (event) => fallbackEvents.push(event),
       });
 
       await asyncPool(slice, CONCURRENCY, (scene) => processScene(scene, plainAssignments));
+      for (const event of fallbackEvents.splice(0)) {
+        profile.count(
+          event.tier === "alternate-window" ? "fallbackAlternateWindow" : "fallbackDistantReuse",
+        );
+      }
       processedScenes += slice.length;
       budget.recordSlice(Date.now() - sliceStartedAt);
     }
 
     if (unmatchedSceneIds.size > 0) {
+      // Not a uniqueness failure any more: a scene only lands here when the
+      // corpus contains no usable footage for it under ANY tier, including
+      // reuse. Round 8 — failing 145 scenes because a handful could not be
+      // unique was the wrong trade.
       throw new Error(
         projectNiche === "space"
-          ? `NASA, Pexels, and Pixabay could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`
-          : `Pexels and Pixabay could not supply unique footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`,
+          ? `NASA, Pexels, and Pixabay returned no usable footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`
+          : `Pexels and Pixabay returned no usable footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`,
       );
     }
 

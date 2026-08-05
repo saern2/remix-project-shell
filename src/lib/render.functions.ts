@@ -53,6 +53,15 @@ function toFallbackUrls(raw: unknown): string[] {
   return Array.isArray(raw) ? raw.filter((url): url is string => typeof url === "string") : [];
 }
 
+/**
+ * Render-job statuses that mean "this render is over". A worker 404 for a job in
+ * one of these is expected: the worker cleans up after itself.
+ */
+const TERMINAL_RENDER_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/** Project statuses that mean the user is no longer waiting on this render. */
+const TERMINAL_PROJECT_STATUSES = new Set(["completed", "failed", "cancelled", "ready"]);
+
 function workerBase(): string {
   const url = process.env.RENDER_WORKER_URL;
   if (!url) throw new Error("RENDER_WORKER_URL is not configured.");
@@ -62,6 +71,20 @@ function workerKey(): string {
   const key = process.env.RENDER_WORKER_API_KEY;
   if (!key) throw new Error("RENDER_WORKER_API_KEY is not configured.");
   return key;
+}
+
+/**
+ * The user-facing message when the worker refuses a job submission.
+ *
+ * Exported so it can be pinned directly: this string is written into
+ * render_jobs.error, where it outlives the request and is read by someone who
+ * cannot act on a status code or a stack. The worker's body belongs in the
+ * server log, never here.
+ */
+export function renderSubmitFailureMessage(status: number): string {
+  return status === 404
+    ? "The render service is unavailable right now. Please try again in a moment."
+    : `The render could not be started (HTTP ${status}). Please try again.`;
 }
 
 /**
@@ -518,8 +541,16 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       body: JSON.stringify(body),
     });
     if (!res.ok) {
+      // Same rule as the poll path: the worker's body is diagnostic, not a user
+      // message. It goes to the server log; the row and the thrown error carry
+      // plain language only.
       const text = await res.text().catch(() => "");
-      const msg = `Render worker rejected job (${res.status}): ${text.slice(0, 300)}`;
+      console.error("[render] worker rejected job submission", {
+        jobId: jobRow.id,
+        status: res.status,
+        body: text.slice(0, 500),
+      });
+      const msg = renderSubmitFailureMessage(res.status);
       await supabaseAdmin
         .from("render_jobs")
         .update({ status: "failed", error: msg, completed_at: new Date().toISOString() })
@@ -614,9 +645,88 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       method: "GET",
       headers: { "X-Api-Key": workerKey() },
     });
+
+    // ── 404 is terminal, not an error (round 8, Problem 1) ────────────────────
+    // A cancelled render removes its jobs from the worker. The app kept polling
+    // and surfaced `Render worker poll failed (404): {"error":"Job not found"}`
+    // to a user who had just cancelled on purpose. Both sides were behaving
+    // correctly; only the client's reading of 404 was wrong.
+    //
+    // The worker not knowing a job means one of two things, and they are not the
+    // same event: either we already know the render is over — expected, say
+    // nothing — or we believed it was still running and it has vanished, which
+    // is a real failure that deserves plain language, not raw JSON.
+    if (res.status === 404) {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data: current } = await supabaseAdmin
+        .from("projects")
+        .select("status")
+        .eq("id", job.project_id)
+        .maybeSingle();
+
+      const settled =
+        TERMINAL_RENDER_STATUSES.has(job.status) ||
+        (current?.status != null && TERMINAL_PROJECT_STATUSES.has(current.status));
+
+      if (settled) {
+        // Expected. Report the state we already hold so the client stops polling
+        // without showing anything.
+        return {
+          status: job.status === "cancelled" ? "failed" : job.status,
+          progress_pct: job.progress_pct,
+          output_url: job.output_url,
+          error: job.error,
+          stall_notice: null,
+          chunks_total: job.chunks_total ?? null,
+          chunks_completed: job.chunks_completed ?? null,
+        };
+      }
+
+      const message =
+        "The render stopped unexpectedly and is no longer running. Please start it again.";
+      await supabaseAdmin
+        .from("render_jobs")
+        .update({
+          status: "failed",
+          error: message,
+          stall_notice: null,
+          completed_at: new Date().toISOString(),
+        })
+        .eq("id", job.id);
+      await supabaseAdmin
+        .from("projects")
+        .update({ status: "failed", error_message: message })
+        .eq("id", job.project_id);
+
+      console.warn("[render-poll] worker no longer knows this job", {
+        jobId: job.id,
+        projectId: job.project_id,
+        jobStatus: job.status,
+        projectStatus: current?.status ?? null,
+      });
+
+      return {
+        status: "failed",
+        progress_pct: job.progress_pct,
+        output_url: null,
+        error: message,
+        stall_notice: null,
+        chunks_total: job.chunks_total ?? null,
+        chunks_completed: job.chunks_completed ?? null,
+      };
+    }
+
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`Render worker poll failed (${res.status}): ${text.slice(0, 200)}`);
+      // Logged in full; the user gets a sentence, not a payload.
+      console.warn("[render-poll] worker poll failed", {
+        jobId: job.id,
+        status: res.status,
+        body: text.slice(0, 500),
+      });
+      throw new Error(
+        `The render worker could not be reached (HTTP ${res.status}). Rendering will retry automatically.`,
+      );
     }
     const payload = (await res.json()) as {
       status?: string;
@@ -758,7 +868,10 @@ export const cancelRenderJob = createServerFn({ method: "POST" })
       method: "POST",
       headers: { "X-Api-Key": workerKey() },
     });
-    if (!res.ok) {
+    // 404 means the worker has already forgotten this job — it finished, was
+    // already cancelled, or was reaped. Cancelling something already gone is the
+    // outcome the caller wanted, so fall through and settle the DB rows.
+    if (!res.ok && res.status !== 404) {
       throw new Error(
         "The render could not be cancelled. It may still be running; please try again.",
       );

@@ -270,6 +270,11 @@ export type StockSearchResult = {
    * cannot disturb clip uniqueness.
    */
   fallbackUrls: string[];
+  /**
+   * Which selection tier produced this. "unique" is the norm; the others record
+   * a deliberate, logged degradation rather than a failure.
+   */
+  tier?: "unique" | "alternate-window" | "distant-reuse";
 };
 
 function parsePexelsKeys(): string[] {

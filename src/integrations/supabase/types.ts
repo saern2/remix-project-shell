@@ -380,6 +380,50 @@ export type Database = {
         }
         Relationships: []
       }
+      project_stock_corpus: {
+        Row: {
+          bucket_id: string
+          candidates: Json
+          created_at: string
+          demand_ids: Json
+          project_id: string
+          providers_done: Json
+          query: string
+          tokens: Json
+          updated_at: string
+        }
+        Insert: {
+          bucket_id: string
+          candidates?: Json
+          created_at?: string
+          demand_ids?: Json
+          project_id: string
+          providers_done?: Json
+          query: string
+          tokens?: Json
+          updated_at?: string
+        }
+        Update: {
+          bucket_id?: string
+          candidates?: Json
+          created_at?: string
+          demand_ids?: Json
+          project_id?: string
+          providers_done?: Json
+          query?: string
+          tokens?: Json
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "project_stock_corpus_project_id_fkey"
+            columns: ["project_id"]
+            isOneToOne: false
+            referencedRelation: "projects"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       projects: {
         Row: {
           aspect_ratio: string

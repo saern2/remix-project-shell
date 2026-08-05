@@ -96,6 +96,8 @@ const STATUS_LABELS: Record<string, string> = {
 
 const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_footage"]);
 const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching", "uploading"]);
+/** A render in one of these is over; polling it again only produces a 404. */
+const RENDER_TERMINAL = new Set(["completed", "failed", "cancelled", "not_found"]);
 
 function expectedFixedSlicesForScenes(scenes: Scene[], fixedDuration: number): number {
   return scenes.reduce((count, scene, index) => {
@@ -355,6 +357,7 @@ function ProjectDetail() {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
+      let reachedTerminalState = false;
       try {
         const result = await runPollRender({ data: { jobId: renderJobId } });
         if (isMissingPollResult(result)) {
@@ -363,12 +366,21 @@ function ProjectDetail() {
           void navigate({ to: "/dashboard", replace: true });
           return;
         }
+        // Stop as soon as the poll itself reports a settled render, rather than
+        // waiting for the status query to round-trip and disable this effect.
+        // A cancelled render's job is removed from the worker, so one more tick
+        // is one more 404 (round 8, Problem 1).
+        reachedTerminalState = RENDER_TERMINAL.has(result?.status ?? "");
       } catch (err) {
         if (!cancelled) toast.error((err as Error).message);
       }
       if (!cancelled) {
         queryClient.invalidateQueries({ queryKey: ["render-job", projectId] });
         queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+        if (reachedTerminalState) {
+          cancelled = true;
+          return;
+        }
         timer = setTimeout(tick, 3000);
       }
     };
