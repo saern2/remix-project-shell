@@ -5,6 +5,7 @@ const IORedis = require('ioredis');
 const config = require('./config');
 const logger = require('./logger');
 const { processRenderJob, processStitchJob, closeRenderConnections } = require('./renderJob');
+const { readJobHealth } = require('./resourceControl');
 
 const QUEUE_NAME = 'render';
 const QUEUE_CHUNK = 'render-chunk';
@@ -211,6 +212,25 @@ async function getJobStatus(job) {
       result.chunks_completed = counts.processed || 0;
     } catch {
       result.chunks_completed = 0;
+    }
+
+    // Progress for a chunked render used to sit at 0 until the stitch itself
+    // started — the deployed run showed 0% for four and a half minutes while 12
+    // of 13 chunks completed. Derive it from the children instead; the stitch
+    // phase keeps the 50-100 band it already sets for itself.
+    if (result.chunks_total > 0 && (result.progress_pct ?? 0) < 50) {
+      result.progress_pct = Math.min(
+        45,
+        Math.round((result.chunks_completed / result.chunks_total) * 45),
+      );
+    }
+
+    // A child chunk in trouble is otherwise invisible here: this job's own
+    // status stays "waiting-children" while chunks_completed silently stops.
+    const health = await readJobHealth(getRedisConnection(), job.id.replace(/-stitch$/, ''));
+    if (health) {
+      result.health = health;
+      result.stalled = health.state === 'stalled' || health.state === 'retrying';
     }
   }
 

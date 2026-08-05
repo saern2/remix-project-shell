@@ -22,7 +22,10 @@ const http = require('http');
 const https = require('https');
 const { pipeline } = require('stream/promises');
 const { URL } = require('url');
-const ffmpeg = require('fluent-ffmpeg');
+// Bounded probe: verifying a leftover file must never be the thing that hangs.
+// A truncated or zero-byte file is exactly the input on which an unbounded
+// ffprobe can block indefinitely (round 7, Problem 2a).
+const { decodesSuccessfully } = require('./mediaProbe');
 
 const config = require('./config');
 const logger = require('./logger');
@@ -437,22 +440,6 @@ const markerPathFor = (destPath) => `${destPath}.ok`;
 async function markDownloadComplete(destPath, url, bytes) {
   const marker = JSON.stringify({ url, bytes, completedAt: new Date().toISOString() });
   await fsp.writeFile(markerPathFor(destPath), marker, 'utf8').catch(() => {});
-}
-
-/**
- * Probes a media file. Resolves false when it cannot be decoded, which is the
- * signal that a leftover file from an interrupted attempt must be re-fetched
- * rather than reused.
- */
-function decodesSuccessfully(filePath) {
-  return new Promise((resolve) => {
-    ffmpeg.ffprobe(filePath, (err, data) => {
-      if (err) return resolve(false);
-      const hasVideo = (data?.streams ?? []).some((s) => s.codec_type === 'video');
-      const duration = Number(data?.format?.duration);
-      resolve(hasVideo && Number.isFinite(duration) && duration > 0);
-    });
-  });
 }
 
 async function isCompleteDownload(destPath, url) {

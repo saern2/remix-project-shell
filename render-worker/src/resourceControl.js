@@ -176,13 +176,35 @@ async function compareAndDelete(redis, key, token) {
   );
 }
 
-async function acquireChunkLease({ redis, jobId, outputPath, signal, timeoutMs }) {
+/**
+ * Claims the exclusive right to produce this chunk's output.
+ *
+ * THE FAILURE THIS IS HARDENED AGAINST: the returned `release()` used to be the
+ * only thing that stopped the renewal interval, and renderJob never called it.
+ * A chunk that failed therefore left an interval refreshing the Redis key every
+ * 20s for the life of the worker process — an immortal lock. Every retry of that
+ * chunk then waited out its full deadline and died with CHUNK_LOCK_TIMEOUT, so
+ * the chunk could never complete and the render hung one chunk short, forever,
+ * with no error. That is exactly the 12/13 hang.
+ *
+ * Two independent guards now, because "the caller always releases" is precisely
+ * the assumption that failed:
+ *   1. release() is idempotent and called from renderJob's finally on every path.
+ *   2. Renewal is BOUNDED. It stops after maxLeaseMs regardless of whether
+ *      anyone releases, so a leaked lease decays into an expiring key instead of
+ *      an immortal one. A leak becomes a delay; it can no longer be a deadlock.
+ */
+async function acquireChunkLease({ redis, jobId, outputPath, signal, timeoutMs, maxLeaseMs }) {
   if (await readyChunkOutput(outputPath)) return { reused: true, release: async () => {} };
 
   const key = `render:chunk-lease:${jobId}`;
   const token = crypto.randomUUID();
   const ttlMs = Math.max(timeoutMs + 60_000, 120_000);
   const deadline = Date.now() + ttlMs;
+  // Never renew past the watchdog's own deadline plus a grace margin: beyond
+  // that point the holder is either dead or about to be killed, and the lease
+  // must be allowed to lapse so somebody else can make progress.
+  const renewUntil = Date.now() + (Number.isFinite(maxLeaseMs) ? maxLeaseMs : ttlMs) + 60_000;
 
   while (Date.now() < deadline) {
     const acquired = await redis.set(key, token, 'PX', ttlMs, 'NX');
@@ -191,8 +213,16 @@ async function acquireChunkLease({ redis, jobId, outputPath, signal, timeoutMs }
       await fsp.rm(`${outputPath}.ready`, { force: true }).catch(() => {});
 
       let renewing = false;
+      let released = false;
       const renewTimer = setInterval(async () => {
         if (renewing) return;
+        if (Date.now() >= renewUntil) {
+          // Backstop: stop propping the key up. Whatever holds it has outlived
+          // any legitimate run, so let it expire on its own TTL.
+          clearInterval(renewTimer);
+          logger.warn({ jobId, key }, 'Chunk lease renewal budget exhausted; letting the lease expire');
+          return;
+        }
         renewing = true;
         try {
           const renewed = await compareAndExpire(redis, key, token, ttlMs);
@@ -207,11 +237,17 @@ async function acquireChunkLease({ redis, jobId, outputPath, signal, timeoutMs }
 
       return {
         reused: false,
+        get released() {
+          return released;
+        },
         release: async () => {
+          if (released) return;
+          released = true;
           clearInterval(renewTimer);
           await compareAndDelete(redis, key, token).catch((err) => {
             logger.warn({ jobId, err: err.message }, 'Chunk lease release failed');
           });
+          logger.debug({ jobId, key }, 'Chunk lease released');
         },
       };
     }
@@ -221,6 +257,46 @@ async function acquireChunkLease({ redis, jobId, outputPath, signal, timeoutMs }
   }
 
   throw new Error(`CHUNK_LOCK_TIMEOUT: another worker is still processing ${jobId}`);
+}
+
+// ── Job health (round 7) ────────────────────────────────────────────────────
+// A chunk's trouble is invisible to the client: the client polls the STITCH job,
+// whose status stays "rendering" and whose chunks_completed simply stops moving.
+// The observed hang showed 12/13 with no error for minutes. Chunks publish their
+// trouble here, keyed by parent job, so GET /jobs/:id can report it upward.
+const JOB_HEALTH_TTL_MS = 10 * 60 * 1000;
+
+const jobHealthKey = (parentJobId) => `render:job-health:${parentJobId}`;
+
+async function publishJobHealth(redis, parentJobId, health) {
+  try {
+    await redis.set(
+      jobHealthKey(parentJobId),
+      JSON.stringify({ ...health, at: new Date().toISOString() }),
+      'PX',
+      JOB_HEALTH_TTL_MS,
+    );
+  } catch (err) {
+    logger.warn({ parentJobId, err: err.message }, 'Job health publish failed');
+  }
+}
+
+async function clearJobHealth(redis, parentJobId) {
+  try {
+    await redis.del(jobHealthKey(parentJobId));
+  } catch {
+    // Health is advisory; failing to clear it only means a stale notice expires
+    // on its own TTL.
+  }
+}
+
+async function readJobHealth(redis, parentJobId) {
+  try {
+    const raw = await redis.get(jobHealthKey(parentJobId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function markChunkReady(outputPath) {
@@ -240,4 +316,7 @@ module.exports = {
   acquireChunkLease,
   markChunkReady,
   getFfmpegTelemetry,
+  publishJobHealth,
+  clearJobHealth,
+  readJobHealth,
 };

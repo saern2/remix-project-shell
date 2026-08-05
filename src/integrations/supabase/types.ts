@@ -538,6 +538,7 @@ export type Database = {
           progress_pct: number
           project_id: string
           settings: Json
+          stall_notice: string | null
           started_at: string | null
           status: string
           updated_at: string
@@ -553,6 +554,7 @@ export type Database = {
           progress_pct?: number
           project_id: string
           settings: Json
+          stall_notice?: string | null
           started_at?: string | null
           status?: string
           updated_at?: string
@@ -568,6 +570,7 @@ export type Database = {
           progress_pct?: number
           project_id?: string
           settings?: Json
+          stall_notice?: string | null
           started_at?: string | null
           status?: string
           updated_at?: string

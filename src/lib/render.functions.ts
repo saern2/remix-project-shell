@@ -10,6 +10,44 @@ const AUDIO_SIGNED_TTL = 60 * 60 * 6; // 6 hours
 const OUTPUT_UPLOAD_TTL = 60 * 60 * 6;
 const OUTPUT_PLAYBACK_TTL = 60 * 60 * 24;
 
+/**
+ * Turns the worker's chunk-health record into one sentence a user can act on.
+ *
+ * Returns null when the render is healthy, so the notice clears itself as soon
+ * as progress resumes rather than lingering after a chunk recovers.
+ */
+function describeStall(
+  stalled: boolean,
+  health: {
+    state?: string;
+    phase?: string;
+    chunkIndex?: number | null;
+    chunksTotal?: number | null;
+    elapsedMs?: number;
+    attempt?: number;
+    maxAttempts?: number;
+  } | null,
+): string | null {
+  if (!stalled || !health) return null;
+  // chunkIndex is 0-based internally; users count segments from 1.
+  const segment =
+    health.chunkIndex != null
+      ? `Segment ${health.chunkIndex + 1}${health.chunksTotal ? ` of ${health.chunksTotal}` : ""}`
+      : "A segment";
+  const minutes = health.elapsedMs ? Math.max(1, Math.round(health.elapsedMs / 60000)) : null;
+
+  if (health.state === "retrying") {
+    const attempt =
+      health.attempt && health.maxAttempts
+        ? ` (attempt ${health.attempt} of ${health.maxAttempts})`
+        : "";
+    return `${segment} timed out and is being retried${attempt}. Rendering will continue automatically.`;
+  }
+  const forLong = minutes ? ` for ${minutes} minute${minutes === 1 ? "" : "s"}` : "";
+  const during = health.phase ? ` while ${health.phase}` : "";
+  return `${segment} has been running${forLong}${during}. It will be retried automatically if it does not finish.`;
+}
+
 function workerBase(): string {
   const url = process.env.RENDER_WORKER_URL;
   if (!url) throw new Error("RENDER_WORKER_URL is not configured.");
@@ -572,6 +610,16 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       error?: string | null;
       chunks_total?: number | null;
       chunks_completed?: number | null;
+      stalled?: boolean;
+      health?: {
+        state?: string;
+        phase?: string;
+        chunkIndex?: number | null;
+        chunksTotal?: number | null;
+        elapsedMs?: number;
+        attempt?: number;
+        maxAttempts?: number;
+      } | null;
     };
 
     const rawStatus = (payload.status ?? "queued").toLowerCase();
@@ -582,6 +630,10 @@ export const pollRenderJob = createServerFn({ method: "POST" })
     const error = payload.error ?? null;
     const chunksTotal = payload.chunks_total ?? null;
     const chunksCompleted = payload.chunks_completed ?? null;
+    // Non-terminal warning: the render is still running, but a chunk is past
+    // half its watchdog budget or is being retried. Round 7, Problem 3 — the
+    // deployed hang showed 12/13 with no indication anything was wrong.
+    const stallNotice = describeStall(payload.stalled === true, payload.health ?? null);
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -589,6 +641,7 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       status: string;
       progress_pct: number;
       error: string | null;
+      stall_notice: string | null;
       completed_at?: string;
       output_url?: string | null;
       chunks_total?: number | null;
@@ -597,12 +650,14 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       status,
       progress_pct: progress,
       error,
+      stall_notice: stallNotice,
       chunks_total: chunksTotal,
       chunks_completed: chunksCompleted,
     };
     if (status === "completed") {
       jobUpdate.completed_at = new Date().toISOString();
       jobUpdate.progress_pct = 100;
+      jobUpdate.stall_notice = null;
       if (chunksTotal != null) jobUpdate.chunks_completed = chunksTotal;
     }
     if (status === "failed") {

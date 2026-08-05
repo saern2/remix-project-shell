@@ -314,7 +314,7 @@ function ProjectDetail() {
       const { data, error } = await supabase
         .from("render_jobs")
         .select(
-          "id, status, progress_pct, output_url, error, chunks_total, chunks_completed, created_at",
+          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, created_at",
         )
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
@@ -764,6 +764,18 @@ function ProjectDetail() {
                           <span className="ml-1">Cancel</span>
                         </Button>
                       </div>
+                      {renderJob.stall_notice ? (
+                        // A render that is stuck must say so. Previously this
+                        // panel showed "12 of 13 segments rendered" unchanged
+                        // for minutes with no hint that anything was wrong.
+                        <div
+                          role="status"
+                          className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-200"
+                        >
+                          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                          <span>{renderJob.stall_notice}</span>
+                        </div>
+                      ) : null}
                     </>
                   ) : null}
 
