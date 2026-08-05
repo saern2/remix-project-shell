@@ -26,6 +26,21 @@ vi.mock("../stock.server", () => ({
     v: { duration_sec: number; duration_known?: boolean },
     minDurationSec: number,
   ) => v.duration_known === false || v.duration_sec >= minDurationSec,
+  selectRenditionForTarget: (
+    files: Array<{ url: string; width: number; height: number; bytes?: number }>,
+    targetWidth: number,
+  ) => {
+    const ascending = [...files].sort((a, b) => a.width - b.width);
+    return ascending.find((f) => f.width >= targetWidth) ?? ascending[ascending.length - 1];
+  },
+  fallbackRenditions: (
+    files: Array<{ url: string; width: number }>,
+    chosen: { url: string; width: number },
+  ) =>
+    files
+      .filter((f) => f.url !== chosen.url && f.width <= chosen.width)
+      .sort((a, b) => b.width - a.width)
+      .map((f) => f.url),
 }));
 
 import { clusterStockQueries, matchStockCorpus } from "../stock-corpus.server";

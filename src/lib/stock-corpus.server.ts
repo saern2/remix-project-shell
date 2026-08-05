@@ -1,7 +1,9 @@
 import {
   buildNasaSourceWindows,
   expandNasaQueries,
+  fallbackRenditions,
   meetsMinimumSourceDuration,
+  selectRenditionForTarget,
   prefetchStockProviderCache,
   searchProviderCandidatePool,
   stockQueryTokens,
@@ -409,15 +411,16 @@ function selectGlobalCandidate(opts: {
     });
   }
 
-  const files = [...selected.video.files].sort((a, b) => a.width - b.width);
-  const chosenFile =
-    files.find((file) => file.width >= opts.targetWidth) ?? files[files.length - 1];
+  // Byte-aware: skips renditions whose provider-reported size already exceeds
+  // the worker's MAX_CLIP_BYTES, which the duration budget above cannot catch.
+  const chosenFile = selectRenditionForTarget(selected.video.files, opts.targetWidth)!;
   return {
     pick: selected.video,
     chosenFile,
     candidates: opts.candidates,
     inPoint: selected.inPoint,
     reservationKey: selected.reservationKey,
+    fallbackUrls: fallbackRenditions(selected.video.files, chosenFile),
   };
 }
 

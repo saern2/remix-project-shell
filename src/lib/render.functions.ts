@@ -48,6 +48,11 @@ function describeStall(
   return `${segment} has been running${forLong}${during}. It will be retried automatically if it does not finish.`;
 }
 
+/** Narrows a jsonb column to the string[] the worker payload expects. */
+function toFallbackUrls(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((url): url is string => typeof url === "string") : [];
+}
+
 function workerBase(): string {
   const url = process.env.RENDER_WORKER_URL;
   if (!url) throw new Error("RENDER_WORKER_URL is not configured.");
@@ -88,7 +93,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     const { data: scenes, error: scenesErr } = await supabase
       .from("scenes")
       .select(
-        "id, idx, start_ts, end_ts, visual_query, selected_clips(in_point, out_point, clip_candidates(url, provider, provider_clip_id))",
+        "id, idx, start_ts, end_ts, visual_query, selected_clips(in_point, out_point, clip_candidates(url, fallback_urls, provider, provider_clip_id))",
       )
       .eq("project_id", projectId)
       .order("idx", { ascending: true });
@@ -104,7 +109,12 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       selected_clips: {
         in_point: number;
         out_point: number;
-        clip_candidates: { url: string; provider: string; provider_clip_id: string };
+        clip_candidates: {
+          url: string;
+          provider: string;
+          provider_clip_id: string;
+          fallback_urls?: unknown;
+        };
       } | null;
     };
     const sceneRows = scenes as unknown as SceneRow[];
@@ -138,6 +148,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       end: number;
       scene_id?: string;
       provider_clip_id?: string | null;
+      /** Smaller renditions of the same source, for oversize fall-through. */
+      fallback_urls?: string[];
     }>;
     const renderTransition = "hard-cut" as const;
 
@@ -156,6 +168,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           end: start + slot.durationSeconds,
           scene_id: slot.sceneId,
           provider_clip_id: scene.selected_clips.clip_candidates.provider_clip_id ?? null,
+          fallback_urls: toFallbackUrls(scene.selected_clips.clip_candidates.fallback_urls),
         };
       });
     } else {
@@ -166,7 +179,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       const { data: existingSlices } = await supabaseAdmin
         .from("render_clip_slices")
         .select(
-          "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+          "scene_id, slice_index, clip_url, fallback_urls, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
         )
         .eq("project_id", projectId);
 
@@ -198,6 +211,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             end: start + slot.durationSeconds,
             scene_id: slot.sceneId,
             provider_clip_id: cached.provider_clip_id ?? null,
+            fallback_urls: toFallbackUrls(cached.fallback_urls),
           };
         });
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
@@ -220,7 +234,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         const { data: existingSlices } = await supabaseAdmin
           .from("render_clip_slices")
           .select(
-            "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+            "scene_id, slice_index, clip_url, fallback_urls, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
           )
           .eq("project_id", projectId);
 
@@ -385,7 +399,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
         const { data: finalSlices } = await supabaseAdmin
           .from("render_clip_slices")
           .select(
-            "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+            "scene_id, slice_index, clip_url, fallback_urls, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
           )
           .eq("project_id", projectId);
         const finalCoverage = summarizeSliceCoverage(
@@ -420,6 +434,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             end: start + slot.durationSeconds,
             scene_id: slot.sceneId,
             provider_clip_id: row.provider_clip_id ?? null,
+            fallback_urls: toFallbackUrls(row.fallback_urls),
           };
         });
       }

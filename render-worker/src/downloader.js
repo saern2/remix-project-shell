@@ -61,6 +61,35 @@ class Semaphore {
 
 const cdnSemaphore = new Semaphore(config.globalCdnConcurrency || 4);
 
+/**
+ * Raised when a source exceeds MAX_CLIP_BYTES on its Content-Length pre-check.
+ * A distinct type so downloadAll can fall through to a smaller rendition rather
+ * than failing the chunk — an oversized source is a recoverable choice, not a
+ * broken one.
+ */
+class OversizedSourceError extends Error {
+  constructor(url, bytes, limit) {
+    super(`Download rejected: Content-Length ${bytes} exceeds per-file limit ${limit} for: ${url}`);
+    this.name = 'OversizedSourceError';
+    this.url = url;
+    this.bytes = bytes;
+    this.limit = limit;
+  }
+}
+
+/** Best-effort provider label for logs, derived from the CDN host. */
+function providerOf(urlStr) {
+  try {
+    const host = new URL(urlStr).hostname.toLowerCase();
+    if (host.includes('pixabay.com')) return 'pixabay';
+    if (host.includes('pexels.com')) return 'pexels';
+    if (host.includes('nasa.gov')) return 'nasa';
+    return host;
+  } catch {
+    return 'unknown';
+  }
+}
+
 function isCdnUrl(urlStr) {
   try {
     const host = new URL(urlStr).hostname.toLowerCase();
@@ -252,9 +281,7 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
             if (!finished) {
               finished = true;
               clearTimers();
-              reject(new Error(
-                `Download rejected: Content-Length ${cl} exceeds per-file limit ${maxBytes} for: ${url}`
-              ));
+              reject(new OversizedSourceError(url, cl, maxBytes));
             }
             return;
           }
@@ -523,6 +550,8 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
     }
 
     let reusedDownloads = 0;
+    let oversizeRejections = 0;
+    let oversizeFallbacks = 0;
     for (const i of primaryIndices) {
       tasks.push(async () => {
         const { clip_url } = clips[i];
@@ -541,9 +570,63 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
           reusedDownloads += 1;
           logger.info({ url: clip_url, destPath }, 'Reusing clip already downloaded by a prior attempt');
         } else {
-          await fsp.rm(markerPathFor(destPath), { force: true }).catch(() => {});
-          const bytes = await downloadTask(clip_url, destPath, config.maxClipBytes);
-          await markDownloadComplete(destPath, clip_url, bytes);
+          // ── Oversize fall-through (round 7) ─────────────────────────────────
+          // The primary URL plus any smaller renditions of the SAME source, in
+          // order. A source rejected by the Content-Length pre-check used to
+          // fail the entire chunk; now it costs one rejected response and moves
+          // on. Only oversize falls through — a network error or SSRF block is
+          // not something a different rendition fixes, so those still throw.
+          const candidates = [clip_url, ...(clips[i].fallback_urls ?? [])];
+          let downloaded = false;
+          let lastOversize = null;
+
+          for (let attempt = 0; attempt < candidates.length; attempt++) {
+            const candidate = candidates[attempt];
+            await fsp.rm(markerPathFor(destPath), { force: true }).catch(() => {});
+            try {
+              const bytes = await downloadTask(candidate, destPath, config.maxClipBytes);
+              await markDownloadComplete(destPath, candidate, bytes);
+              if (attempt > 0) {
+                oversizeFallbacks += 1;
+                logger.info(
+                  {
+                    provider: providerOf(candidate),
+                    rejectedUrl: clip_url,
+                    usedUrl: candidate,
+                    attempt: attempt + 1,
+                    ofCandidates: candidates.length,
+                    bytes,
+                  },
+                  'Recovered from an oversized source using a smaller rendition',
+                );
+              }
+              downloaded = true;
+              break;
+            } catch (err) {
+              if (!(err instanceof OversizedSourceError)) throw err;
+              lastOversize = err;
+              oversizeRejections += 1;
+              logger.warn(
+                {
+                  provider: providerOf(candidate),
+                  url: candidate,
+                  contentLengthBytes: err.bytes,
+                  limitBytes: err.limit,
+                  overBy: err.bytes - err.limit,
+                  remainingCandidates: candidates.length - attempt - 1,
+                },
+                'Source rejected as oversized',
+              );
+            }
+          }
+
+          if (!downloaded) {
+            // Every rendition of this source is too large. Nothing local can fix
+            // that, so the chunk fails — but with the full picture in the message.
+            throw new Error(
+              `${lastOversize.message} (all ${candidates.length} rendition(s) of this source exceed the limit)`,
+            );
+          }
         }
 
         // Point every index that shares this URL at the single downloaded file.
@@ -565,6 +648,8 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
         uniqueDownloads: primaryIndices.length,
         dedupedDownloads,
         reusedDownloads,
+        oversizeRejections,
+        oversizeFallbacks,
       },
       'Required assets downloaded',
     );
@@ -574,4 +659,12 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
   }
 }
 
-module.exports = { downloadFile, downloadAll, preFlightCheckUrl, assertAllowedUrl, asyncPool };
+module.exports = {
+  downloadFile,
+  downloadAll,
+  preFlightCheckUrl,
+  assertAllowedUrl,
+  asyncPool,
+  OversizedSourceError,
+  providerOf,
+};

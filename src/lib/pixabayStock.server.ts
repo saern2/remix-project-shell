@@ -12,6 +12,12 @@ type PixabayRendition = {
   url?: string;
   width?: number;
   height?: number;
+  /**
+   * Bytes. Pixabay is the one provider that reports this, and dropping it was
+   * how a 235 MB rendition got selected against the worker's 150 MB ceiling —
+   * the size was in the search response we already had (round 7).
+   */
+  size?: number;
   thumbnail?: string;
 };
 
@@ -68,6 +74,7 @@ function toStockVideo(hit: PixabayHit): StockVideo[] {
       url: file.url,
       width: Number(file.width),
       height: Number(file.height),
+      ...(Number.isFinite(file.size) && Number(file.size) > 0 ? { bytes: Number(file.size) } : {}),
     }));
   if (files.length === 0) return [];
 

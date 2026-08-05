@@ -1,7 +1,17 @@
 import { CATEGORY_THEMES } from "@/lib/visual-queries.server";
 import type { MatchingProfile } from "@/lib/matching-profile";
 
-export type StockVideoFile = { url: string; width: number; height: number };
+export type StockVideoFile = {
+  url: string;
+  width: number;
+  height: number;
+  /**
+   * Byte size, when the provider volunteers it. Pixabay does (per rendition);
+   * Pexels and NASA do not. Undefined means unknown, never "unlimited" — the
+   * worker's Content-Length pre-check remains the authority.
+   */
+  bytes?: number;
+};
 
 export type StockVideo = {
   provider: "pexels" | "pixabay" | "nasa";
@@ -63,6 +73,71 @@ export function sourceDurationBudgetSeconds(minDurationSec: number): number {
 export function meetsMinimumSourceDuration(video: StockVideo, minDurationSec: number): boolean {
   if (video.duration_known === false) return true;
   return video.duration_sec >= minDurationSec;
+}
+
+/**
+ * Byte ceiling for a single source clip. MUST mirror the worker's
+ * MAX_CLIP_BYTES — the worker rejects anything above it on the Content-Length
+ * pre-check, so a selection that ignores this is choosing a guaranteed failure.
+ *
+ * Round 7: a 235,132,958-byte Pixabay rendition was selected against the
+ * worker's 150 MB limit and burned the chunk's first attempt every time it was
+ * drawn. The round-6 budget bounds DURATION, which does not bound bytes: that
+ * clip was short enough to pass and still far too large.
+ */
+export function maxClipBytes(): number {
+  const configured = Number(process.env.MAX_CLIP_BYTES ?? 157_286_400);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 157_286_400;
+}
+
+/** A file is oversized only when its size is KNOWN to exceed the ceiling. */
+export function isOversizedFile(file: StockVideoFile, ceilingBytes = maxClipBytes()): boolean {
+  return typeof file.bytes === "number" && file.bytes > ceilingBytes;
+}
+
+/**
+ * Picks the rendition to download: the smallest that still meets the target
+ * width, skipping any whose size is known to exceed the ceiling.
+ *
+ * Falling back deliberately prefers a SMALLER-than-target file over a
+ * known-oversized one — a slightly soft clip renders, a rejected download does
+ * not. When nothing has a known size (Pexels, NASA) this behaves exactly as
+ * before, and the worker's pre-check stays the backstop.
+ */
+export function selectRenditionForTarget(
+  files: StockVideoFile[],
+  targetWidth: number,
+  ceilingBytes = maxClipBytes(),
+): StockVideoFile | null {
+  if (files.length === 0) return null;
+  const ascending = [...files].sort((a, b) => a.width - b.width);
+  const affordable = ascending.filter((file) => !isOversizedFile(file, ceilingBytes));
+  // Every rendition is known to be too large: take the SMALLEST rather than the
+  // one matching the target. The download will likely be rejected either way, so
+  // prefer the one most likely to squeak under a slightly different real
+  // Content-Length, and cheapest to reject if not.
+  if (affordable.length === 0) return ascending[0];
+  return affordable.find((file) => file.width >= targetWidth) ?? affordable[affordable.length - 1];
+}
+
+/**
+ * Renditions of the same source the worker may fall back to, best-first.
+ *
+ * Only smaller renditions, and only ones not already known to be oversized:
+ * falling "up" would re-hit the same ceiling. Same source throughout, so a
+ * fallback swaps the file and never the footage — which is what keeps clip
+ * uniqueness and scene relevance intact without a round trip to the matcher.
+ */
+export function fallbackRenditions(
+  files: StockVideoFile[],
+  chosen: StockVideoFile,
+  ceilingBytes = maxClipBytes(),
+): string[] {
+  return [...files]
+    .filter((file) => file.url !== chosen.url && file.width <= chosen.width)
+    .filter((file) => !isOversizedFile(file, ceilingBytes))
+    .sort((a, b) => b.width - a.width)
+    .map((file) => file.url);
 }
 
 export function withinSourceDurationBudget(video: StockVideo, minDurationSec: number): boolean {
@@ -188,6 +263,13 @@ export type StockSearchResult = {
   candidates: StockVideo[];
   inPoint: number;
   reservationKey: string;
+  /**
+   * Smaller renditions of the SAME source, best-first, for the worker to fall
+   * back to when the chosen one is rejected as oversized. Same footage, same
+   * provider_clip_id — so a fallback changes the file, never the shot, and
+   * cannot disturb clip uniqueness.
+   */
+  fallbackUrls: string[];
 };
 
 function parsePexelsKeys(): string[] {
@@ -894,15 +976,14 @@ export function selectStockCandidate(opts: {
   const top = [...preferredMeta].sort((a, b) => a.index - b.index).slice(0, SEEDED_TOP_CANDIDATES);
   const selected = top[seededIndex(`${opts.seed ?? "stock"}:candidate`, top.length)];
   const pick = selected.video;
-  const sortedFiles = [...pick.files].sort((a, b) => a.width - b.width);
-  let chosenFile = sortedFiles.find((file) => file.width >= opts.targetWidth);
-  if (!chosenFile) chosenFile = sortedFiles[sortedFiles.length - 1];
+  const chosenFile = selectRenditionForTarget(pick.files, opts.targetWidth)!;
   return {
     pick,
     chosenFile,
     candidates: candidateMeta.map(({ video }) => video),
     inPoint: selected.inPoint,
     reservationKey: stockReservationKey(pick.provider, pick.provider_clip_id, selected.inPoint),
+    fallbackUrls: fallbackRenditions(pick.files, chosenFile),
   };
 }
 

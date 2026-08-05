@@ -758,6 +758,9 @@ async function advanceFromMatchingFootage(projectId: string) {
             scene_id: slot.sceneId,
             slice_index: slot.sliceIndex,
             clip_url: result.chosenFile.url,
+            // Smaller renditions of the same source; the worker walks these when
+            // the primary is rejected as oversized (round 7).
+            fallback_urls: result.fallbackUrls,
             provider_clip_id: providerClipId,
             provider: result.pick.provider,
             in_point_seconds: result.inPoint,
@@ -1019,6 +1022,7 @@ async function advanceFromMatchingFootage(projectId: string) {
           provider: pick.provider,
           provider_clip_id: pick.provider_clip_id,
           url: chosenFile.url,
+          fallback_urls: result.fallbackUrls,
           thumbnail_url: pick.thumbnail_url,
           width: chosenFile.width,
           height: chosenFile.height,

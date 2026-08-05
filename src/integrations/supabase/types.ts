@@ -220,6 +220,7 @@ export type Database = {
         Row: {
           created_at: string
           duration_sec: number | null
+          fallback_urls: Json
           height: number | null
           id: string
           provider: string
@@ -233,6 +234,7 @@ export type Database = {
         Insert: {
           created_at?: string
           duration_sec?: number | null
+          fallback_urls?: Json
           height?: number | null
           id?: string
           provider: string
@@ -246,6 +248,7 @@ export type Database = {
         Update: {
           created_at?: string
           duration_sec?: number | null
+          fallback_urls?: Json
           height?: number | null
           id?: string
           provider?: string
@@ -468,6 +471,7 @@ export type Database = {
           clip_url: string
           created_at: string
           duration_seconds: number
+          fallback_urls: Json
           id: string
           in_point_seconds: number
           project_id: string
@@ -483,6 +487,7 @@ export type Database = {
           clip_url: string
           created_at?: string
           duration_seconds: number
+          fallback_urls?: Json
           id?: string
           in_point_seconds?: number
           project_id: string
@@ -498,6 +503,7 @@ export type Database = {
           clip_url?: string
           created_at?: string
           duration_seconds?: number
+          fallback_urls?: Json
           id?: string
           in_point_seconds?: number
           project_id?: string

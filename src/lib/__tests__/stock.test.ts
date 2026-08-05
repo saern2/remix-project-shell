@@ -224,7 +224,11 @@ describe("source duration budget (round 6, Issue 1)", () => {
   });
 
   it("treats unknown-duration sources (e.g. NASA) as within budget", () => {
-    const nasa = { ...pexelsVideo("nasa-1", 9999), provider: "nasa" as const, duration_known: false };
+    const nasa = {
+      ...pexelsVideo("nasa-1", 9999),
+      provider: "nasa" as const,
+      duration_known: false,
+    };
     expect(withinSourceDurationBudget(nasa, 4)).toBe(true);
   });
 
@@ -241,14 +245,16 @@ describe("source duration budget (round 6, Issue 1)", () => {
       ...Array.from({ length: 9 }, (_, i) => pexelsVideo(`short-${i}`, 12 + i)),
     ];
     const picks = new Set(
-      Array.from({ length: 40 }, (_, i) =>
-        selectStockCandidate({
-          results: candidates,
-          minDurationSec: 5,
-          targetWidth: 1920,
-          usedIds: [],
-          seed: `project-${i}:scene-1`,
-        })?.pick.provider_clip_id,
+      Array.from(
+        { length: 40 },
+        (_, i) =>
+          selectStockCandidate({
+            results: candidates,
+            minDurationSec: 5,
+            targetWidth: 1920,
+            usedIds: [],
+            seed: `project-${i}:scene-1`,
+          })?.pick.provider_clip_id,
       ),
     );
     expect(picks.has("long-240s")).toBe(false);
@@ -289,5 +295,6 @@ function stockResult(id: string): StockSearchResult {
     candidates: [pick],
     inPoint: 0,
     reservationKey: `nasa:${id}:0`,
+    fallbackUrls: [],
   };
 }
