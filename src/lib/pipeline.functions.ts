@@ -8,6 +8,7 @@ import {
 } from "@/lib/matching-budget";
 import { createMatchingProfile } from "@/lib/matching-profile";
 import type { StockSearchSession } from "@/lib/stock.server";
+import type { AssignmentTier } from "@/lib/stock-corpus.server";
 
 const ProjectIdInput = z.object({ projectId: z.string().uuid() });
 
@@ -460,11 +461,28 @@ async function advanceFromGeneratingScenes(projectId: string) {
 /** A scene that had to be matched below the unique tier. */
 type FallbackEvent = {
   demandId: string;
-  tier: "unique" | "alternate-window" | "distant-reuse";
+  tier: AssignmentTier;
   reason: string;
   sourceKey: string;
   sceneDistance: number | null;
 };
+
+/**
+ * How many scenes may go unmatched before the project is failed.
+ *
+ * One unmatched scene used to fail a 145-scene project outright. With the
+ * last-resort tier in place an unmatched scene means the corpus held nothing
+ * renderable for it at all, which is rare enough that a handful is worth
+ * shipping around rather than throwing 144 good scenes away.
+ *
+ * The floor of 2 is the hard promise: a single scene NEVER fails a project, at
+ * any project size. MATCHING_MAX_UNMATCHED_FRACTION overrides the 10%.
+ */
+export function unmatchedSceneFailureThreshold(totalScenes: number): number {
+  const configured = Number(process.env.MATCHING_MAX_UNMATCHED_FRACTION ?? 0.1);
+  const fraction = Number.isFinite(configured) && configured > 0 ? configured : 0.1;
+  return Math.max(2, Math.ceil(totalScenes * fraction));
+}
 
 /**
  * Reconstructs project-wide source usage from what is already persisted.
@@ -531,9 +549,40 @@ async function advanceFromMatchingFootage(projectId: string) {
     "visualQueryCacheHit",
     "corpusCacheHit",
     "sceneReadRows",
+    "fallbackAlternateWindow",
+    "fallbackDistantReuse",
+    "fallbackLastResort",
   ]) {
     profile.count(counter, 0);
   }
+
+  const TIER_COUNTERS: Record<AssignmentTier, string | null> = {
+    unique: null,
+    "alternate-window": "fallbackAlternateWindow",
+    "distant-reuse": "fallbackDistantReuse",
+    "last-resort": "fallbackLastResort",
+  };
+
+  /**
+   * Counts a degraded assignment and writes the decision to the log.
+   *
+   * Both matching paths funnel through here so a tier can never be counted as a
+   * different one — the previous form was a ternary that silently folded
+   * last-resort into distant-reuse, which would have hidden exactly the events
+   * most worth seeing.
+   */
+  const recordFallback = (event: FallbackEvent) => {
+    const counter = TIER_COUNTERS[event.tier];
+    if (counter) profile.count(counter);
+    console.info("[matching_footage] scene matched below the unique tier", {
+      projectId,
+      sceneId: event.demandId,
+      tier: event.tier,
+      reason: event.reason,
+      sourceKey: event.sourceKey,
+      sceneDistance: event.sceneDistance,
+    });
+  };
 
   /**
    * Per-invocation timing breakdown, returned to the CLIENT as well as logged.
@@ -1055,22 +1104,29 @@ async function advanceFromMatchingFootage(projectId: string) {
           throwPipelineWriteError(sliceError, "Failed to save a footage slice.");
         });
 
-        for (const event of fallbackEvents.splice(0)) {
-          profile.count(
-            event.tier === "alternate-window" ? "fallbackAlternateWindow" : "fallbackDistantReuse",
-          );
-        }
+        for (const event of fallbackEvents.splice(0)) recordFallback(event);
         processedSlots += slice.length;
         budget.recordSlice(Date.now() - sliceStartedAt);
       }
 
       if (unmatchedSlots.length > 0) {
-        // Reaching here means the corpus held nothing usable for these slots —
-        // not merely nothing unique. Uniqueness now degrades through two further
-        // tiers before a scene is allowed to fail (round 8).
-        throw new Error(
-          `No stock footage at all could be found for ${unmatchedSlots.length} slot(s): ${describeMissingSlots(unmatchedSlots)}. Try a different category or clip duration, then retry matching.`,
-        );
+        // Reaching here means the corpus held nothing RENDERABLE for these
+        // slots — four tiers have already declined, the last of which drops
+        // every preference. A few such slots are not worth throwing the rest of
+        // the project away for; a lot of them mean the corpus is broken.
+        const threshold = unmatchedSceneFailureThreshold(expectedSlots.length);
+        console.warn("[matching_footage:fixed-duration] slots left unmatched", {
+          projectId,
+          unmatchedSlots: unmatchedSlots.length,
+          totalSlots: expectedSlots.length,
+          failureThreshold: threshold,
+          detail: describeMissingSlots(unmatchedSlots),
+        });
+        if (unmatchedSlots.length >= threshold) {
+          throw new Error(
+            `No stock footage at all could be found for ${unmatchedSlots.length} of ${expectedSlots.length} slot(s): ${describeMissingSlots(unmatchedSlots)}. Try a different category or clip duration, then retry matching.`,
+          );
+        }
       }
 
       // More slots remain — stay in matching_footage so the next poll continues.
@@ -1404,25 +1460,31 @@ async function advanceFromMatchingFootage(projectId: string) {
       });
 
       await asyncPool(slice, CONCURRENCY, (scene) => processScene(scene, plainAssignments));
-      for (const event of fallbackEvents.splice(0)) {
-        profile.count(
-          event.tier === "alternate-window" ? "fallbackAlternateWindow" : "fallbackDistantReuse",
-        );
-      }
+      for (const event of fallbackEvents.splice(0)) recordFallback(event);
       processedScenes += slice.length;
       budget.recordSlice(Date.now() - sliceStartedAt);
     }
 
     if (unmatchedSceneIds.size > 0) {
-      // Not a uniqueness failure any more: a scene only lands here when the
-      // corpus contains no usable footage for it under ANY tier, including
-      // reuse. Round 8 — failing 145 scenes because a handful could not be
-      // unique was the wrong trade.
-      throw new Error(
-        projectNiche === "space"
-          ? `NASA, Pexels, and Pixabay returned no usable footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`
-          : `Pexels and Pixabay returned no usable footage for ${unmatchedSceneIds.size} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`,
-      );
+      // Not a uniqueness failure: a scene only lands here when the corpus holds
+      // nothing RENDERABLE for it under any of the four tiers — the last of
+      // which takes any clip with a usable rendition. One such scene must never
+      // cost the project; enough of them means the corpus itself is broken.
+      const threshold = unmatchedSceneFailureThreshold(scenes.length);
+      console.warn("[matching_footage:plain] scenes left unmatched", {
+        projectId,
+        unmatchedScenes: unmatchedSceneIds.size,
+        totalScenes: scenes.length,
+        failureThreshold: threshold,
+        sceneIds: [...unmatchedSceneIds].slice(0, 20),
+      });
+      if (unmatchedSceneIds.size >= threshold) {
+        throw new Error(
+          projectNiche === "space"
+            ? `NASA, Pexels, and Pixabay returned no usable footage for ${unmatchedSceneIds.size} of ${scenes.length} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`
+            : `Pexels and Pixabay returned no usable footage for ${unmatchedSceneIds.size} of ${scenes.length} scene(s). Retry matching; if this continues, ask the operator to verify provider availability.`,
+        );
+      }
     }
 
     // More scenes remain — stay in matching_footage so the next poll continues.

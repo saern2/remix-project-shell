@@ -274,7 +274,7 @@ export type StockSearchResult = {
    * Which selection tier produced this. "unique" is the norm; the others record
    * a deliberate, logged degradation rather than a failure.
    */
-  tier?: "unique" | "alternate-window" | "distant-reuse";
+  tier?: "unique" | "alternate-window" | "distant-reuse" | "last-resort";
 };
 
 function parsePexelsKeys(): string[] {

@@ -38,8 +38,16 @@ export type StockDemand = {
  */
 export type SourceUsage = Map<string, { windows: Set<number>; sceneIndexes: number[] }>;
 
-/** Which tier supplied a scene's clip. Reported so degradation is never silent. */
-export type AssignmentTier = "unique" | "alternate-window" | "distant-reuse";
+/**
+ * Which tier supplied a scene's clip. Reported so degradation is never silent.
+ *
+ * `last-resort` is the floor: it drops every preference — distance, recency,
+ * relevance minimums, duration budget — and keeps only what is physically
+ * required to render (a source with a usable rendition). It exists because one
+ * scene failing used to fail a 145-scene project, and a repeated clip is always
+ * better than no video.
+ */
+export type AssignmentTier = "unique" | "alternate-window" | "distant-reuse" | "last-resort";
 
 /**
  * Minimum timeline distance between two uses of the same source. Adjacent reuse
@@ -538,6 +546,7 @@ function assignFromProjectCorpus(
     unique: 0,
     "alternate-window": 0,
     "distant-reuse": 0,
+    "last-resort": 0,
   };
 
   for (const demand of opts.demands) {
@@ -647,7 +656,89 @@ function selectWithDegradation(opts: {
   if (alternate) return alternate;
 
   // Tier 3: an outright repeat, placed as far from its other uses as possible.
-  return selectDistantReuse(opts);
+  const distant = selectDistantReuse(opts);
+  if (distant) return distant;
+
+  // Tier 4: anything that will render. Every tier above declines for a reason
+  // that is about QUALITY — unused, unseen window, far enough away — and each of
+  // those reasons is worth less than the project existing. This one keeps only
+  // the physical requirements and takes the most relevant clip that satisfies
+  // them, however recently or closely it was already used.
+  return selectLastResort(opts);
+}
+
+/**
+ * The floor. Reached only when tiers 1-3 have all declined.
+ *
+ * Deliberately ignores: `recentSources` (which blocks the last 20 sources
+ * outright), the NASA relevance minimum, scene distance, the duration budget,
+ * and whether the exact window is already reserved. What it cannot ignore is
+ * whether the clip can be turned into a render row at all — a source with no
+ * files, or none that `selectRenditionForTarget` will accept, is not a clip.
+ *
+ * The reservation key is made unique per demand so this pick never collides with
+ * the existing reservation it is knowingly duplicating.
+ */
+function selectLastResort(opts: {
+  demand: StockDemand;
+  candidates: StockVideo[];
+  targetWidth: number;
+  sourceUsage: SourceUsage;
+}): TieredSelection | null {
+  // Least-used first, so a forced repeat spreads across the corpus rather than
+  // hammering whichever clip happens to rank highest; relevance breaks ties.
+  const ranked = [...opts.candidates].sort((a, b) => {
+    const aUses =
+      opts.sourceUsage.get(`${a.provider}:${a.provider_clip_id}`)?.sceneIndexes.length ?? 0;
+    const bUses =
+      opts.sourceUsage.get(`${b.provider}:${b.provider_clip_id}`)?.sceneIndexes.length ?? 0;
+    return (
+      aUses - bUses ||
+      candidateRelevance(opts.demand.query, b) - candidateRelevance(opts.demand.query, a) ||
+      stableHash(`${opts.demand.seed}:${a.provider}:${a.provider_clip_id}`) -
+        stableHash(`${opts.demand.seed}:${b.provider}:${b.provider_clip_id}`)
+    );
+  });
+
+  for (const video of ranked) {
+    if (video.files.length === 0) continue;
+    const sourceKey = `${video.provider}:${video.provider_clip_id}`;
+    const usage = opts.sourceUsage.get(sourceKey);
+    const distance = nearestSceneDistance(usage?.sceneIndexes ?? [], opts.demand.sceneIndex);
+    const result = buildResult(
+      video,
+      0,
+      opts.targetWidth,
+      `${sourceKey}:last-resort:${opts.demand.id}`,
+      opts.candidates,
+    );
+    if (!result) continue;
+
+    // Loud on purpose. Every other tier is a considered trade; this one means
+    // the corpus could not satisfy a scene any other way, and the operator
+    // should see it even if the project completes successfully.
+    console.warn("[stock-corpus] LAST-RESORT assignment — every preference dropped", {
+      demandId: opts.demand.id,
+      sceneIndex: opts.demand.sceneIndex ?? null,
+      query: opts.demand.query,
+      sourceKey,
+      timesAlreadyUsed: usage?.sceneIndexes.length ?? 0,
+      nearestUseSceneDistance: distance,
+      requiredDurationSec: Number(opts.demand.minDurationSec.toFixed(3)),
+      sourceDurationSec: Number(video.duration_sec.toFixed(3)),
+    });
+
+    return {
+      result,
+      tier: "last-resort",
+      reason:
+        usage == null
+          ? "no tier could place this scene; took the most relevant clip available regardless of preferences"
+          : `no unique source, free window or distant repeat existed; reused a clip ${distance ?? "an unknown number of"} scene(s) away rather than failing the project`,
+      sceneDistance: distance,
+    };
+  }
+  return null;
 }
 
 /** Ranks candidates the way tier 1 does, so degraded picks are still relevant. */
