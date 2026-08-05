@@ -30,8 +30,21 @@
  * when the whole point is not to block other users.
  */
 
-const DEFAULT_MATCHING_TIME_BUDGET_MS = 8_000;
-const DEFAULT_MATCHING_SLICE_SIZE = 2;
+// Round 6 follow-up: with 8s/2 scenes, 145 scenes took 56 invocations because
+// ~4.9s of every ~9.1s invocation was per-invocation setup that scaled with the
+// PROJECT (all scenes re-read, the whole stock_search_cache prefetched, the key
+// pool reloaded) rather than with the slice. That setup is now O(slice), which
+// frees the budget for actual matching: a bigger slice and a longer budget now
+// buy scenes instead of buying repeated setup.
+//
+// Note the cap this implies. An in-flight slice cannot be preempted, so the true
+// worst case per invocation is `budget + one slice`, not `budget`. The larger
+// slice is deliberately paired with the tighter setup: the first slice now
+// starts at ~0.3s elapsed instead of ~4.9s, so the projection guard has the
+// budget's full width to work with and lands invocations near it rather than
+// past it.
+const DEFAULT_MATCHING_TIME_BUDGET_MS = 12_000;
+const DEFAULT_MATCHING_SLICE_SIZE = 5;
 
 /**
  * Wall-clock budget per matching_footage invocation, from MATCHING_TIME_BUDGET_MS.

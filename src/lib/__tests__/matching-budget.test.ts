@@ -143,9 +143,9 @@ describe("matching time budget — configuration", () => {
     delete process.env.MATCHING_SLICE_SIZE;
   });
 
-  it("defaults to 8 seconds when unset", () => {
+  it("defaults to 12 seconds when unset", () => {
     delete process.env.MATCHING_TIME_BUDGET_MS;
-    expect(matchingTimeBudgetMs()).toBe(8_000);
+    expect(matchingTimeBudgetMs()).toBe(12_000);
   });
 
   it("honours a configured override", () => {
@@ -153,21 +153,21 @@ describe("matching time budget — configuration", () => {
     expect(matchingTimeBudgetMs()).toBe(5_000);
   });
 
-  it("defaults the slice size to 2 and honours overrides", () => {
+  it("defaults the slice size to 5 and honours overrides", () => {
     delete process.env.MATCHING_SLICE_SIZE;
-    expect(matchingSliceSize()).toBe(2);
+    expect(matchingSliceSize()).toBe(5);
     process.env.MATCHING_SLICE_SIZE = "4";
     expect(matchingSliceSize()).toBe(4);
     for (const raw of ["0", "-3", "nope", ""]) {
       process.env.MATCHING_SLICE_SIZE = raw;
-      expect(matchingSliceSize()).toBe(2);
+      expect(matchingSliceSize()).toBe(5);
     }
   });
 
   it("falls back to the default for invalid or non-positive values", () => {
     for (const raw of ["not-a-number", "0", "-1", ""]) {
       process.env.MATCHING_TIME_BUDGET_MS = raw;
-      expect(matchingTimeBudgetMs()).toBe(8_000);
+      expect(matchingTimeBudgetMs()).toBe(12_000);
     }
   });
 });

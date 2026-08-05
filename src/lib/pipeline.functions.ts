@@ -458,6 +458,38 @@ async function advanceFromMatchingFootage(projectId: string) {
   const sliceSize = matchingSliceSize();
   const budget = createMatchingBudget({ budgetMs });
   const profile = createMatchingProfile();
+  // Seed the buckets that matter so the poll payload always carries the same
+  // shape, even for an invocation that did no work of that kind.
+  for (const bucket of [
+    "sceneRead",
+    "selectionRead",
+    "cacheRead",
+    "providerSearch",
+    "assignment",
+    "dbWrite",
+  ]) {
+    profile.add(bucket, 0);
+  }
+
+  /**
+   * Per-invocation timing breakdown, returned to the CLIENT as well as logged.
+   *
+   * Round 6: the operator polls this endpoint from a browser and cannot reach
+   * server logs, so the breakdown that identifies where an invocation's time
+   * went has to travel in the response body to be observable at all. It is
+   * diagnostic only — the client ignores it and reads `status`.
+   *
+   * Excludes the stock session flush, which runs in `finally` after the value is
+   * built; `elapsedMs` is the time known at return.
+   */
+  const matchingTelemetry = (fields: { scenesProcessed: number; remaining: number }) => ({
+    ...fields,
+    budgetMs,
+    sliceSize,
+    elapsedMs: budget.elapsedMs(),
+    ...budget.stats(),
+    ...profile.summary(),
+  });
 
   // Single-flight guard: if a peer poll is already matching this project, do not
   // start duplicate work — return matching_footage so the client keeps polling.
@@ -469,7 +501,11 @@ async function advanceFromMatchingFootage(projectId: string) {
     throw err;
   }
   if (!lockHeld) {
-    return { status: "matching_footage", error_message: null };
+    return {
+      status: "matching_footage",
+      error_message: null,
+      matching: { ...matchingTelemetry({ scenesProcessed: 0, remaining: -1 }), lockHeld: 0 },
+    };
   }
 
   try {
@@ -482,16 +518,47 @@ async function advanceFromMatchingFootage(projectId: string) {
     if (pErr) throw new Error(pErr.message);
     if (!project) throw new PipelineStoppedError();
 
+    // Timeline skeleton: every scene, but only the columns the timeline maths
+    // needs. This one read CANNOT be narrowed to pending scenes — a slot's
+    // boundaries come from the *adjacent* scene's start_ts, so a gap in the list
+    // would silently shift every downstream timing. It is made cheap instead:
+    // `text` (the narration body, by far the largest column on the table) is no
+    // longer selected, and visual_query is read separately, for pending scenes
+    // only, once the pending set is known.
+    const sceneReadStartedAt = Date.now();
     const { data: scenes, error } = await supabaseAdmin
       .from("scenes")
-      .select("id, idx, text, start_ts, end_ts, visual_query")
+      .select("id, idx, start_ts, end_ts")
       .eq("project_id", projectId)
       .order("idx", { ascending: true });
+    profile.add("sceneRead", Date.now() - sceneReadStartedAt);
     if (error) throw new Error(error.message);
     if (!scenes || scenes.length === 0) {
       await supabaseAdmin.from("projects").update({ status: "ready" }).eq("id", projectId);
       return { status: "ready", error_message: null };
     }
+
+    /**
+     * Visual queries for exactly the scenes this invocation still has work for.
+     * Filtered in the query, so the payload shrinks with every invocation instead
+     * of re-reading all 145 scenes' queries 56 times.
+     */
+    const loadVisualQueries = async (sceneIds: string[]): Promise<Map<string, string>> => {
+      const queries = new Map<string, string>();
+      if (sceneIds.length === 0) return queries;
+      const startedAt = Date.now();
+      const { data, error: queryError } = await supabaseAdmin
+        .from("scenes")
+        .select("id, visual_query")
+        .in("id", sceneIds);
+      profile.add("sceneRead", Date.now() - startedAt);
+      profile.count("sceneReadRows", data?.length ?? 0);
+      if (queryError) throw new Error(queryError.message);
+      for (const row of data ?? []) {
+        if (row.visual_query) queries.set(row.id, row.visual_query);
+      }
+      return queries;
+    };
 
     const { data: audioAsset, error: audioAssetError } = await supabaseAdmin
       .from("audio_assets")
@@ -517,12 +584,6 @@ async function advanceFromMatchingFootage(projectId: string) {
     const orientation = orientationForAspect(project.aspect_ratio);
     const targetWidth = targetWidthForAspect(project.aspect_ratio);
     const projectNiche = project.niche;
-    stockSession = await createStockSearchSession(
-      scenes.map((scene) => scene.visual_query ?? ""),
-      orientation,
-      projectNiche,
-      profile,
-    );
 
     const fixedDuration =
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
@@ -628,10 +689,13 @@ async function advanceFromMatchingFootage(projectId: string) {
             : [],
         ),
       );
-      const sceneById = new Map(scenes.map((scene) => [scene.id, scene]));
       const pendingSlots = expectedSlots.filter(
         (slot) => !sliceCache.has(sliceKey(slot.sceneId, slot.sliceIndex)),
       );
+      // Only the scenes with unfilled slots, and only now that they are known.
+      const visualQueryByScene = await loadVisualQueries([
+        ...new Set(pendingSlots.map((slot) => slot.sceneId)),
+      ]);
       const newSliceRows: Array<{
         project_id: string;
         scene_id: string;
@@ -653,18 +717,23 @@ async function advanceFromMatchingFootage(projectId: string) {
       const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
       let processedSlots = 0;
 
+      // Created last, and only if there is work: session setup loads the Pexels
+      // key pool (now snapshot-cached) and nothing else. Cache prefetching is
+      // matchStockCorpus's job, scoped to the slice it is about to search.
+      stockSession = await createStockSearchSession(profile);
+
       while (processedSlots < pendingSlots.length && budget.shouldStartAnotherSlice()) {
         const sliceStartedAt = Date.now();
         const slice = pendingSlots.slice(processedSlots, processedSlots + sliceSize);
         const fixedAssignments = await matchStockCorpus({
           projectId,
           demands: slice.flatMap((slot) => {
-            const scene = sceneById.get(slot.sceneId);
-            if (!scene?.visual_query) return [];
+            const visualQuery = visualQueryByScene.get(slot.sceneId);
+            if (!visualQuery) return [];
             return [
               {
                 id: sliceKey(slot.sceneId, slot.sliceIndex),
-                query: scene.visual_query,
+                query: visualQuery,
                 minDurationSec: slot.durationSeconds,
                 seed: `${projectId}:${slot.sceneId}:${slot.sliceIndex}`,
               },
@@ -720,26 +789,20 @@ async function advanceFromMatchingFootage(projectId: string) {
       // More slots remain — stay in matching_footage so the next poll continues.
       if (processedSlots < pendingSlots.length) {
         await assertPipelineWritable(projectId);
-        console.info("[matching_footage:fixed-duration] budget spent, more pending", {
-          projectId,
+        const telemetry = matchingTelemetry({
           scenesProcessed: processedSlots,
           remaining: pendingSlots.length - processedSlots,
-          elapsedMs: budget.elapsedMs(),
-          budgetMs,
-          ...budget.stats(),
-          ...profile.summary(),
         });
-        return { status: "matching_footage", error_message: null };
+        console.info("[matching_footage:fixed-duration] budget spent, more pending", {
+          projectId,
+          ...telemetry,
+        });
+        return { status: "matching_footage", error_message: null, matching: telemetry };
       }
 
       console.info("[matching_footage:fixed-duration] final invocation", {
         projectId,
-        scenesProcessed: processedSlots,
-        remaining: 0,
-        elapsedMs: budget.elapsedMs(),
-        budgetMs,
-        ...budget.stats(),
-        ...profile.summary(),
+        ...matchingTelemetry({ scenesProcessed: processedSlots, remaining: 0 }),
       });
 
       const { data: finalSlices } = await supabaseAdmin
@@ -758,55 +821,87 @@ async function advanceFromMatchingFootage(projectId: string) {
 
       const { data: selectedRows } = await supabaseAdmin
         .from("selected_clips")
-        .select("scene_id, clip_candidates!inner(provider)")
-        .in(
-          "scene_id",
-          scenes.map((s) => s.id),
-        );
+        .select("scene_id, scenes!inner(project_id)")
+        .eq("scenes.project_id", projectId);
       const selectedSceneIds = new Set((selectedRows ?? []).map((row) => row.scene_id));
 
-      for (const scene of scenes) {
-        if (selectedSceneIds.has(scene.id)) {
-          await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
-          continue;
+      // Round 6: this used to be a per-scene loop of two or three sequential
+      // round trips — 145 scenes meant up to ~435 serialised statements on the
+      // final invocation, the one invocation that must also stay under budget.
+      // Same writes, batched: one insert, one upsert, one status update.
+      const firstSlotByScene = new Map<string, (typeof allRows)[number]>();
+      for (const row of allRows) {
+        const current = firstSlotByScene.get(row.scene_id);
+        if (!current || row.slice_index < current.slice_index) {
+          firstSlotByScene.set(row.scene_id, row);
         }
+      }
 
-        const firstSlot = allRows
-          .filter((row) => row.scene_id === scene.id)
-          .sort((a, b) => a.slice_index - b.slice_index)[0];
-        if (!firstSlot) continue;
-        const { data: candidate } = await supabaseAdmin
+      const scenesNeedingSelection = scenes.filter(
+        (scene) => !selectedSceneIds.has(scene.id) && firstSlotByScene.has(scene.id),
+      );
+      const newlySelectedSceneIds: string[] = [];
+      if (scenesNeedingSelection.length > 0) {
+        const height = Math.round(targetWidth * (orientation === "portrait" ? 16 / 9 : 9 / 16));
+        const { data: insertedCandidates } = await supabaseAdmin
           .from("clip_candidates")
-          .insert({
-            scene_id: scene.id,
-            provider: firstSlot.provider,
-            provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
-            url: firstSlot.clip_url,
-            thumbnail_url: firstSlot.thumbnail_url ?? null,
-            width: targetWidth,
-            height: Math.round(targetWidth * (orientation === "portrait" ? 16 / 9 : 9 / 16)),
-            duration_sec: Number(firstSlot.duration_seconds),
-          })
-          .select("id")
-          .maybeSingle();
+          .insert(
+            scenesNeedingSelection.map((scene) => {
+              const firstSlot = firstSlotByScene.get(scene.id)!;
+              return {
+                scene_id: scene.id,
+                provider: firstSlot.provider,
+                provider_clip_id: firstSlot.provider_clip_id ?? `slot-${scene.id}-0`,
+                url: firstSlot.clip_url,
+                thumbnail_url: firstSlot.thumbnail_url ?? null,
+                width: targetWidth,
+                height,
+                duration_sec: Number(firstSlot.duration_seconds),
+              };
+            }),
+          )
+          .select("id, scene_id");
 
-        if (candidate?.id) {
-          await supabaseAdmin.from("selected_clips").upsert(
+        const sceneById = new Map(scenes.map((scene) => [scene.id, scene]));
+        const selectionRows = (insertedCandidates ?? []).flatMap((candidate) => {
+          const scene = sceneById.get(candidate.scene_id);
+          const firstSlot = firstSlotByScene.get(candidate.scene_id);
+          if (!scene || !firstSlot) return [];
+          const inPoint = Number(firstSlot.in_point_seconds);
+          return [
             {
               scene_id: scene.id,
               clip_candidate_id: candidate.id,
-              in_point: Number(firstSlot.in_point_seconds),
+              in_point: inPoint,
               out_point:
-                Number(firstSlot.in_point_seconds) +
+                inPoint +
                 Math.min(
                   Number(firstSlot.duration_seconds),
                   Math.max(fixedSceneDuration(scene), 1),
                 ),
             },
-            { onConflict: "scene_id" },
-          );
-          await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
+          ];
+        });
+        newlySelectedSceneIds.push(...selectionRows.map((row) => row.scene_id));
+        if (selectionRows.length > 0) {
+          const { error: selectionError } = await supabaseAdmin
+            .from("selected_clips")
+            .upsert(selectionRows, { onConflict: "scene_id" });
+          throwPipelineWriteError(selectionError, "Failed to save selected clips.");
         }
+      }
+
+      const sceneIdsToMarkSelected = [
+        ...new Set([
+          ...scenes.filter((scene) => selectedSceneIds.has(scene.id)).map((scene) => scene.id),
+          ...newlySelectedSceneIds,
+        ]),
+      ];
+      if (sceneIdsToMarkSelected.length > 0) {
+        await supabaseAdmin
+          .from("scenes")
+          .update({ status: "selected" })
+          .in("id", sceneIdsToMarkSelected);
       }
 
       console.info("[matching_footage:fixed-duration]", {
@@ -837,17 +932,26 @@ async function advanceFromMatchingFootage(projectId: string) {
         .from("projects")
         .update({ status: "ready", error_message: null })
         .eq("id", projectId);
-      return { status: "ready", error_message: null };
+      return {
+        status: "ready",
+        error_message: null,
+        matching: matchingTelemetry({ scenesProcessed: processedSlots, remaining: 0 }),
+      };
     }
     // Plain path (no fixed duration).
     // Existing selections (idempotent re-runs). Skip scenes already selected.
+    // Project-scoped via the scenes join rather than an IN list of every scene
+    // id — the id list was the request payload, and it grew with the project.
+    // This read stays project-wide on purpose: it is what seeds `usedIds`, and
+    // clip uniqueness is a whole-project invariant, not a per-slice one.
+    const selectionReadStartedAt = Date.now();
     const { data: existingSel } = await supabaseAdmin
       .from("selected_clips")
-      .select("scene_id, in_point, clip_candidates!inner(provider, provider_clip_id)")
-      .in(
-        "scene_id",
-        scenes.map((s) => s.id),
-      );
+      .select(
+        "scene_id, in_point, clip_candidates!inner(provider, provider_clip_id), scenes!inner(project_id)",
+      )
+      .eq("scenes.project_id", projectId);
+    profile.add("selectionRead", Date.now() - selectionReadStartedAt);
     const eligibleExistingSelections = existingSel ?? [];
     const sceneOrder = new Map(scenes.map((scene, index) => [scene.id, index]));
     const alreadySelected = new Set<string>();
@@ -886,6 +990,9 @@ async function advanceFromMatchingFootage(projectId: string) {
     );
     const CONCURRENCY = 5;
     const pending = scenes.filter((s) => !alreadySelected.has(s.id));
+    // Only the scenes still to match — filtered in the query, so this shrinks
+    // with every invocation rather than re-reading the whole project's queries.
+    const visualQueryByScene = await loadVisualQueries(pending.map((scene) => scene.id));
     const unmatchedSceneIds = new Set<string>();
     const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
 
@@ -943,20 +1050,25 @@ async function advanceFromMatchingFootage(projectId: string) {
     // Time-budgeted slice loop (see fixed-duration path above for rationale).
     let processedScenes = 0;
 
+    // Created last, and only if there is work: session setup loads the Pexels
+    // key pool (now snapshot-cached) and nothing else.
+    stockSession = await createStockSearchSession(profile);
+
     while (processedScenes < pending.length && budget.shouldStartAnotherSlice()) {
       const sliceStartedAt = Date.now();
       const slice = pending.slice(processedScenes, processedScenes + sliceSize);
       const plainAssignments = await matchStockCorpus({
         projectId,
         demands: slice.flatMap((scene) => {
-          if (!scene.visual_query) return [];
+          const visualQuery = visualQueryByScene.get(scene.id);
+          if (!visualQuery) return [];
           const visualDuration =
             timelineSlots.get(scene.id)?.durationSeconds ??
             Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
           return [
             {
               id: scene.id,
-              query: scene.visual_query,
+              query: visualQuery,
               minDurationSec: Math.max(1, Math.ceil(visualDuration)),
               seed: `${projectId}:${scene.id}`,
             },
@@ -985,25 +1097,23 @@ async function advanceFromMatchingFootage(projectId: string) {
     // More scenes remain — stay in matching_footage so the next poll continues.
     if (processedScenes < pending.length) {
       await assertPipelineWritable(projectId);
-      console.info("[matching_footage:plain] budget spent, more pending", {
-        projectId,
+      const telemetry = matchingTelemetry({
         scenesProcessed: processedScenes,
         remaining: pending.length - processedScenes,
-        elapsedMs: budget.elapsedMs(),
-        budgetMs,
-        ...budget.stats(),
-        ...profile.summary(),
       });
-      return { status: "matching_footage", error_message: null };
+      console.info("[matching_footage:plain] budget spent, more pending", {
+        projectId,
+        ...telemetry,
+      });
+      return { status: "matching_footage", error_message: null, matching: telemetry };
     }
 
     const { data: completedSelections } = await supabaseAdmin
       .from("selected_clips")
-      .select("in_point, clip_candidates!inner(provider, provider_clip_id)")
-      .in(
-        "scene_id",
-        scenes.map((scene) => scene.id),
-      );
+      .select(
+        "in_point, clip_candidates!inner(provider, provider_clip_id), scenes!inner(project_id)",
+      )
+      .eq("scenes.project_id", projectId);
     const selectionEvidence = (completedSelections ?? []).map((row) => {
       const candidate = (
         row as unknown as {
@@ -1037,7 +1147,11 @@ async function advanceFromMatchingFootage(projectId: string) {
       .from("projects")
       .update({ status: "ready", error_message: null })
       .eq("id", projectId);
-    return { status: "ready", error_message: null };
+    return {
+      status: "ready",
+      error_message: null,
+      matching: matchingTelemetry({ scenesProcessed: processedScenes, remaining: 0 }),
+    };
   } catch (err) {
     if (isPipelineStopped(err)) {
       console.info("[pipeline] project deleted during footage matching", { projectId });

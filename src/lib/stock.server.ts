@@ -144,6 +144,12 @@ export type StockSearchSession = {
     }
   >;
   usage: Map<string, UsageCount>;
+  /**
+   * Cache keys already looked up in stock_search_cache during this session,
+   * including misses. Successive slices cluster into overlapping query buckets,
+   * so without this the same rows are re-read once per slice.
+   */
+  prefetched?: Set<string>;
   pexelsPool: PexelsStagePool;
   nasaMetrics?: NasaRequestMetrics;
   /** Optional timing instrumentation (round 6 profiling). Measurement only. */
@@ -184,6 +190,37 @@ function buildPexelsUrl(query: string, orientation: Orientation, page: number): 
     page: String(page),
   });
   return `${PEXELS_URL}?${params.toString()}`;
+}
+
+// Round 6: the key pool was reloaded from the DB on every matching invocation.
+// With 20-25 invocations per project that is 20-25 identical reads of a table
+// that changes only when a key is added, exhausted, or rejected — all of which
+// invalidate the snapshot explicitly below. A short TTL bounds staleness for the
+// one case that is not explicitly invalidated: a rate-limit window expiring.
+const PEXELS_POOL_SNAPSHOT_TTL_MS = 45_000;
+
+let pexelsPoolSnapshot: {
+  loadedAt: number;
+  value: { configured: boolean; keys: PoolKey[] };
+} | null = null;
+
+/**
+ * Drops the cached key-pool snapshot. Called whenever this process learns a key
+ * changed state (dead, rate-limited) so the next stage reloads instead of
+ * re-selecting a key it already knows is unusable.
+ */
+export function invalidatePexelsPoolSnapshot(): void {
+  pexelsPoolSnapshot = null;
+}
+
+async function loadActivePoolKeysCached(
+  now: () => number = Date.now,
+): Promise<{ configured: boolean; keys: PoolKey[] }> {
+  const snapshot = pexelsPoolSnapshot;
+  if (snapshot && now() - snapshot.loadedAt < PEXELS_POOL_SNAPSHOT_TTL_MS) return snapshot.value;
+  const value = await loadActivePoolKeys();
+  pexelsPoolSnapshot = { loadedAt: now(), value };
+  return value;
 }
 
 async function loadActivePoolKeys(): Promise<{ configured: boolean; keys: PoolKey[] }> {
@@ -239,7 +276,7 @@ export function createPexelsStagePool(
 }
 
 async function loadPexelsStagePool(): Promise<PexelsStagePool> {
-  const loaded = await loadActivePoolKeys();
+  const loaded = await loadActivePoolKeysCached();
   if (loaded.configured) return createPexelsStagePool(loaded.keys, true);
   const envKeys = parsePexelsKeys().map((api_key, index) => ({
     id: `env-${index}`,
@@ -279,6 +316,7 @@ async function markKeyDead(id: string, message: string) {
       last_error_at: new Date().toISOString(),
     })
     .eq("id", id);
+  invalidatePexelsPoolSnapshot();
 }
 
 async function markKeyRateLimited(id: string, res: Response) {
@@ -293,6 +331,7 @@ async function markKeyRateLimited(id: string, res: Response) {
       last_error_at: new Date().toISOString(),
     })
     .eq("id", id);
+  invalidatePexelsPoolSnapshot();
   console.info("[pexels-pool] rotated rate-limited key", { keyId: id, resetAt });
 }
 
@@ -440,17 +479,28 @@ export function reserveProviderClipId(usedIds: Set<string>, providerClipId: stri
   return true;
 }
 
+/**
+ * Creates a per-stage search session (in-memory cache, in-flight dedupe, key
+ * pool, pending cache writes).
+ *
+ * Round 6: this used to eagerly prefetch stock_search_cache rows for EVERY
+ * scene query in the project — 145 rows of multi-hundred-KB JSON on every one of
+ * ~56 matching invocations, of which one invocation used two or three. It was
+ * also largely wasted work: matchStockCorpus prefetches the *clustered bucket*
+ * queries it is about to search (see stock-corpus.server.ts), which are not the
+ * raw per-scene queries prefetched here, so most rows were fetched and never
+ * read. Prefetching is now left entirely to matchStockCorpus, where it is scoped
+ * to the slice actually being processed. Session setup is O(1).
+ */
 export async function createStockSearchSession(
-  queries: string[],
-  orientation: Orientation,
-  niche?: string | null,
   profile?: MatchingProfile,
 ): Promise<StockSearchSession> {
   const pexelsPool = await loadPexelsStagePool();
-  const session: StockSearchSession = {
+  return {
     cache: new Map(),
     inflight: new Map(),
     pendingCache: new Map(),
+    prefetched: new Set(),
     usage: new Map(),
     pexelsPool,
     profile,
@@ -464,18 +514,6 @@ export async function createStockSearchSession(
       assetCacheMisses: 0,
     },
   };
-  const normalized = [...new Set(queries.map(normalizeStockQuery).filter(Boolean))];
-  const nasaQueries = niche === "space" ? [...new Set(normalized.flatMap(expandNasaQueries))] : [];
-  const pexelsQueries = niche === "space" ? normalized.map(spaceBiasedPexelsQuery) : normalized;
-  await Promise.all([
-    prefetchCacheRows(session, "pexels", orientation, pexelsQueries),
-    prefetchCacheRows(session, "nasa", "any", nasaQueries),
-  ]).catch((error) => {
-    console.warn("[stock] cache prefetch unavailable; continuing with provider search", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  });
-  return session;
 }
 
 export async function flushStockSearchSession(session: StockSearchSession): Promise<void> {
@@ -757,10 +795,17 @@ async function prefetchCacheRows(
   orientation: string,
   queries: string[],
 ) {
-  if (queries.length === 0) return;
+  // Skip anything this session already looked up — a hit is already in
+  // session.cache, and a miss would just re-read nothing. Slices cluster into
+  // overlapping buckets, so the overlap between consecutive slices is real.
+  const pending = queries.filter(
+    (query) => !session.prefetched?.has(cacheKey(provider, query, orientation)),
+  );
+  if (pending.length === 0) return;
   const profile = session.profile;
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  for (let start = 0; start < queries.length; start += 75) {
+  for (let start = 0; start < pending.length; start += 75) {
+    const batch = pending.slice(start, start + 75);
     profile?.count("cacheReadQueries");
     const startedAt = Date.now();
     const { data, error } = await supabaseAdmin
@@ -768,9 +813,11 @@ async function prefetchCacheRows(
       .select("provider, query, orientation, results, cached_at")
       .eq("provider", provider)
       .eq("orientation", orientation)
-      .in("query", queries.slice(start, start + 75));
+      .in("query", batch);
     profile?.add("cacheRead", Date.now() - startedAt);
     if (error) throw new Error(`Stock cache prefetch failed: ${error.message}`);
+    // Only after a successful read: a failed batch must stay re-readable.
+    for (const query of batch) session.prefetched?.add(cacheKey(provider, query, orientation));
     for (const row of data ?? []) {
       session.cache.set(cacheKey(row.provider, row.query, row.orientation), {
         results: row.results as unknown as StockVideo[],
