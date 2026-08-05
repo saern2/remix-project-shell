@@ -311,6 +311,7 @@ export type Database = {
           duration_known: boolean
           duration_seconds: number | null
           files: Json
+          has_captions: boolean | null
           nasa_id: string
           thumbnail_url: string | null
         }
@@ -319,6 +320,7 @@ export type Database = {
           duration_known?: boolean
           duration_seconds?: number | null
           files?: Json
+          has_captions?: boolean | null
           nasa_id: string
           thumbnail_url?: string | null
         }
@@ -327,6 +329,7 @@ export type Database = {
           duration_known?: boolean
           duration_seconds?: number | null
           files?: Json
+          has_captions?: boolean | null
           nasa_id?: string
           thumbnail_url?: string | null
         }
@@ -382,6 +385,7 @@ export type Database = {
           created_at: string
           error_message: string | null
           id: string
+          matching_lock_at: string | null
           name: string
           niche: string
           pipeline_cancel_requested_at: string | null
@@ -397,6 +401,7 @@ export type Database = {
           created_at?: string
           error_message?: string | null
           id?: string
+          matching_lock_at?: string | null
           name?: string
           niche?: string
           pipeline_cancel_requested_at?: string | null
@@ -412,6 +417,7 @@ export type Database = {
           created_at?: string
           error_message?: string | null
           id?: string
+          matching_lock_at?: string | null
           name?: string
           niche?: string
           pipeline_cancel_requested_at?: string | null

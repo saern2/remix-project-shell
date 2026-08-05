@@ -105,6 +105,132 @@ async function pollCancellationUntilDone(redis, jobId, abortControllers, done) {
 }
 
 /**
+ * Will BullMQ hand this job another attempt after the current one fails?
+ *
+ * Decides whether a failed chunk's downloads are worth keeping. Retries land on
+ * the same jobId and therefore the same tempDir, so keeping them turns a retry
+ * from a full re-download into a verify-and-reuse. On the LAST attempt nothing
+ * will ever read them again, and leaving them behind was the original
+ * disk-growth bug — so they go.
+ *
+ * Conservative on purpose: if the attempt counters cannot be read, assume no
+ * retry and clean up. Wasting bandwidth on one re-download beats leaking disk.
+ */
+function willRetry(job) {
+  const maxAttempts = Number(job?.opts?.attempts ?? config.jobAttempts);
+  const made = Number(job?.attemptsMade ?? job?.attemptsStarted);
+  if (!Number.isFinite(maxAttempts) || !Number.isFinite(made)) return false;
+  return made < maxAttempts - 1;
+}
+
+/**
+ * Reads a media file's real duration. Returns null if it cannot be probed —
+ * callers treat that as "unknown" and leave the clip alone rather than guessing.
+ */
+function probeSourceDuration(filePath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return resolve(null);
+      const duration = Number(data?.format?.duration);
+      resolve(Number.isFinite(duration) && duration > 0 ? duration : null);
+    });
+  });
+}
+
+// A source must leave at least this much material after the in-point for the
+// decoder to produce a frame at all.
+const MIN_USABLE_SOURCE_SECONDS = 0.05;
+
+/**
+ * Reconciles requested in-points against what the downloaded files actually
+ * contain, and reports every scene whose footage falls short.
+ *
+ * Two distinct failures are handled here:
+ *
+ *  1. In-point at or past the end of the source. The decoder yields ZERO frames,
+ *     tpad has no last frame to clone, and concat receives an empty stream —
+ *     the render fails, or worse, silently loses a scene. In-points are derived
+ *     from provider-reported durations (buildNasaSourceWindows) or from
+ *     render_clip_slices rows that may predate a source being replaced, so a
+ *     stale or wrong duration lands here. The in-point is pulled back to the
+ *     latest position that still yields the requested footage.
+ *
+ *  2. Source shorter than the slot. This renders as a freeze frame via tpad.
+ *     That is a deliberate fallback, not a bug — but it must never be silent,
+ *     so it is logged with the scene, the source, and both durations.
+ *
+ * The REQUESTED DURATION IS NEVER CHANGED. It is the timeline contract: shorten
+ * a clip here and every downstream slot shifts.
+ */
+async function reconcileClipSources(jobId, clips, clipPaths) {
+  const durations = new Array(clips.length).fill(null);
+  // downloader's asyncPool takes (limit, items, worker) — not the clip-slices order.
+  await asyncPool(
+    4,
+    clips.map((_, index) => index),
+    async (index) => {
+      const localPath = clipPaths.get(index);
+      if (localPath) durations[index] = await probeSourceDuration(localPath);
+    },
+  );
+
+  let clampedInPoints = 0;
+  let freezeFrames = 0;
+
+  const reconciled = clips.map((clip, index) => {
+    const requestedDuration = clip.end - clip.start;
+    const sourceDuration = durations[index];
+    if (sourceDuration == null) return clip;
+
+    let start = clip.start;
+    if (start >= sourceDuration - MIN_USABLE_SOURCE_SECONDS) {
+      start = Math.max(0, sourceDuration - requestedDuration);
+      clampedInPoints += 1;
+      logger.warn(
+        {
+          jobId,
+          clipIndex: index,
+          sceneId: clip.scene_id ?? null,
+          providerClipId: clip.provider_clip_id ?? null,
+          requestedInPointSec: Number(clip.start.toFixed(3)),
+          clampedInPointSec: Number(start.toFixed(3)),
+          sourceDurationSec: Number(sourceDuration.toFixed(3)),
+        },
+        'In-point past end of source; clamped to keep the clip decodable',
+      );
+    }
+
+    const availableDuration = Math.max(0, sourceDuration - start);
+    if (availableDuration + 1e-3 < requestedDuration) {
+      freezeFrames += 1;
+      logger.warn(
+        {
+          jobId,
+          clipIndex: index,
+          sceneId: clip.scene_id ?? null,
+          providerClipId: clip.provider_clip_id ?? null,
+          requestedDurationSec: Number(requestedDuration.toFixed(3)),
+          sourceDurationSec: Number(sourceDuration.toFixed(3)),
+          availableAfterInPointSec: Number(availableDuration.toFixed(3)),
+          freezeFrameSec: Number((requestedDuration - availableDuration).toFixed(3)),
+        },
+        'Source shorter than its slot; the shortfall renders as a freeze frame',
+      );
+    }
+
+    return { ...clip, start, end: start + requestedDuration };
+  });
+
+  if (clampedInPoints > 0 || freezeFrames > 0) {
+    logger.warn(
+      { jobId, clips: clips.length, clampedInPoints, freezeFrames },
+      'Clip source reconciliation adjusted this job',
+    );
+  }
+  return reconciled;
+}
+
+/**
  * Validates the job payload at enqueue time.
  * Returns a string error message or null if valid.
  */
@@ -369,6 +495,11 @@ async function processStitchJob(job) {
           '-c:a', 'aac',    // transcode audio to AAC (matches runFfmpeg's output codec)
           '-b:a', '192k',   // same bitrate as the non-chunked render path
           '-shortest',
+          // Moves moov ahead of mdat so the delivered file starts playing before
+          // it has fully downloaded. runFfmpeg has always set this, but CHUNK_SIZE=12
+          // means every real project goes down the chunked path, so until now no
+          // delivered output had it.
+          '-movflags', '+faststart',
         ])
         .output(outputPath);
 
@@ -486,8 +617,10 @@ async function processRenderJob(job) {
   const validationError = validatePayload(payload);
   if (validationError) throw new Error(`VALIDATION: ${validationError}`);
 
+  // `clips` is rebound after download by reconcileClipSources, which corrects
+  // in-points against the files that actually arrived.
+  let { clips } = payload;
   const {
-    clips,
     audio_url,
     width,
     height,
@@ -550,6 +683,11 @@ async function processRenderJob(job) {
     await job.updateData({ ...payload, _status: 'downloading' });
     await job.updateProgress(5);
 
+    // Phase split. Whether a chunk is download-bound or encode-bound decides
+    // whether raising WORKER_CONCURRENCY_CHUNKS would help or merely re-queue the
+    // same bytes through the same GLOBAL_CDN_CONCURRENCY permits — so measure it
+    // rather than guess.
+    const downloadStartedAt = Date.now();
     const { clipPaths, audioPath } = await downloadAll({
       clips,
       fallbackIndices,
@@ -557,8 +695,16 @@ async function processRenderJob(job) {
       tempDir,
       signal: dlController.signal,
     });
+    const downloadMs = Date.now() - downloadStartedAt;
 
     await job.updateProgress(30);
+
+    // Reconcile requested in-points against what actually landed on disk, and
+    // report every scene that will freeze-frame. Requested durations are never
+    // changed — they are the timeline contract.
+    const reconcileStartedAt = Date.now();
+    clips = await reconcileClipSources(jobId, clips, clipPaths);
+    const reconcileMs = Date.now() - reconcileStartedAt;
 
     // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Status: rendering ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
     await job.updateData({ ...payload, _status: 'rendering' });
@@ -572,6 +718,8 @@ async function processRenderJob(job) {
       transition,
       transitionDuration: transition_duration,
       tempDir,
+      // Keeps frame-count arithmetic continuous across chunk boundaries.
+      timelineOffsetSeconds: Number(payload.timeline_offset_seconds) || 0,
     });
 
 
@@ -588,6 +736,7 @@ async function processRenderJob(job) {
     });
 
     // Run the main FFmpeg encode
+    const encodeStartedAt = Date.now();
     await runFfmpeg({
       jobId,
       clipInputs,
@@ -598,6 +747,24 @@ async function processRenderJob(job) {
       fps,
       signal: ffController.signal,
     });
+    const encodeMs = Date.now() - encodeStartedAt;
+
+    logger.info(
+      {
+        jobId,
+        isChunk: !!payload.is_chunk,
+        chunkIndex: payload.chunk_index ?? null,
+        clips: clips.length,
+        downloadMs,
+        reconcileMs,
+        encodeMs,
+        downloadSharePct: Math.round((downloadMs / Math.max(1, downloadMs + encodeMs)) * 100),
+        cdnConcurrency: config.globalCdnConcurrency,
+        chunkConcurrency: config.workerConcurrencyChunks,
+        ffmpegThreads: config.ffmpegThreads,
+      },
+      'Render phase split',
+    );
 
     if (payload.is_chunk) await markChunkReady(outputPath);
 
@@ -671,21 +838,41 @@ async function processRenderJob(job) {
         await fsp.rm(tempDir, { recursive: true, force: true });
         logger.debug({ jobId, tempDir }, 'Temp directory cleaned up');
       } else {
-        // Chunk: always clean up downloaded source clips and intermediate files
-        // to reclaim disk space. Keep output.mp4 only if the job succeeded
-        // (i.e. the tempDir still exists and output.mp4 is present).
-        const entries = await fsp.readdir(tempDir).catch(() => []);
-        for (const entry of entries) {
-          if (entry === 'output.mp4') continue; // stitch job needs this
-          await fsp.rm(path.join(tempDir, entry), { recursive: true, force: true }).catch(() => {});
-        }
-        // If the job failed, output.mp4 won't exist ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â delete the whole dir
-        const outputExists = await fsp.access(path.join(tempDir, 'output.mp4')).then(() => true).catch(() => false);
-        if (!outputExists) {
-          await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
-          logger.debug({ jobId, tempDir }, 'Chunk temp directory cleaned up after failure');
-        } else {
+        const outputExists = await fsp
+          .access(path.join(tempDir, 'output.mp4'))
+          .then(() => true)
+          .catch(() => false);
+
+        if (outputExists) {
+          // Success: keep output.mp4 for the stitch, drop everything else
+          // (source clips, filtergraph script) to reclaim disk immediately.
+          const entries = await fsp.readdir(tempDir).catch(() => []);
+          for (const entry of entries) {
+            if (entry === 'output.mp4') continue; // stitch job needs this
+            await fsp.rm(path.join(tempDir, entry), { recursive: true, force: true }).catch(() => {});
+          }
           logger.debug({ jobId, tempDir }, 'Chunk temp directory partially cleaned (output.mp4 kept for stitch)');
+        } else if (willRetry(job)) {
+          // Failure with an attempt still to come. Keeping the downloaded
+          // sources is the whole point: BullMQ retries the same jobId into this
+          // same tempDir, and re-fetching hundreds of MB already on disk was the
+          // largest single source of wasted bandwidth per render (round 6,
+          // Issue 4). Every kept file carries a `.ok` marker, so the retry
+          // re-verifies size and decodability before trusting any of it.
+          const entries = await fsp.readdir(tempDir).catch(() => []);
+          for (const entry of entries) {
+            if (entry.startsWith('clip_') || entry.startsWith('audio')) continue;
+            await fsp.rm(path.join(tempDir, entry), { recursive: true, force: true }).catch(() => {});
+          }
+          logger.info(
+            { jobId, tempDir, attemptsMade: job.attemptsMade ?? null },
+            'Chunk failed with a retry pending; downloaded sources kept for reuse',
+          );
+        } else {
+          // Terminal failure: nothing will ever consume these files, and leaving
+          // them behind was the original disk-growth bug. Delete the lot.
+          await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+          logger.debug({ jobId, tempDir }, 'Chunk temp directory cleaned up after final failure');
         }
       }
     } catch (cleanupErr) {

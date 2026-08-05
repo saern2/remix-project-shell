@@ -53,6 +53,8 @@ type CachedNasaAsset = {
   duration_seconds: number | null;
   duration_known: boolean;
   thumbnail_url: string | null;
+  /** null = never probed; see the caption-probe comment in resolveNasaAssets. */
+  has_captions: boolean | null;
   cached_at: string;
 };
 
@@ -109,7 +111,9 @@ export async function searchNasaFootage(
     .filter((id): id is string => !!id);
   const { data: cachedRows, error: cacheError } = await supabaseAdmin
     .from("nasa_asset_cache")
-    .select("nasa_id, files, duration_seconds, duration_known, thumbnail_url, cached_at")
+    .select(
+      "nasa_id, files, duration_seconds, duration_known, thumbnail_url, has_captions, cached_at",
+    )
     .in("nasa_id", nasaIds);
   if (cacheError) {
     console.warn("[nasa-stock] asset cache read failed", { error: cacheError.message });
@@ -123,8 +127,13 @@ export async function searchNasaFootage(
     duration_seconds: number | null;
     duration_known: boolean;
     thumbnail_url: string | null;
+    has_captions: boolean | null;
     cached_at: string;
   }> = [];
+  // Caption results for rows that were cached before has_captions existed, or
+  // that have not been probed yet. Written back separately so a caption probe
+  // never forces a re-fetch of files/metadata.
+  const captionWrites: Array<{ nasa_id: string; has_captions: boolean }> = [];
 
   await asyncPool(
     rankedItems.map((item, index) => ({ item, index })),
@@ -135,11 +144,23 @@ export async function searchNasaFootage(
       if (!nasaId) return;
       const thumbnail = selectThumbnailUrl(item.links);
       const cached = cache.get(nasaId);
-      const hasCaptions = await fetchNasaCaptionSignal(nasaId, opts.metrics);
+
+      // The caption probe used to run HERE, unconditionally, before the cache
+      // was consulted — one HTTPS round trip per ranked item on every search,
+      // even when everything else came from cache, and all of it inside the
+      // matching_footage time budget. Captions never change for a given asset,
+      // so the answer is cached alongside the rest and probed only on a miss.
       if (cached && Date.now() - new Date(cached.cached_at).getTime() < NASA_ASSET_CACHE_TTL_MS) {
         const files = parseCachedFiles(cached.files);
         if (files.length > 0) {
           incrementMetric(opts.metrics, "assetCacheHits");
+          // null means this row predates the has_captions column: probe once,
+          // persist, and it settles for every later search.
+          let hasCaptions = cached.has_captions;
+          if (hasCaptions == null) {
+            hasCaptions = await fetchNasaCaptionSignal(nasaId, opts.metrics);
+            captionWrites.push({ nasa_id: nasaId, has_captions: hasCaptions });
+          }
           resolved[index] = toStockVideo({
             nasaId,
             files,
@@ -154,6 +175,7 @@ export async function searchNasaFootage(
         }
       }
       incrementMetric(opts.metrics, "assetCacheMisses");
+      const hasCaptions = await fetchNasaCaptionSignal(nasaId, opts.metrics);
 
       try {
         const [files, metadata] = await Promise.all([
@@ -184,6 +206,7 @@ export async function searchNasaFootage(
           duration_seconds: duration,
           duration_known: duration !== null,
           thumbnail_url: thumbnail,
+          has_captions: hasCaptions,
           cached_at: new Date().toISOString(),
         });
       } catch (error) {
@@ -200,6 +223,20 @@ export async function searchNasaFootage(
       .from("nasa_asset_cache")
       .upsert(cacheWrites, { onConflict: "nasa_id" });
     if (error) console.warn("[nasa-stock] asset cache write failed", { error: error.message });
+  }
+
+  // Backfill only. Fire-and-forget: a failed backfill just means one more probe
+  // on the next search, which is strictly better than failing the match.
+  if (captionWrites.length > 0) {
+    await Promise.all(
+      captionWrites.map(({ nasa_id, has_captions }) =>
+        supabaseAdmin.from("nasa_asset_cache").update({ has_captions }).eq("nasa_id", nasa_id),
+      ),
+    ).catch((error) => {
+      console.warn("[nasa-stock] caption backfill failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
   }
 
   const candidates = resolved.filter((video): video is StockVideo => video !== null);

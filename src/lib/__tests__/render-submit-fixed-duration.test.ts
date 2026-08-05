@@ -218,10 +218,22 @@ describe("submitRenderJob fixed-duration fallback", () => {
     ];
     const workerBody = JSON.parse(String(init.body));
     expect(workerBody.transition).toBe("hard-cut");
+    // scene_id / provider_clip_id ride along so the worker can name the scene and
+    // source in its freeze-frame and in-point warnings; the timing contract that
+    // matters is still clip_url/start/end.
     expect(workerBody.clips).toEqual([
-      { clip_url: "https://videos.example.com/a.mp4", start: 0, end: 4 },
-      { clip_url: "https://videos.example.com/b.mp4", start: 0, end: 4 },
+      expect.objectContaining({
+        clip_url: "https://videos.example.com/a.mp4",
+        start: 0,
+        end: 4,
+      }),
+      expect.objectContaining({
+        clip_url: "https://videos.example.com/b.mp4",
+        start: 0,
+        end: 4,
+      }),
     ]);
+    expect(workerBody.clips.every((clip: { scene_id?: string }) => !!clip.scene_id)).toBe(true);
     expect(rows).toEqual([
       expect.objectContaining({
         duration_seconds: 4,

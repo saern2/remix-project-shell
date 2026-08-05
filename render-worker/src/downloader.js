@@ -22,6 +22,7 @@ const http = require('http');
 const https = require('https');
 const { pipeline } = require('stream/promises');
 const { URL } = require('url');
+const ffmpeg = require('fluent-ffmpeg');
 
 const config = require('./config');
 const logger = require('./logger');
@@ -426,6 +427,49 @@ async function preFlightCheckUrl(url, { signal } = {}) {
  * @param {AbortSignal} [params.signal]
  * @returns {Promise<{clipPaths: Map<number, string>, audioPath: string|null}>}
  */
+// ── Completed-download markers (round 6, Issue 4) ───────────────────────────
+// Same shape as resourceControl.js's `.ready` marker for finished chunk output:
+// the payload file alone proves nothing (a half-written file also exists), so a
+// sibling marker records that the transfer ran to completion, and what it
+// produced. Reuse requires the marker, a matching size, and a successful probe.
+const markerPathFor = (destPath) => `${destPath}.ok`;
+
+async function markDownloadComplete(destPath, url, bytes) {
+  const marker = JSON.stringify({ url, bytes, completedAt: new Date().toISOString() });
+  await fsp.writeFile(markerPathFor(destPath), marker, 'utf8').catch(() => {});
+}
+
+/**
+ * Probes a media file. Resolves false when it cannot be decoded, which is the
+ * signal that a leftover file from an interrupted attempt must be re-fetched
+ * rather than reused.
+ */
+function decodesSuccessfully(filePath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return resolve(false);
+      const hasVideo = (data?.streams ?? []).some((s) => s.codec_type === 'video');
+      const duration = Number(data?.format?.duration);
+      resolve(hasVideo && Number.isFinite(duration) && duration > 0);
+    });
+  });
+}
+
+async function isCompleteDownload(destPath, url) {
+  try {
+    const [raw, stat] = await Promise.all([
+      fsp.readFile(markerPathFor(destPath), 'utf8'),
+      fsp.stat(destPath),
+    ]);
+    const marker = JSON.parse(raw);
+    if (marker.url !== url) return false;
+    if (!stat.isFile() || stat.size === 0 || stat.size !== marker.bytes) return false;
+    return await decodesSuccessfully(destPath);
+  } catch {
+    return false;
+  }
+}
+
 async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, signal }) {
   let totalBytes = 0;
   const clipPaths = new Map();
@@ -491,13 +535,30 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
       primaryIndices.push(i);
     }
 
+    let reusedDownloads = 0;
     for (const i of primaryIndices) {
       tasks.push(async () => {
         const { clip_url } = clips[i];
         let ext = '.mp4';
         try { ext = path.extname(new URL(clip_url).pathname) || '.mp4'; } catch {}
         const destPath = path.join(tempDir, `clip_${i}${ext}`);
-        await downloadTask(clip_url, destPath, config.maxClipBytes);
+
+        // ── Retry reuse (round 6, Issue 4) ────────────────────────────────────
+        // A chunk that fails keeps its downloads, and BullMQ retries the same
+        // jobId into the same tempDir. Re-fetching ~420 MB that is already on
+        // disk was the single largest source of wasted bandwidth per render.
+        // A file is only reused if its completion marker matches its size AND
+        // it still decodes — a truncated or corrupt file must not be trusted
+        // just because it exists.
+        if (await isCompleteDownload(destPath, clip_url)) {
+          reusedDownloads += 1;
+          logger.info({ url: clip_url, destPath }, 'Reusing clip already downloaded by a prior attempt');
+        } else {
+          await fsp.rm(markerPathFor(destPath), { force: true }).catch(() => {});
+          const bytes = await downloadTask(clip_url, destPath, config.maxClipBytes);
+          await markDownloadComplete(destPath, clip_url, bytes);
+        }
+
         // Point every index that shares this URL at the single downloaded file.
         for (const j of fallbackIndices) {
           if (clips[j].clip_url === clip_url) clipPaths.set(j, destPath);
@@ -516,6 +577,7 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
         fallbackCount: fallbackIndices.length,
         uniqueDownloads: primaryIndices.length,
         dedupedDownloads,
+        reusedDownloads,
       },
       'Required assets downloaded',
     );

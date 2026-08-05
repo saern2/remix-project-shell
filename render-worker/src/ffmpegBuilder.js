@@ -34,7 +34,58 @@ const path = require('path');
 
 const SUPPORTED_TRANSITIONS = new Set(['hard-cut', 'crossfade']);
 
-function buildNormFilter(inputIndex, outLabel, width, height, fps, duration) {
+/**
+ * Per-clip frame counts on a CUMULATIVE timeline.
+ *
+ * The bug this replaces: each clip was trimmed independently with
+ * `trim=duration=D`, and the `fps` filter resolves a D-second input to
+ * round(D x fps) frames. The sub-frame remainder in [-0.5, +0.5) frames was
+ * therefore discarded per clip instead of being carried into the next one, so
+ * the total length of a render was a random walk around the audio duration
+ * rather than a fixed function of it (measured: -1.11 frames over 240 clips,
+ * but unbounded in principle and random in SIGN — when it lands negative,
+ * `-shortest` silently truncates the tail of the narration).
+ *
+ * Instead of asking each clip for a duration, ask the shared timeline where
+ * this clip's boundary falls. Clip i gets
+ *     round(cumulativeEnd_i x fps) - round(cumulativeEnd_(i-1) x fps)
+ * frames, so consecutive counts telescope: the frames emitted for the whole
+ * job are exactly round(totalDuration x fps), independent of how the total is
+ * split into clips or chunks.
+ *
+ * `timelineOffsetSeconds` is what makes that hold ACROSS chunks. Each chunk is
+ * rendered by a separate process with its own graph, so without the offset each
+ * chunk would restart the timeline at zero and re-introduce up to half a frame
+ * of error per chunk boundary.
+ *
+ * @param {Array<{start:number,end:number}>} clips
+ * @param {number} fps
+ * @param {number} timelineOffsetSeconds - seconds of finished timeline preceding this chunk
+ * @returns {number[]} frame count per clip
+ */
+function computeClipFrameCounts(clips, fps, timelineOffsetSeconds = 0) {
+  const offset = Number.isFinite(timelineOffsetSeconds) ? Math.max(0, timelineOffsetSeconds) : 0;
+  let cumulativeSeconds = offset;
+  let emittedFrames = Math.round(offset * fps);
+
+  return clips.map((clip) => {
+    cumulativeSeconds += clip.end - clip.start;
+    const boundaryFrame = Math.round(cumulativeSeconds * fps);
+    // A clip shorter than half a frame would round to zero frames, which would
+    // hand concat an empty stream. Force one frame and let the running total
+    // absorb it — the next clip's count comes out one lower, so the timeline
+    // self-corrects instead of drifting.
+    const frameCount = Math.max(1, boundaryFrame - emittedFrames);
+    emittedFrames += frameCount;
+    return frameCount;
+  });
+}
+
+function buildNormFilter(inputIndex, outLabel, width, height, fps, frameCount) {
+  // tpad pads past the end of short sources so `trim` always has frameCount
+  // frames to take; the extra second is cloned frames that trim drops
+  // immediately, so it costs nothing to encode.
+  const padSeconds = Number((frameCount / fps + 1).toFixed(6));
   // Note: stream specifier [N:v] selects the video stream of the Nth input.
   return (
     `[${inputIndex}:v]setpts=PTS-STARTPTS,` +
@@ -42,8 +93,10 @@ function buildNormFilter(inputIndex, outLabel, width, height, fps, duration) {
     `crop=${width}:${height},` +
     `setsar=1,` +
     `fps=${fps},` +
-    `tpad=stop_mode=clone:stop_duration=${duration},` +
-    `trim=duration=${duration},` +
+    `tpad=stop_mode=clone:stop_duration=${padSeconds},` +
+    // end_frame, not duration: an exact frame count is the whole point. With
+    // `duration` the count would be re-derived from a timestamp and re-rounded.
+    `trim=end_frame=${frameCount},` +
     `setpts=PTS-STARTPTS` +
     `${outLabel}`
   );
@@ -76,7 +129,16 @@ function buildXfadeFilter(inA, inB, outLabel, duration, offset) {
  * @param {string} params.tempDir           - existing temp dir to write script file into
  * @returns {{ scriptPath: string, finalVideoLabel: string }}
  */
-function buildFilterGraph({ clips, width, height, fps, transition, transitionDuration, tempDir }) {
+function buildFilterGraph({
+  clips,
+  width,
+  height,
+  fps,
+  transition,
+  transitionDuration,
+  tempDir,
+  timelineOffsetSeconds = 0,
+}) {
   if (!SUPPORTED_TRANSITIONS.has(transition)) {
     throw new Error(
       `Unsupported transition: "${transition}". Supported: ${[...SUPPORTED_TRANSITIONS].join(', ')}`
@@ -89,10 +151,12 @@ function buildFilterGraph({ clips, width, height, fps, transition, transitionDur
   const w = width % 2 === 0 ? width : width - 1;
   const h = height % 2 === 0 ? height : height - 1;
 
+  // Frame counts come from the shared timeline, not from each clip in isolation.
+  const frameCounts = computeClipFrameCounts(clips, fps, timelineOffsetSeconds);
+
   // ── Step 1: Normalise every input clip ──────────────────────────────────
   for (let i = 0; i < n; i++) {
-    const duration = clips[i].end - clips[i].start;
-    lines.push(buildNormFilter(i, `[v${i}]`, w, h, fps, duration));
+    lines.push(buildNormFilter(i, `[v${i}]`, w, h, fps, frameCounts[i]));
   }
 
   let finalLabel;
@@ -107,8 +171,9 @@ function buildFilterGraph({ clips, width, height, fps, transition, transitionDur
     lines.push(`${inputLabels}concat=n=${n}:v=1:a=0${finalLabel}`);
   } else {
     // ── Step 2b: Crossfade chain via xfade ───────────────────────────────
-    // Compute per-clip durations (end - start)
-    const durations = clips.map((c) => c.end - c.start);
+    // Durations come from the frame counts actually emitted, so the xfade
+    // offsets line up with real stream lengths rather than requested ones.
+    const durations = frameCounts.map((frames) => frames / fps);
     const td = transitionDuration;
 
     // xfade offset for each transition = Σ(durations[0..i]) - (i+1)*td
@@ -133,4 +198,4 @@ function buildFilterGraph({ clips, width, height, fps, transition, transitionDur
   return { scriptPath, finalVideoLabel: finalLabel };
 }
 
-module.exports = { buildFilterGraph, SUPPORTED_TRANSITIONS };
+module.exports = { buildFilterGraph, computeClipFrameCounts, SUPPORTED_TRANSITIONS };

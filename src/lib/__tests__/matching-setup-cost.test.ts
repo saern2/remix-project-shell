@@ -86,9 +86,8 @@ describe("matching setup cost", () => {
   });
 
   it("reloads the pool after a key is invalidated", async () => {
-    const { createStockSearchSession, invalidatePexelsPoolSnapshot } = await import(
-      "../stock.server"
-    );
+    const { createStockSearchSession, invalidatePexelsPoolSnapshot } =
+      await import("../stock.server");
     await createStockSearchSession();
     invalidatePexelsPoolSnapshot(); // what markKeyDead / markKeyRateLimited do
     await createStockSearchSession();
@@ -96,7 +95,8 @@ describe("matching setup cost", () => {
   });
 
   it("reads each search-cache key at most once per session", async () => {
-    const { createStockSearchSession, prefetchStockProviderCache } = await import("../stock.server");
+    const { createStockSearchSession, prefetchStockProviderCache } =
+      await import("../stock.server");
     const session = await createStockSearchSession();
 
     // Consecutive slices cluster into overlapping query buckets.
@@ -108,7 +108,8 @@ describe("matching setup cost", () => {
   });
 
   it("keeps orientation and provider distinct when deduping prefetches", async () => {
-    const { createStockSearchSession, prefetchStockProviderCache } = await import("../stock.server");
+    const { createStockSearchSession, prefetchStockProviderCache } =
+      await import("../stock.server");
     const session = await createStockSearchSession();
 
     await prefetchStockProviderCache(session, "pexels", "landscape", ["ocean waves"]);

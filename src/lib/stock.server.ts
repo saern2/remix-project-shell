@@ -50,6 +50,21 @@ export function sourceDurationBudgetSeconds(minDurationSec: number): number {
   return Math.max(minDurationSec * SOURCE_DURATION_BUDGET_MULTIPLE, MIN_SOURCE_DURATION_BUDGET_SEC);
 }
 
+/**
+ * Lower bound on a source: does it actually contain as much footage as the
+ * scene needs? A source that fails this still *renders* — tpad clones the last
+ * frame to fill the slot — so the failure mode is a silent freeze frame rather
+ * than an error, which is why selection has to care.
+ *
+ * Unknown-duration NASA assets pass: their length is genuinely unknown rather
+ * than known-to-be-short, and buildNasaSourceWindows pins them to in-point 0 so
+ * the whole asset is available.
+ */
+export function meetsMinimumSourceDuration(video: StockVideo, minDurationSec: number): boolean {
+  if (video.duration_known === false) return true;
+  return video.duration_sec >= minDurationSec;
+}
+
 export function withinSourceDurationBudget(video: StockVideo, minDurationSec: number): boolean {
   // Unknown duration (e.g. some NASA assets) is not penalised — the NASA source
   // window logic already bounds how much of it is used.
@@ -866,8 +881,8 @@ export function selectStockCandidate(opts: {
       return video.provider === "nasa" || !used.has(video.provider_clip_id);
     });
   if (eligible.length === 0) return null;
-  const longEnough = eligible.filter(
-    ({ video }) => video.duration_sec >= opts.minDurationSec || video.duration_known === false,
+  const longEnough = eligible.filter(({ video }) =>
+    meetsMinimumSourceDuration(video, opts.minDurationSec),
   );
   if (opts.requireMinDuration && longEnough.length === 0) return null;
   const candidateMeta = longEnough.length > 0 ? longEnough : eligible;

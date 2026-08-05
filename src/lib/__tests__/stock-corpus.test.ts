@@ -22,6 +22,10 @@ vi.mock("../stock.server", () => ({
     v: { duration_sec: number; duration_known?: boolean },
     minDurationSec: number,
   ) => v.duration_known === false || v.duration_sec <= Math.max(minDurationSec * 6, 30),
+  meetsMinimumSourceDuration: (
+    v: { duration_sec: number; duration_known?: boolean },
+    minDurationSec: number,
+  ) => v.duration_known === false || v.duration_sec >= minDurationSec,
 }));
 
 import { clusterStockQueries, matchStockCorpus } from "../stock-corpus.server";

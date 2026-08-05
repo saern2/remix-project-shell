@@ -91,7 +91,16 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     const fixedDuration =
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
-    let clips: Array<{ clip_url: string; start: number; end: number }>;
+    // scene_id / provider_clip_id are diagnostic only: they let the worker name
+    // the scene and source in its freeze-frame and in-point-guard warnings
+    // instead of reporting a bare clip index.
+    let clips: Array<{
+      clip_url: string;
+      start: number;
+      end: number;
+      scene_id?: string;
+      provider_clip_id?: string | null;
+    }>;
     const renderTransition = "hard-cut" as const;
 
     if (fixedDuration == null || !(fixedDuration > 0)) {
@@ -107,6 +116,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           clip_url: scene.selected_clips.clip_candidates.url,
           start,
           end: start + slot.durationSeconds,
+          scene_id: slot.sceneId,
+          provider_clip_id: scene.selected_clips.clip_candidates.provider_clip_id ?? null,
         };
       });
     } else {
@@ -143,7 +154,13 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             );
           }
           const start = Number(cached.in_point_seconds);
-          return { clip_url: cached.clip_url, start, end: start + slot.durationSeconds };
+          return {
+            clip_url: cached.clip_url,
+            start,
+            end: start + slot.durationSeconds,
+            scene_id: slot.sceneId,
+            provider_clip_id: cached.provider_clip_id ?? null,
+          };
         });
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
 
@@ -359,7 +376,13 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             );
           }
           const start = Number(row.in_point_seconds);
-          return { clip_url: row.clip_url, start, end: start + slot.durationSeconds };
+          return {
+            clip_url: row.clip_url,
+            start,
+            end: start + slot.durationSeconds,
+            scene_id: slot.sceneId,
+            provider_clip_id: row.provider_clip_id ?? null,
+          };
         });
       }
     }

@@ -1,6 +1,7 @@
 import {
   buildNasaSourceWindows,
   expandNasaQueries,
+  meetsMinimumSourceDuration,
   prefetchStockProviderCache,
   searchProviderCandidatePool,
   stockQueryTokens,
@@ -354,13 +355,25 @@ function selectGlobalCandidate(opts: {
   });
 
   if (options.length === 0) return null;
+
+  // Lower bound. This path had only the UPPER bound below, so nothing stopped a
+  // source shorter than the scene from winning — it renders as a freeze frame
+  // (tpad clones the last frame to fill the slot), silently. Same semantics as
+  // selectStockCandidate: prefer sources that are long enough, fall back only
+  // when none is, because a freeze frame still beats an unmatched scene.
+  const longEnough = options.filter((option) =>
+    meetsMinimumSourceDuration(option.video, opts.demand.minDurationSec),
+  );
+  const durationEligible = longEnough.length > 0 ? longEnough : options;
+
   // Round 6, Issue 1: prefer sources within the scene's duration budget so a
   // multi-minute clip is not downloaded for a few seconds of footage. Fall back
-  // to the full option set only when nothing fits the budget.
-  const budgetedOptions = options.filter((option) =>
+  // to the full option set only when nothing fits the budget. Applied INSIDE the
+  // lower bound — the budget is an optimisation, the floor is correctness.
+  const budgetedOptions = durationEligible.filter((option) =>
     withinSourceDurationBudget(option.video, opts.demand.minDurationSec),
   );
-  const rankable = budgetedOptions.length > 0 ? budgetedOptions : options;
+  const rankable = budgetedOptions.length > 0 ? budgetedOptions : durationEligible;
   rankable.sort((a, b) => {
     if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
     const aRelevance = candidateRelevance(opts.demand.query, a.video);
@@ -375,6 +388,27 @@ function selectGlobalCandidate(opts: {
   });
 
   const selected = rankable[0];
+
+  // A silent freeze is worse than a logged one. If nothing was long enough, say
+  // so here, at selection time, with the numbers needed to judge it. The worker
+  // logs the same event again against the real downloaded file, which is the
+  // authoritative measurement — this one catches the cases the provider's own
+  // metadata already admits to.
+  if (longEnough.length === 0) {
+    console.warn("[stock-corpus] no source long enough — scene will freeze-frame", {
+      demandId: opts.demand.id,
+      query: opts.demand.query,
+      requiredDurationSec: Number(opts.demand.minDurationSec.toFixed(3)),
+      provider: selected.video.provider,
+      providerClipId: selected.video.provider_clip_id,
+      sourceDurationSec: Number(selected.video.duration_sec.toFixed(3)),
+      shortfallSec: Number(
+        Math.max(0, opts.demand.minDurationSec - selected.video.duration_sec).toFixed(3),
+      ),
+      candidatesConsidered: options.length,
+    });
+  }
+
   const files = [...selected.video.files].sort((a, b) => a.width - b.width);
   const chosenFile =
     files.find((file) => file.width >= opts.targetWidth) ?? files[files.length - 1];

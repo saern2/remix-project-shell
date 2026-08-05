@@ -75,9 +75,16 @@ app.post('/jobs', requireApiKey, async (req, res) => {
       const job = await queue.add('render', payload, { jobId });
       isNew = job.timestamp > Date.now() - 2000;
     } else {
+      // Each chunk carries the number of seconds of finished timeline that
+      // precede it. Chunks render in separate processes, so this is the only
+      // way the frame-count arithmetic in ffmpegBuilder can stay continuous
+      // across chunk boundaries instead of restarting at zero in each one.
       const chunks = [];
+      let timelineOffsetSeconds = 0;
       for (let i = 0; i < payload.clips.length; i += config.chunkSize) {
-        chunks.push(payload.clips.slice(i, i + config.chunkSize));
+        const clips = payload.clips.slice(i, i + config.chunkSize);
+        chunks.push({ clips, timelineOffsetSeconds });
+        timelineOffsetSeconds += clips.reduce((total, clip) => total + (clip.end - clip.start), 0);
       }
 
       const flowProducer = getFlowProducer();
@@ -109,16 +116,17 @@ app.post('/jobs', requireApiKey, async (req, res) => {
             queueName: QUEUE_CHUNK,
             data: {
               ...chunkPayloadBase,
-              clips: chunk,
+              clips: chunk.clips,
               chunk_index: index,
               chunks_total: chunks.length,
+              timeline_offset_seconds: chunk.timelineOffsetSeconds,
               is_chunk: true,
               _fairness_slot: slot,
             },
             opts: {
               jobId: `${jobId}-chunk-${index}`,
               priority: chunkPriority(index, slot, config.fairnessPriorityStride),
-              ...buildChunkOpts(chunk, config),
+              ...buildChunkOpts(chunk.clips, config),
             }
           };
         });

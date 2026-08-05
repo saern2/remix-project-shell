@@ -52,4 +52,27 @@ async function assertFileNonEmpty(filePath) {
   expect(stat.size).toBeGreaterThan(0);
 }
 
-module.exports = { probe, assertVideoProperties, assertFileNonEmpty };
+/**
+ * Counts decoded video frames. Decodes the file rather than trusting the
+ * container's nb_frames header, because the header is exactly what a
+ * frame-accuracy test must not take on faith.
+ *
+ * @param {string} filePath
+ * @returns {Promise<number>}
+ */
+async function countFrames(filePath) {
+  const { execFile } = require('child_process');
+  const { promisify: p } = require('util');
+  const run = p(execFile);
+  const { stdout } = await run('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-count_frames',
+    '-show_entries', 'stream=nb_read_frames',
+    '-of', 'csv=p=0',
+    filePath,
+  ]);
+  return Number(String(stdout).trim());
+}
+
+module.exports = { probe, assertVideoProperties, assertFileNonEmpty, countFrames };

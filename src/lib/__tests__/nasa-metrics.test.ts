@@ -4,7 +4,12 @@ import { searchNasaFootage } from "../nasaStock.server";
 import type { NasaRequestMetrics } from "../stock.server";
 
 const { state } = vi.hoisted(() => ({
-  state: { cached: false },
+  state: {
+    cached: false,
+    /** null models a row written before nasa_asset_cache.has_captions existed. */
+    hasCaptions: null as boolean | null,
+    captionBackfills: [] as Array<Record<string, unknown>>,
+  },
 }));
 
 vi.mock("@/integrations/supabase/client.server", () => ({
@@ -26,6 +31,7 @@ vi.mock("@/integrations/supabase/client.server", () => ({
                   duration_seconds: 20,
                   duration_known: true,
                   thumbnail_url: "https://example.test/thumb.jpg",
+                  has_captions: state.hasCaptions,
                   cached_at: new Date().toISOString(),
                 },
               ]
@@ -34,6 +40,12 @@ vi.mock("@/integrations/supabase/client.server", () => ({
         }),
       }),
       upsert: async () => ({ error: null }),
+      update: (values: Record<string, unknown>) => ({
+        eq: async () => {
+          state.captionBackfills.push(values);
+          return { error: null };
+        },
+      }),
     }),
   },
 }));
@@ -79,6 +91,8 @@ function nasaSearchResponse() {
 describe("NASA request metrics", () => {
   beforeEach(() => {
     state.cached = false;
+    state.hasCaptions = null;
+    state.captionBackfills = [];
     vi.restoreAllMocks();
   });
 
@@ -121,8 +135,12 @@ describe("NASA request metrics", () => {
     });
   });
 
-  it("reports an asset-cache hit while retaining the caption probe", async () => {
+  it("probes captions once for a legacy cached row, then backfills it", async () => {
+    // Rows cached before nasa_asset_cache.has_captions existed read back as
+    // null. They must probe exactly once and persist the answer, rather than
+    // re-probing on every future search.
     state.cached = true;
+    state.hasCaptions = null;
     const counts = metrics();
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
@@ -146,5 +164,30 @@ describe("NASA request metrics", () => {
       assetCacheHits: 1,
       assetCacheMisses: 0,
     });
+    expect(state.captionBackfills).toEqual([{ has_captions: false }]);
+  });
+
+  it("makes no caption request at all once the answer is cached", async () => {
+    // The waste this removes: the caption probe used to run before the cache was
+    // consulted, so a fully warm asset still cost one HTTPS round trip per ranked
+    // item — inside the matching_footage time budget.
+    state.cached = true;
+    state.hasCaptions = false;
+    const counts = metrics();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/search?")) return Response.json(nasaSearchResponse());
+      throw new Error(`Unexpected request on warm asset cache: ${url}`);
+    });
+
+    const results = await searchNasaFootage("rogue planet", {
+      targetWidth: 1280,
+      metrics: counts,
+    });
+
+    expect(results).toHaveLength(1);
+    expect(counts.captionCalls).toBe(0);
+    expect(counts.assetCacheHits).toBe(1);
+    expect(state.captionBackfills).toEqual([]);
   });
 });
