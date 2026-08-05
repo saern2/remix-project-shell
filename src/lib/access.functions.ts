@@ -164,12 +164,12 @@ export const listAccessAdministration = createServerFn({ method: "GET" })
   .handler(async ({ context }) => {
     await assertAdmin(context);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const [requests, secrets, events] = await Promise.all([
+    const [requests, secrets, events, devices, failures] = await Promise.all([
       supabaseAdmin.from("access_requests").select("*").order("created_at", { ascending: false }),
       supabaseAdmin
         .from("user_access_secrets")
         .select(
-          "id,user_id,secret_suffix,status,activation_count,max_activations,created_at,last_used_at,revoked_at,revocation_reason",
+          "id,user_id,secret_suffix,status,activation_count,max_activations,created_at,last_used_at,revoked_at,revocation_reason,failed_attempt_count,failed_window_started_at",
         )
         .order("created_at", { ascending: false }),
       supabaseAdmin
@@ -177,14 +177,30 @@ export const listAccessAdministration = createServerFn({ method: "GET" })
         .select("id,event_type,user_id,actor_user_id,metadata,created_at")
         .order("created_at", { ascending: false })
         .limit(100),
+      // Live trusted browsers. client_token_hash is deliberately NOT selected —
+      // it is the device credential, and an admin never needs to see it to
+      // revoke one.
+      supabaseAdmin
+        .from("access_activations")
+        .select("id,user_id,secret_id,created_at,last_seen_at,trusted_until")
+        .is("revoked_at", null)
+        .order("last_seen_at", { ascending: false }),
+      supabaseAdmin
+        .from("auth_login_failures")
+        .select("email_normalized,stage,created_at")
+        .gte("created_at", new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+        .order("created_at", { ascending: false })
+        .limit(500),
     ]);
-    for (const result of [requests, secrets, events]) {
+    for (const result of [requests, secrets, events, devices, failures]) {
       if (result.error) throw new Error(result.error.message);
     }
     return {
       requests: requests.data ?? [],
       secrets: secrets.data ?? [],
       events: events.data ?? [],
+      devices: devices.data ?? [],
+      failures: failures.data ?? [],
     };
   });
 
@@ -279,7 +295,9 @@ export const issueUserAccessSecret = createServerFn({ method: "POST" })
       .maybeSingle();
     if (user?.approval_status !== "approved")
       throw new Error("Approve the user before issuing access.");
-    if (user.role === "admin") throw new Error("Administrators do not require access secrets.");
+    // Administrators sign in with email + password, so they do not NEED a
+    // secret — but nothing should refuse them one either, and an admin who also
+    // uses the workspace as a normal user does.
     const { count } = await supabaseAdmin
       .from("user_access_secrets")
       .select("id", { count: "exact", head: true })
@@ -333,11 +351,25 @@ export const revokeUserAccessSecret = createServerFn({ method: "POST" })
       .select("id,user_id")
       .maybeSingle();
     if (error || !secret) throw new Error("The secret is already revoked or does not exist.");
+    // The migration installs a trigger that does this too. Kept here as well so
+    // revocation holds regardless of which layer runs first, and so the effect
+    // is visible at the call site rather than only in the schema.
     await supabaseAdmin
       .from("access_activations")
       .update({ revoked_at: new Date().toISOString() })
       .eq("secret_id", secret.id)
       .is("revoked_at", null);
+    await supabaseAdmin
+      .from("auth_login_codes")
+      .update({ invalidated_at: new Date().toISOString() })
+      .eq("user_id", secret.user_id)
+      .is("consumed_at", null)
+      .is("invalidated_at", null);
+    // Kills live sessions: without this a revoked user keeps working until
+    // their JWT expires, which is up to an hour of access after revocation.
+    await supabaseAdmin.auth.admin
+      .signOut(secret.user_id, "global")
+      .then(undefined, () => undefined);
     await supabaseAdmin.from("access_security_events").insert({
       event_type: "secret_revoked",
       user_id: secret.user_id,
@@ -361,4 +393,55 @@ export const resetUserAccessSecretActivations = createServerFn({ method: "POST" 
     if (error) throw new Error(error.message);
     if (!reset) throw new Error("This access secret is no longer usable.");
     return { ok: true as const };
+  });
+
+/**
+ * Revokes one trusted browser, or every one, for a user.
+ *
+ * Distinct from resetUserAccessSecretActivations, which resets the FIVE-slot
+ * counter as a recovery action. This is the targeted version: an admin who
+ * knows a specific laptop is gone should not have to make everyone else
+ * re-verify.
+ */
+export const revokeTrustedDevice = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        userId: z.string().uuid(),
+        // Omit to revoke every browser for this user.
+        activationId: z.string().uuid().optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const now = new Date().toISOString();
+
+    let query = supabaseAdmin
+      .from("access_activations")
+      .update({ revoked_at: now })
+      .eq("user_id", data.userId)
+      .is("revoked_at", null);
+    if (data.activationId) query = query.eq("id", data.activationId);
+
+    const { data: revoked, error } = await query.select("id");
+    if (error) throw new Error(error.message);
+
+    // A revoked browser must stop working now, not when its JWT happens to
+    // expire. Revoking every device signs the user out everywhere.
+    if (!data.activationId) {
+      await supabaseAdmin.auth.admin
+        .signOut(data.userId, "global")
+        .then(undefined, () => undefined);
+    }
+
+    await supabaseAdmin.from("access_security_events").insert({
+      event_type: "trusted_devices_revoked",
+      user_id: data.userId,
+      actor_user_id: context.userId,
+      metadata: { revoked: revoked?.length ?? 0, scope: data.activationId ? "one" : "all" },
+    });
+    return { ok: true as const, revoked: revoked?.length ?? 0 };
   });

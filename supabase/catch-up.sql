@@ -904,6 +904,77 @@ alter table public.render_jobs drop constraint if exists render_jobs_status_chec
 alter table public.render_jobs add constraint render_jobs_status_check
   check (status in ('queued', 'downloading', 'rendering', 'completed', 'failed', 'cancelled'));
 
+-- ── 20260807000001: passwordless sign-in ────────────────────────────────────
+
+alter table public.access_activations
+  add column if not exists trusted_until timestamptz;
+
+create index if not exists access_activations_trusted_idx
+  on public.access_activations (user_id, client_token_hash)
+  where revoked_at is null;
+
+create table if not exists public.auth_login_codes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  email_normalized text not null,
+  code_hash text check (code_hash is null or char_length(code_hash) = 64),
+  client_token_hash text not null check (char_length(client_token_hash) = 64),
+  attempts integer not null default 0 check (attempts >= 0),
+  max_attempts integer not null default 5 check (max_attempts > 0),
+  expires_at timestamptz not null,
+  consumed_at timestamptz,
+  invalidated_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists auth_login_codes_live_unique
+  on public.auth_login_codes (user_id, client_token_hash)
+  where consumed_at is null and invalidated_at is null;
+create index if not exists auth_login_codes_email_created_idx
+  on public.auth_login_codes (email_normalized, created_at desc);
+alter table public.auth_login_codes enable row level security;
+revoke all on public.auth_login_codes from public, anon, authenticated;
+grant all on public.auth_login_codes to service_role;
+
+create table if not exists public.auth_login_failures (
+  id bigint generated always as identity primary key,
+  email_normalized text,
+  ip_address text,
+  stage text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists auth_login_failures_email_idx
+  on public.auth_login_failures (email_normalized, created_at desc);
+create index if not exists auth_login_failures_ip_idx
+  on public.auth_login_failures (ip_address, created_at desc);
+alter table public.auth_login_failures enable row level security;
+revoke all on public.auth_login_failures from public, anon, authenticated;
+grant all on public.auth_login_failures to service_role;
+
+create or replace function public.revoke_activations_with_secret()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'revoked' and coalesce(old.status, '') <> 'revoked' then
+    update public.access_activations
+    set revoked_at = coalesce(revoked_at, now())
+    where secret_id = new.id and revoked_at is null;
+
+    update public.auth_login_codes
+    set invalidated_at = coalesce(invalidated_at, now())
+    where user_id = new.user_id and consumed_at is null and invalidated_at is null;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists revoke_activations_with_secret_trigger on public.user_access_secrets;
+create trigger revoke_activations_with_secret_trigger
+after update on public.user_access_secrets
+for each row execute function public.revoke_activations_with_secret();
+
+-- check_access_activation and activate_access_secret are redefined by
+-- 20260807000001 (trusted-device expiry and constant-time comparison). Their
+-- current bodies live in that migration; run it, or the file, to get them.
+
 -- ── Function privileges (20260720055930, 20260720074558, 20260724042257,
 --    20260727012002, 20260801053928, 20260801080041) ────────────────────────
 
@@ -920,6 +991,7 @@ revoke all on function public.check_access_activation(uuid, text) from public, a
 revoke all on function public.reset_access_secret_activations(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.has_platform_account_access() from public, anon, authenticated;
 revoke all on function public.cleanup_delete_project_with_audit(uuid, text, timestamptz, text, integer, bigint, boolean, uuid[]) from public, anon, authenticated;
+revoke all on function public.revoke_activations_with_secret() from public, anon, authenticated;
 
 grant execute on function public.increment_provider_usage(text, date, boolean) to service_role;
 grant execute on function public.increment_provider_usage_counts(text, date, integer, integer) to service_role;
@@ -932,6 +1004,7 @@ grant execute on function public.check_access_activation(uuid, text) to service_
 grant execute on function public.reset_access_secret_activations(uuid, uuid) to service_role;
 grant execute on function public.has_platform_account_access() to authenticated, service_role;
 grant execute on function public.cleanup_delete_project_with_audit(uuid, text, timestamptz, text, integer, bigint, boolean, uuid[]) to service_role;
+grant execute on function public.revoke_activations_with_secret() to service_role;
 
 -- ── Verification: what you asked to confirm ─────────────────────────────────
 -- Run this last. Every row should say 'present'.
@@ -948,5 +1021,8 @@ from (
     ('nasa_asset_cache.has_captions',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='nasa_asset_cache' and column_name='has_captions')),
     ('project_stock_corpus (table)',     to_regclass('public.project_stock_corpus') is not null),
     ('render_jobs allows cancelled',     exists (select 1 from pg_constraint where conname='render_jobs_status_check' and pg_get_constraintdef(oid) like '%cancelled%')),
-    ('admins exempt from limit',         exists (select 1 from pg_proc where proname='enforce_two_project_limit' and prosrc like '%role = ''admin''%'))
+    ('admins exempt from limit',         exists (select 1 from pg_proc where proname='enforce_two_project_limit' and prosrc like '%role = ''admin''%')),
+    ('auth_login_codes (table)',         to_regclass('public.auth_login_codes') is not null),
+    ('auth_login_failures (table)',      to_regclass('public.auth_login_failures') is not null),
+    ('access_activations.trusted_until', exists (select 1 from information_schema.columns where table_schema='public' and table_name='access_activations' and column_name='trusted_until'))
 ) as checks(check_name, present);

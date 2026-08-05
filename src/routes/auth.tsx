@@ -10,6 +10,9 @@ import {
   requestAdminPasswordRecovery,
   submitAccessRequest,
 } from "@/lib/access.functions";
+import { resendLoginCode, verifyAccessCredential, verifyLoginCode } from "@/lib/sign-in.functions";
+import { lockMessage, SIGN_IN_MESSAGES } from "@/lib/sign-in.messages";
+import { getOrCreateTrustedClientToken } from "@/lib/trusted-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -33,8 +36,14 @@ function AuthPage() {
   const activate = useServerFn(activateAccessSecret);
   const submitWaitlist = useServerFn(submitAccessRequest);
   const requestPasswordRecovery = useServerFn(requestAdminPasswordRecovery);
+  const verifyCredential = useServerFn(verifyAccessCredential);
+  const submitLoginCode = useServerFn(verifyLoginCode);
+  const resendCode = useServerFn(resendLoginCode);
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+  const [step, setStep] = useState<"email" | "credential" | "code">("email");
+  const [credential, setCredential] = useState("");
+  const [code, setCode] = useState("");
+  const [signInError, setSignInError] = useState<string | null>(null);
   const [secret, setSecret] = useState("");
   const [gate, setGate] = useState<Gate | null>(null);
   const [needsPasswordSetup, setNeedsPasswordSetup] = useState(false);
@@ -89,16 +98,127 @@ function AuthPage() {
     };
   }, [getGate, navigate]);
 
-  async function handleSignIn(event: React.FormEvent) {
+  /**
+   * Screen 1 -> 2. Deliberately makes NO server call: advancing purely on the
+   * client is what makes "never reveal whether the email exists" structural
+   * rather than a rule someone has to remember not to break.
+   */
+  function handleEmailStep(event: React.FormEvent) {
+    event.preventDefault();
+    setSignInError(null);
+    setStep("credential");
+  }
+
+  /** Establishes the Supabase session from tokens the server minted for us. */
+  async function adoptSession(accessToken: string, refreshToken: string) {
+    const { error } = await supabase.auth.setSession({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    });
+    if (error) throw new Error("Could not start your session. Try again.");
+    const { data } = await supabase.auth.getUser();
+    setNeedsPasswordSetup(data.user?.user_metadata?.needs_password_setup === true);
+    await refreshGate();
+  }
+
+  /** Screen 2: the access secret, or an administrator's password. */
+  async function handleCredentialStep(event: React.FormEvent) {
     event.preventDefault();
     setLoading(true);
+    setSignInError(null);
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error || !data.user) throw new Error(error?.message ?? "Sign in failed.");
-      setNeedsPasswordSetup(data.user.user_metadata?.needs_password_setup === true);
-      await refreshGate();
+      const result = await verifyCredential({
+        data: { email, credential, clientToken: getOrCreateTrustedClientToken() ?? "" },
+      });
+      switch (result.outcome) {
+        case "signed_in":
+          await adoptSession(result.accessToken, result.refreshToken);
+          break;
+        case "code_sent":
+          setStep("code");
+          break;
+        case "locked":
+          setSignInError(lockMessage(result.retryAfterMinutes));
+          break;
+        case "pending":
+          setSignInError(SIGN_IN_MESSAGES.pending);
+          break;
+        case "rejected":
+          setSignInError(SIGN_IN_MESSAGES.rejected);
+          break;
+        case "device_limit_reached":
+          setSignInError(SIGN_IN_MESSAGES.device_limit_reached);
+          break;
+        case "delivery_failed":
+          setSignInError(result.message);
+          break;
+        default:
+          setSignInError(SIGN_IN_MESSAGES.denied);
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Sign in failed.");
+      setSignInError(error instanceof Error ? error.message : "Sign in failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /** Screen 3: the emailed code. Only reachable for an untrusted browser. */
+  async function handleCodeStep(event: React.FormEvent) {
+    event.preventDefault();
+    setLoading(true);
+    setSignInError(null);
+    try {
+      const result = await submitLoginCode({
+        data: {
+          email,
+          code,
+          credential,
+          clientToken: getOrCreateTrustedClientToken() ?? "",
+        },
+      });
+      switch (result.outcome) {
+        case "signed_in":
+          await adoptSession(result.accessToken, result.refreshToken);
+          break;
+        case "wrong":
+          setSignInError(
+            `${SIGN_IN_MESSAGES.code_wrong} ${result.attemptsRemaining} attempt${result.attemptsRemaining === 1 ? "" : "s"} left.`,
+          );
+          break;
+        case "too_many_attempts":
+          setSignInError(SIGN_IN_MESSAGES.code_dead);
+          break;
+        case "expired":
+          setSignInError(SIGN_IN_MESSAGES.code_expired);
+          break;
+        case "device_limit_reached":
+          setSignInError(SIGN_IN_MESSAGES.device_limit_reached);
+          break;
+        default:
+          setSignInError(SIGN_IN_MESSAGES.denied);
+      }
+    } catch (error) {
+      setSignInError(error instanceof Error ? error.message : "Verification failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleResendCode() {
+    setLoading(true);
+    setSignInError(null);
+    try {
+      const result = await resendCode({ data: { email } });
+      if (result.outcome === "locked") {
+        setSignInError(lockMessage(result.retryAfterMinutes));
+      } else if (result.outcome === "delivery_failed") {
+        setSignInError(result.message);
+      } else {
+        toast.success("A new code is on its way.");
+        setCode("");
+      }
+    } catch {
+      setSignInError(SIGN_IN_MESSAGES.delivery_failed);
     } finally {
       setLoading(false);
     }
@@ -261,29 +381,109 @@ function AuthPage() {
               <TabsTrigger value="waitlist">Request access</TabsTrigger>
             </TabsList>
             <TabsContent value="signin">
-              <form onSubmit={handleSignIn} className="mt-4 space-y-4">
-                <Field label="Email" id="signin-email">
-                  <Input
-                    id="signin-email"
-                    type="email"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                  />
-                </Field>
-                <Field label="Password" id="signin-password">
-                  <Input
-                    id="signin-password"
-                    type="password"
-                    required
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                  />
-                </Field>
-                <Button className="w-full" disabled={loading}>
-                  {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Sign in"}
-                </Button>
-              </form>
+              {signInError ? (
+                <div
+                  role="alert"
+                  className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm"
+                >
+                  {signInError}
+                </div>
+              ) : null}
+
+              {step === "email" ? (
+                <form onSubmit={handleEmailStep} className="mt-4 space-y-4">
+                  <Field label="Email" id="signin-email">
+                    <Input
+                      id="signin-email"
+                      type="email"
+                      autoComplete="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                    />
+                  </Field>
+                  <Button className="w-full" disabled={loading}>
+                    Continue
+                  </Button>
+                </form>
+              ) : null}
+
+              {step === "credential" ? (
+                <form onSubmit={handleCredentialStep} className="mt-4 space-y-4">
+                  <p className="text-sm text-muted-foreground">
+                    Signing in as <span className="font-medium text-foreground">{email}</span>
+                  </p>
+                  <Field label="Access secret" id="signin-credential">
+                    <Input
+                      id="signin-credential"
+                      type="password"
+                      autoComplete="off"
+                      autoFocus
+                      required
+                      value={credential}
+                      onChange={(e) => setCredential(e.target.value)}
+                    />
+                    {/* Deliberately shown to everyone: an administrator-only hint
+                        would make the account type observable from this screen. */}
+                    <p className="text-xs text-muted-foreground">
+                      Administrators: enter your password here.
+                    </p>
+                  </Field>
+                  <Button className="w-full" disabled={loading}>
+                    <KeyRound className="mr-2 h-4 w-4" />
+                    {loading ? "Checking..." : "Continue"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="w-full"
+                    onClick={() => {
+                      setStep("email");
+                      setCredential("");
+                      setSignInError(null);
+                    }}
+                  >
+                    Use a different email
+                  </Button>
+                </form>
+              ) : null}
+
+              {step === "code" ? (
+                <form onSubmit={handleCodeStep} className="mt-4 space-y-4">
+                  <p className="text-sm text-muted-foreground">
+                    This browser is new, so we emailed a 6-digit code to{" "}
+                    <span className="font-medium text-foreground">{email}</span>. It expires in 10
+                    minutes.
+                  </p>
+                  <Field label="6-digit code" id="signin-code">
+                    <Input
+                      id="signin-code"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      pattern="[0-9]{6}"
+                      maxLength={6}
+                      autoFocus
+                      required
+                      value={code}
+                      onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+                    />
+                  </Field>
+                  <Button className="w-full" disabled={loading}>
+                    {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Verify and sign in"}
+                  </Button>
+                  {/* A silent delivery failure locks someone out entirely, so
+                      resending is always one click away. */}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="w-full"
+                    disabled={loading}
+                    onClick={() => void handleResendCode()}
+                  >
+                    Email me another code
+                  </Button>
+                </form>
+              ) : null}
               <Button
                 type="button"
                 variant="ghost"

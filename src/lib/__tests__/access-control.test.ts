@@ -138,7 +138,11 @@ describe("access control security contract", () => {
     expect(authMiddleware).toContain('identity.profile.role === "admin"');
     expect(authMiddleware).toContain('identity.profile?.approval_status === "approved"');
     expect(accessFunctions).toContain("isAdmin || (await hasTrustedAccess(context.userId))");
-    expect(accessFunctions).toContain("Administrators do not require access secrets.");
+    // Administrators are no longer REFUSED a secret — passwordless sign-in kept
+    // them on email + password, and an admin who also uses the workspace as a
+    // normal user needs one. The bypass above is what this test is really about,
+    // and it is unchanged: an approved admin never needs an activation.
+    expect(accessFunctions).not.toContain("Administrators do not require access secrets.");
     expect(authRoute).not.toContain("Initialize primary administrator access");
     expect(adminBypassMigration).toContain("u.role = 'admin'");
   });

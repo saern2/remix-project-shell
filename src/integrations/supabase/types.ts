@@ -22,6 +22,7 @@ export type Database = {
           last_seen_at: string
           revoked_at: string | null
           secret_id: string
+          trusted_until: string | null
           user_id: string
         }
         Insert: {
@@ -31,6 +32,7 @@ export type Database = {
           last_seen_at?: string
           revoked_at?: string | null
           secret_id: string
+          trusted_until?: string | null
           user_id: string
         }
         Update: {
@@ -40,6 +42,7 @@ export type Database = {
           last_seen_at?: string
           revoked_at?: string | null
           secret_id?: string
+          trusted_until?: string | null
           user_id?: string
         }
         Relationships: [
@@ -423,6 +426,72 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      auth_login_codes: {
+        Row: {
+          id: string
+          user_id: string
+          email_normalized: string
+          code_hash: string | null
+          client_token_hash: string
+          attempts: number
+          max_attempts: number
+          expires_at: string
+          consumed_at: string | null
+          invalidated_at: string | null
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          email_normalized: string
+          code_hash?: string | null
+          client_token_hash: string
+          attempts?: number
+          max_attempts?: number
+          expires_at: string
+          consumed_at?: string | null
+          invalidated_at?: string | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          email_normalized?: string
+          code_hash?: string | null
+          client_token_hash?: string
+          attempts?: number
+          max_attempts?: number
+          expires_at?: string
+          consumed_at?: string | null
+          invalidated_at?: string | null
+          created_at?: string
+        }
+        Relationships: []
+      }
+      auth_login_failures: {
+        Row: {
+          id: number
+          email_normalized: string | null
+          ip_address: string | null
+          stage: string
+          created_at: string
+        }
+        Insert: {
+          id?: number
+          email_normalized?: string | null
+          ip_address?: string | null
+          stage: string
+          created_at?: string
+        }
+        Update: {
+          id?: number
+          email_normalized?: string | null
+          ip_address?: string | null
+          stage?: string
+          created_at?: string
+        }
+        Relationships: []
       }
       projects: {
         Row: {

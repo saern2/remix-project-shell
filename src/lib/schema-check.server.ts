@@ -63,6 +63,26 @@ export const REQUIRED_SCHEMA: Array<{
     migration: "20260805160000_project_stock_corpus",
   },
   {
+    table: "auth_login_codes",
+    columns: ["client_token_hash", "attempts", "max_attempts", "expires_at", "invalidated_at"],
+    migration: "20260807000001_passwordless_sign_in",
+  },
+  {
+    table: "auth_login_failures",
+    columns: ["email_normalized", "ip_address", "stage"],
+    migration: "20260807000001_passwordless_sign_in",
+  },
+  {
+    table: "access_activations",
+    columns: ["trusted_until", "client_token_hash", "revoked_at"],
+    migration: "20260807000001_passwordless_sign_in",
+  },
+  {
+    table: "user_access_secrets",
+    columns: ["secret_hash", "secret_suffix", "status", "activation_count", "max_activations"],
+    migration: "20260801000001_approval_waitlist_access_secrets",
+  },
+  {
     table: "stock_search_cache",
     columns: ["provider", "query", "orientation", "results"],
     migration: "20260720065512 (base stock cache)",
