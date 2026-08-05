@@ -11,12 +11,34 @@ export function isProjectLimitError(error: unknown): boolean {
   );
 }
 
-export function projectUsage(count: number) {
+/**
+ * @param options.isAdmin Administrators are exempt from the limit — they operate
+ *   the platform and need projects to reproduce user problems. Mirrors the
+ *   database trigger, which is the real gate: the client inserts straight into
+ *   PostgREST, so a UI-only exemption would still be rejected.
+ */
+export function projectUsage(count: number, options: { isAdmin?: boolean } = {}) {
+  const exempt = options.isAdmin === true;
   return {
     count,
-    remaining: Math.max(0, PROJECT_LIMIT - count),
-    atLimit: count >= PROJECT_LIMIT,
+    exempt,
+    remaining: exempt ? Number.POSITIVE_INFINITY : Math.max(0, PROJECT_LIMIT - count),
+    atLimit: !exempt && count >= PROJECT_LIMIT,
   };
+}
+
+/**
+ * The project a "free up a slot" action should offer to delete: the oldest.
+ *
+ * Oldest rather than, say, the least recently touched, because it is the one
+ * choice a user can predict without opening anything — and the action always
+ * names it and asks before deleting.
+ */
+export function oldestProject<T extends { created_at: string }>(projects: T[]): T | null {
+  if (projects.length === 0) return null;
+  return [...projects].sort(
+    (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+  )[0];
 }
 
 export function summarizeProjectStatuses(projects: Array<{ status: string }>) {

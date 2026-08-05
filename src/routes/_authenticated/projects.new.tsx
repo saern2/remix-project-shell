@@ -17,16 +17,31 @@ import {
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { AlertCircle, ArrowLeft, FolderKanban, Upload } from "lucide-react";
+import { AlertCircle, ArrowLeft, FolderKanban, Loader2, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
-import { useProjects } from "@/components/project-overview";
+import { useQueryClient } from "@tanstack/react-query";
+import { formatDistanceToNow } from "date-fns";
+import { PROJECTS_QUERY_KEY, useProjects } from "@/components/project-overview";
+import { deleteProject } from "@/lib/deleteProject";
+import { useIsAdmin } from "@/hooks/use-is-admin";
 import {
   isProjectLimitError,
+  oldestProject,
   PROJECT_LIMIT,
   PROJECT_LIMIT_MESSAGE,
   projectUsage,
 } from "@/lib/project-limit";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export const Route = createFileRoute("/_authenticated/projects/new")({
@@ -51,7 +66,29 @@ function NewProject() {
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState<string>("");
   const { data: existingProjects = [], isLoading: projectsLoading } = useProjects();
-  const usage = projectUsage(existingProjects.length);
+  const { isAdmin } = useIsAdmin();
+  const usage = projectUsage(existingProjects.length, { isAdmin });
+  const oldest = oldestProject(existingProjects);
+  const [confirmDeleteOldest, setConfirmDeleteOldest] = useState(false);
+  const [deletingOldest, setDeletingOldest] = useState(false);
+  const runDeleteProject = useServerFn(deleteProject);
+  const queryClient = useQueryClient();
+
+  /** Frees a slot in place, so the half-filled form below stays as it was. */
+  const handleDeleteOldest = async () => {
+    if (!oldest) return;
+    setDeletingOldest(true);
+    try {
+      await runDeleteProject({ data: { projectId: oldest.id } });
+      await queryClient.invalidateQueries({ queryKey: PROJECTS_QUERY_KEY });
+      toast.success(`Deleted "${oldest.name}". You can create a project now.`);
+    } catch (err) {
+      toast.error((err as Error).message ?? "Could not delete the project.");
+    } finally {
+      setDeletingOldest(false);
+      setConfirmDeleteOldest(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -183,40 +220,6 @@ function NewProject() {
     );
   }
 
-  if (usage.atLimit) {
-    return (
-      <main className="mx-auto max-w-2xl px-5 py-10 sm:px-8">
-        <Button variant="ghost" size="sm" asChild className="mb-6">
-          <Link to="/dashboard">
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to dashboard
-          </Link>
-        </Button>
-        <Alert>
-          <AlertCircle className="h-4 w-4" />
-          <AlertTitle>All project slots are in use</AlertTitle>
-          <AlertDescription className="mt-2">{PROJECT_LIMIT_MESSAGE}</AlertDescription>
-        </Alert>
-        <div className="mt-5 flex items-center justify-between rounded-lg border bg-card p-4">
-          <div>
-            <p className="text-sm font-medium">
-              {usage.count} of {PROJECT_LIMIT} projects used
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Delete an existing project before starting another.
-            </p>
-          </div>
-          <Button asChild variant="outline">
-            <Link to="/projects">
-              <FolderKanban className="mr-2 h-4 w-4" />
-              Manage projects
-            </Link>
-          </Button>
-        </div>
-      </main>
-    );
-  }
-
   return (
     <main className="mx-auto max-w-2xl px-5 py-10 sm:px-8">
       <div className="mb-6">
@@ -228,9 +231,68 @@ function NewProject() {
         </Button>
         <h1 className="mt-5 text-2xl font-semibold">New project</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          {usage.count} of {PROJECT_LIMIT} project slots used
+          {usage.exempt
+            ? `${usage.count} project${usage.count === 1 ? "" : "s"} — no limit on this account`
+            : `${usage.count} of ${PROJECT_LIMIT} project slots used`}
         </p>
       </div>
+
+      {/*
+        Being at the limit is a notice, not a wall. The form stays reachable and
+        filled in: a user who arrives here with a file picked should be able to
+        free a slot and submit, rather than be bounced to a dead-end page that
+        discards everything they had entered.
+      */}
+      {usage.atLimit ? (
+        <Alert className="mb-6">
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>Both project slots are in use</AlertTitle>
+          <AlertDescription className="mt-2 space-y-3">
+            <p>{PROJECT_LIMIT_MESSAGE}</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={!oldest || deletingOldest}
+                onClick={() => setConfirmDeleteOldest(true)}
+              >
+                {deletingOldest ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Trash2 className="mr-2 h-4 w-4" />
+                )}
+                {oldest ? `Delete "${oldest.name}"` : "Delete oldest project"}
+              </Button>
+              <Button asChild size="sm" variant="ghost">
+                <Link to="/projects">
+                  <FolderKanban className="mr-2 h-4 w-4" />
+                  Choose another
+                </Link>
+              </Button>
+            </div>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      <AlertDialog open={confirmDeleteOldest} onOpenChange={setConfirmDeleteOldest}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete "{oldest?.name}"?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This is your oldest project, created{" "}
+              {oldest ? formatDistanceToNow(new Date(oldest.created_at), { addSuffix: true }) : ""}.
+              Its audio, scenes and any rendered video are permanently removed. This cannot be
+              undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep it</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteOldest}>Delete project</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <Card>
         <CardHeader>
           <CardTitle>Create a project</CardTitle>

@@ -18,7 +18,7 @@ import {
   UsersRound,
   type LucideIcon,
 } from "lucide-react";
-import { amIAdmin } from "@/lib/admin.functions";
+import { useIsAdmin } from "@/hooks/use-is-admin";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
 import { useTheme, type ThemePreference } from "@/components/theme-provider";
@@ -70,13 +70,7 @@ function ThemeMenuItems() {
 
 function ShellNav({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: () => void }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
-  const checkAdmin = useServerFn(amIAdmin);
-  const { data: admin } = useQuery({
-    queryKey: ["am-i-admin"],
-    queryFn: () => checkAdmin({}),
-    retry: false,
-    staleTime: 60_000,
-  });
+  const { isAdmin } = useIsAdmin();
 
   const renderLink = (item: NavItem) => {
     const active = isActive(pathname, item.to, item.exact);
@@ -114,7 +108,7 @@ function ShellNav({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: 
         {!collapsed ? (
           <p className="px-3 pb-2 text-xs font-medium text-muted-foreground">Manage</p>
         ) : null}
-        {admin?.isAdmin ? (
+        {isAdmin ? (
           <>
             {renderLink({ label: "Admin", to: "/admin", icon: Shield, exact: true })}
             {renderLink({ label: "Users", to: "/users", icon: UsersRound })}

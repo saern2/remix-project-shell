@@ -881,11 +881,22 @@ export const cancelRenderJob = createServerFn({ method: "POST" })
     const now = new Date().toISOString();
 
     // Only update if still in an active status (race: job may have completed)
-    await supabaseAdmin
+    const { error: cancelWriteError } = await supabaseAdmin
       .from("render_jobs")
       .update({ status: "cancelled", completed_at: now })
       .eq("id", job.id)
       .in("status", ACTIVE_RENDER_STATUSES);
+    // Checked, not swallowed. This write silently violated a check constraint
+    // that did not list 'cancelled', so every cancel left the job row claiming
+    // to be rendering. An unchecked write is how that stayed invisible.
+    if (cancelWriteError) {
+      console.error("[render] could not mark job cancelled", {
+        jobId: job.id,
+        code: cancelWriteError.code,
+        message: cancelWriteError.message,
+      });
+      throw new Error("The render was stopped but its status could not be saved.");
+    }
 
     await supabaseAdmin
       .from("projects")

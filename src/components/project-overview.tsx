@@ -15,7 +15,9 @@ import {
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { deleteProject } from "@/lib/deleteProject";
+import { useIsAdmin } from "@/hooks/use-is-admin";
 import {
+  oldestProject,
   PROJECT_LIMIT,
   PROJECT_LIMIT_MESSAGE,
   projectUsage,
@@ -76,16 +78,14 @@ export function useProjects() {
   });
 }
 
+/**
+ * Always navigable. Being at the limit is surfaced by the notice below and on
+ * the new-project page, which offers to free a slot in place — disabling the
+ * button here just left the user with nowhere to go and nothing to click.
+ */
 function CreateProjectAction({ atLimit }: { atLimit: boolean }) {
-  if (atLimit)
-    return (
-      <Button disabled title={PROJECT_LIMIT_MESSAGE}>
-        <Plus className="mr-2 h-4 w-4" />
-        Project limit reached
-      </Button>
-    );
   return (
-    <Button asChild>
+    <Button asChild variant={atLimit ? "outline" : "default"}>
       <Link to="/projects/new">
         <Plus className="mr-2 h-4 w-4" />
         Create project
@@ -100,7 +100,9 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
   const { data: projects = [], isLoading, error } = useProjects();
   const [pendingDelete, setPendingDelete] = useState<ProjectSummary | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const usage = projectUsage(projects.length);
+  const { isAdmin } = useIsAdmin();
+  const usage = projectUsage(projects.length, { isAdmin });
+  const oldest = oldestProject(projects);
   const stats = summarizeProjectStatuses(projects);
 
   const confirmDelete = async () => {
@@ -136,28 +138,47 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
       <div className="mt-7 flex flex-wrap items-center justify-between gap-3 border-y py-4">
         <div>
           <p className="text-sm font-medium">
-            {usage.count} of {PROJECT_LIMIT} projects used
+            {usage.exempt
+              ? `${usage.count} project${usage.count === 1 ? "" : "s"}`
+              : `${usage.count} of ${PROJECT_LIMIT} projects used`}
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            {usage.remaining} project {usage.remaining === 1 ? "slot" : "slots"} available
+            {usage.exempt
+              ? "No project limit on this account"
+              : `${usage.remaining} project ${usage.remaining === 1 ? "slot" : "slots"} available`}
           </p>
         </div>
-        <div
-          className="flex h-2 w-36 overflow-hidden rounded-full bg-muted"
-          aria-label={`${usage.count} of ${PROJECT_LIMIT} project slots used`}
-        >
-          <span
-            className="bg-primary transition-[width]"
-            style={{ width: `${Math.min(100, (usage.count / PROJECT_LIMIT) * 100)}%` }}
-          />
-        </div>
+        {!usage.exempt ? (
+          <div
+            className="flex h-2 w-36 overflow-hidden rounded-full bg-muted"
+            aria-label={`${usage.count} of ${PROJECT_LIMIT} project slots used`}
+          >
+            <span
+              className="bg-primary transition-[width]"
+              style={{ width: `${Math.min(100, (usage.count / PROJECT_LIMIT) * 100)}%` }}
+            />
+          </div>
+        ) : null}
       </div>
 
       {usage.atLimit ? (
         <Alert className="mt-6">
           <AlertCircle className="h-4 w-4" />
           <AlertTitle>Project limit reached</AlertTitle>
-          <AlertDescription>{PROJECT_LIMIT_MESSAGE}</AlertDescription>
+          <AlertDescription className="mt-2 space-y-3">
+            <p>{PROJECT_LIMIT_MESSAGE}</p>
+            {oldest ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => setPendingDelete(oldest)}
+              >
+                <Trash2 className="mr-2 h-4 w-4" />
+                Delete the oldest ("{oldest.name}")
+              </Button>
+            ) : null}
+          </AlertDescription>
         </Alert>
       ) : null}
 

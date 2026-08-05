@@ -44,8 +44,43 @@ function isH3SwallowedErrorBody(body: string): boolean {
   }
 }
 
+/**
+ * Schema verification, run once for the life of the process.
+ *
+ * A missing migration used to surface only as a 400 loop in the browser console
+ * — the render page just never loaded its status, and nothing server-side said
+ * why. Checking here means the very first request answers with the list of
+ * missing columns instead, and every later request is unaffected: the promise is
+ * created once and its result reused.
+ *
+ * Deliberately fails closed. A build whose database cannot serve its own pages
+ * must not look healthy; SCHEMA_CHECK=warn or =off opts out when deploying ahead
+ * of a migration on purpose.
+ */
+let schemaCheckPromise: Promise<string | null> | undefined;
+
+function checkSchemaOnce(): Promise<string | null> {
+  if (!schemaCheckPromise) {
+    schemaCheckPromise = import("./lib/schema-check.server")
+      .then(async ({ runSchemaCheck }) => {
+        await runSchemaCheck();
+        return null;
+      })
+      .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+  }
+  return schemaCheckPromise;
+}
+
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
+    const schemaFailure = await checkSchemaOnce();
+    if (schemaFailure) {
+      return new Response(renderErrorPage(schemaFailure), {
+        status: 503,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
     try {
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);

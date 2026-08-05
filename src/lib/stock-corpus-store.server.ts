@@ -154,15 +154,56 @@ export async function ensureProjectBuckets(
   return buckets.map((bucket) => ({ ...bucket, candidates: [], providersDone: [] }));
 }
 
-/** The (bucket, provider) pairs still to search, in a stable order. */
+/**
+ * NASA queries per bucket. expandNasaQueries widens a bucket query into related
+ * phrasings; three is what the matcher used before the corpus existed.
+ */
+export const NASA_QUERIES_PER_BUCKET = 3;
+
+/**
+ * A single unit of corpus work: one bucket, one provider, one query.
+ *
+ * NASA used to be one cell that ran all three of its queries in a loop. A cell
+ * cannot be preempted, so on a space project that made the smallest schedulable
+ * unit three sequential HTTP searches — which is how invocations reached 17s
+ * against a 12s budget. One query per cell makes the budget able to stop.
+ */
+export type CorpusCell = {
+  bucket: CorpusBucket;
+  provider: CorpusProvider;
+  /** Which of the provider's queries this cell covers. */
+  queryIndex: number;
+};
+
+/** The stable identifier stored in providers_done once a cell is searched. */
+export function corpusCellKey(provider: CorpusProvider, queryIndex: number): string {
+  // pexels/pixabay keep their bare provider name so rows written before cells
+  // were split still read as done.
+  return provider === "nasa" ? `nasa#${queryIndex}` : provider;
+}
+
+function cellsForProvider(provider: CorpusProvider): number {
+  return provider === "nasa" ? NASA_QUERIES_PER_BUCKET : 1;
+}
+
+/** The (bucket, provider, query) cells still to search, in a stable order. */
 export function pendingCorpusWork(
   buckets: CorpusBucket[],
   providers: CorpusProvider[],
-): Array<{ bucket: CorpusBucket; provider: CorpusProvider }> {
+): CorpusCell[] {
   return buckets.flatMap((bucket) =>
-    providers
-      .filter((provider) => !bucket.providersDone.includes(provider))
-      .map((provider) => ({ bucket, provider })),
+    providers.flatMap((provider) => {
+      // A row written before cells were split records a bare "nasa" for the
+      // whole provider. Honour it rather than re-searching all three queries.
+      if (bucket.providersDone.includes(provider) && provider === "nasa") return [];
+      return Array.from({ length: cellsForProvider(provider) }, (_, queryIndex) => ({
+        bucket,
+        provider,
+        queryIndex,
+      })).filter(
+        (cell) => !bucket.providersDone.includes(corpusCellKey(provider, cell.queryIndex)),
+      );
+    }),
   );
 }
 
@@ -178,28 +219,30 @@ export async function buildCorpusCell(opts: {
   projectId: string;
   bucket: CorpusBucket;
   provider: CorpusProvider;
+  queryIndex?: number;
   orientation: Orientation;
   targetWidth: number;
   niche?: string | null;
   session: StockSearchSession;
 }): Promise<CorpusBucket> {
   const { bucket, provider } = opts;
+  const queryIndex = opts.queryIndex ?? 0;
   const spaceBias = opts.niche === "space";
 
   let found: StockVideo[] = [];
   try {
     if (provider === "nasa") {
-      for (const query of expandNasaQueries(bucket.query).slice(0, 3)) {
-        found.push(
-          ...(await searchProviderCandidatePool({
-            provider: "nasa",
-            query,
-            orientation: opts.orientation,
-            targetWidth: opts.targetWidth,
-            seed: `${opts.projectId}:${bucket.id}:${query}`,
-            session: opts.session,
-          })),
-        );
+      // Exactly one query per cell — see CorpusCell for why this is not a loop.
+      const query = expandNasaQueries(bucket.query).slice(0, NASA_QUERIES_PER_BUCKET)[queryIndex];
+      if (query) {
+        found = await searchProviderCandidatePool({
+          provider: "nasa",
+          query,
+          orientation: opts.orientation,
+          targetWidth: opts.targetWidth,
+          seed: `${opts.projectId}:${bucket.id}:${query}`,
+          session: opts.session,
+        });
       }
     } else {
       found = await searchProviderCandidatePool({
@@ -226,7 +269,9 @@ export async function buildCorpusCell(opts: {
     0,
     CORPUS_CANDIDATES_PER_BUCKET * 3,
   );
-  const providersDone = [...new Set([...bucket.providersDone, provider])];
+  const providersDone = [
+    ...new Set([...bucket.providersDone, corpusCellKey(provider, queryIndex)]),
+  ];
 
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { error } = await supabaseAdmin

@@ -241,6 +241,10 @@ async function persistTranscriptAndScenes(
     // back to nearest-bucket for every scene and quietly lose its clustering.
     const { clearProjectCorpus } = await import("@/lib/stock-corpus-store.server");
     await clearProjectCorpus(projectId);
+    // The in-process matching cache holds the scene skeleton, the visual queries
+    // and the corpus — all three describe the scenes that were just deleted.
+    const { invalidateMatchingCache } = await import("@/lib/matching-cache.server");
+    invalidateMatchingCache(projectId);
   }
 
   const { data: asset } = await supabaseAdmin
@@ -513,8 +517,22 @@ async function advanceFromMatchingFootage(projectId: string) {
     "providerSearch",
     "assignment",
     "dbWrite",
+    "projectRead",
+    "corpusLoad",
   ]) {
     profile.add(bucket, 0);
+  }
+  // Cache counters, seeded so a zero is reported as a zero rather than as an
+  // absent field. These are how the round-8 setup cost is verified from the
+  // client: on a warm process every assignment invocation should report all
+  // three as 1, and sceneReadRows as 0.
+  for (const counter of [
+    "sceneCacheHit",
+    "visualQueryCacheHit",
+    "corpusCacheHit",
+    "sceneReadRows",
+  ]) {
+    profile.count(counter, 0);
   }
 
   /**
@@ -555,43 +573,121 @@ async function advanceFromMatchingFootage(projectId: string) {
   }
 
   try {
-    await assertPipelineWritable(projectId);
+    const {
+      cacheScenes,
+      cacheCompleteCorpus,
+      getCachedCorpus,
+      getCachedScenes,
+      getCachedVisualQueries,
+      mergeVisualQueries,
+    } = await import("@/lib/matching-cache.server");
+
+    /**
+     * The cancel flag is read as part of the project row rather than by a
+     * separate assertPipelineWritable() call. They hit the same table on the
+     * same primary key one after the other; on a VPS talking to hosted Supabase
+     * that second round trip cost as much as the read it duplicated.
+     */
+    const projectStartedAt = Date.now();
     const { data: project, error: pErr } = await supabaseAdmin
       .from("projects")
-      .select("id, aspect_ratio, clip_duration_seconds, niche")
+      .select("id, aspect_ratio, clip_duration_seconds, niche, pipeline_cancel_requested_at")
       .eq("id", projectId)
       .maybeSingle();
+    profile.add("projectRead", Date.now() - projectStartedAt);
     if (pErr) throw new Error(pErr.message);
-    if (!project) throw new PipelineStoppedError();
+    if (!project || project.pipeline_cancel_requested_at) throw new PipelineStoppedError();
 
     // Timeline skeleton: every scene, but only the columns the timeline maths
     // needs. This one read CANNOT be narrowed to pending scenes — a slot's
     // boundaries come from the *adjacent* scene's start_ts, so a gap in the list
     // would silently shift every downstream timing. It is made cheap instead:
     // `text` (the narration body, by far the largest column on the table) is no
-    // longer selected, and visual_query is read separately, for pending scenes
-    // only, once the pending set is known.
-    const sceneReadStartedAt = Date.now();
-    const { data: scenes, error } = await supabaseAdmin
-      .from("scenes")
-      .select("id, idx, start_ts, end_ts")
-      .eq("project_id", projectId)
-      .order("idx", { ascending: true });
-    profile.add("sceneRead", Date.now() - sceneReadStartedAt);
-    if (error) throw new Error(error.message);
-    if (!scenes || scenes.length === 0) {
+    // longer selected, visual_query is read separately, and the result is held in
+    // the process cache because scenes cannot change while matching runs.
+    const readScenes = async () => {
+      const cached = getCachedScenes(projectId);
+      if (cached) {
+        profile.count("sceneCacheHit");
+        return cached;
+      }
+      const startedAt = Date.now();
+      const { data, error } = await supabaseAdmin
+        .from("scenes")
+        .select("id, idx, start_ts, end_ts")
+        .eq("project_id", projectId)
+        .order("idx", { ascending: true });
+      profile.add("sceneRead", Date.now() - startedAt);
+      if (error) throw new Error(error.message);
+      if (data && data.length > 0) cacheScenes(projectId, data);
+      return data ?? [];
+    };
+
+    const readAudioAsset = async () => {
+      const { data, error: audioAssetError } = await supabaseAdmin
+        .from("audio_assets")
+        .select("duration_sec")
+        .eq("project_id", projectId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (audioAssetError) throw new Error(audioAssetError.message);
+      return data;
+    };
+
+    const fixedDuration =
+      project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
+
+    /**
+     * Slices already assigned. Started here rather than inside the fixed-duration
+     * branch so it overlaps the scene and audio reads: it is the one setup read
+     * that GROWS as matching progresses (~1,300 rows by the end of a 145-scene
+     * project), and paying for it in parallel costs nothing extra.
+     */
+    const existingSlicesPromise =
+      fixedDuration != null && fixedDuration > 0
+        ? supabaseAdmin
+            .from("render_clip_slices")
+            .select(
+              "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
+            )
+            .eq("project_id", projectId)
+        : null;
+
+    // Independent reads, so they go out together. Sequentially these were three
+    // more round trips of pure latency on top of the project read.
+    const [scenes, audioAsset] = await Promise.all([readScenes(), readAudioAsset()]);
+
+    if (scenes.length === 0) {
       await supabaseAdmin.from("projects").update({ status: "ready" }).eq("id", projectId);
       return { status: "ready", error_message: null };
     }
 
     /**
      * Visual queries for exactly the scenes this invocation still has work for.
-     * Filtered in the query, so the payload shrinks with every invocation instead
-     * of re-reading all 145 scenes' queries 56 times.
+     *
+     * Served from the process cache when possible: the first invocation reads
+     * every scene's query to cluster the corpus, and every later invocation used
+     * to re-read the queries for all remaining scenes — 1,305 rows across a
+     * 145-scene run for data that never changes.
      */
     const loadVisualQueries = async (sceneIds: string[]): Promise<Map<string, string>> => {
       const queries = new Map<string, string>();
       if (sceneIds.length === 0) return queries;
+
+      const cached = getCachedVisualQueries(projectId);
+      if (cached) {
+        const missing = sceneIds.filter((id) => !cached.has(id));
+        if (missing.length === 0) {
+          profile.count("visualQueryCacheHit");
+          for (const id of sceneIds) {
+            const query = cached.get(id);
+            if (query) queries.set(id, query);
+          }
+          return queries;
+        }
+      }
+
       const startedAt = Date.now();
       const { data, error: queryError } = await supabaseAdmin
         .from("scenes")
@@ -603,17 +699,9 @@ async function advanceFromMatchingFootage(projectId: string) {
       for (const row of data ?? []) {
         if (row.visual_query) queries.set(row.id, row.visual_query);
       }
+      mergeVisualQueries(projectId, queries);
       return queries;
     };
-
-    const { data: audioAsset, error: audioAssetError } = await supabaseAdmin
-      .from("audio_assets")
-      .select("duration_sec")
-      .eq("project_id", projectId)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (audioAssetError) throw new Error(audioAssetError.message);
     const narrationEnd = Math.max(...scenes.map((scene) => Number(scene.end_ts ?? 0)));
     const measuredAudioDuration = Number(audioAsset?.duration_sec);
     const audioDuration =
@@ -658,6 +746,14 @@ async function advanceFromMatchingFootage(projectId: string) {
         .order("idx", { ascending: true });
       profile.add("sceneRead", Date.now() - startedAt);
       if (queryError) throw new Error(queryError.message);
+      // This read already has every scene's query in hand. Handing it to the
+      // cache means the per-slice reads below never have to happen at all.
+      mergeVisualQueries(
+        projectId,
+        new Map(
+          (data ?? []).flatMap((row) => (row.visual_query ? [[row.id, row.visual_query]] : [])),
+        ),
+      );
       return (data ?? []).flatMap((row) =>
         row.visual_query
           ? [
@@ -679,6 +775,16 @@ async function advanceFromMatchingFootage(projectId: string) {
      * matching_footage and let the next invocation continue.
      */
     const prepareCorpus = async () => {
+      // A COMPLETE corpus is immutable — the build phase is over and assignment
+      // only reads it — so serving it from memory is safe, and it is the single
+      // largest read in the invocation: ~37 buckets of distilled candidates,
+      // fetched whole on every one of the ~30 assignment invocations.
+      const memo = getCachedCorpus(projectId);
+      if (memo) {
+        profile.count("corpusCacheHit");
+        return { corpus: memo, complete: true as const, remaining: 0 };
+      }
+
       const corpusStartedAt = Date.now();
       let corpus = await loadProjectCorpus(projectId);
       if (corpus.length === 0) {
@@ -688,22 +794,26 @@ async function advanceFromMatchingFootage(projectId: string) {
 
       let pending = pendingCorpusWork(corpus, corpusProviders);
       profile.count("corpusCellsPending", pending.length);
-      if (pending.length === 0) return { corpus, complete: true as const, remaining: 0 };
+      if (pending.length === 0) {
+        cacheCompleteCorpus(projectId, corpus);
+        return { corpus, complete: true as const, remaining: 0 };
+      }
 
       stockSession = stockSession ?? (await createStockSearchSession(profile));
       const byId = new Map(corpus.map((bucket) => [bucket.id, bucket]));
 
       while (pending.length > 0 && budget.shouldStartAnotherSlice()) {
         const cellStartedAt = Date.now();
-        const { bucket, provider } = pending[0];
+        const { bucket, provider, queryIndex } = pending[0];
         const updated = await buildCorpusCell({
           projectId,
           bucket: byId.get(bucket.id) ?? bucket,
           provider,
+          queryIndex,
           orientation,
           targetWidth,
           niche: projectNiche,
-          session: stockSession,
+          session: stockSession ?? undefined,
         });
         byId.set(updated.id, updated);
         profile.count("corpusCellsBuilt");
@@ -713,13 +823,13 @@ async function advanceFromMatchingFootage(projectId: string) {
 
       const rebuilt = [...byId.values()];
       if (pending.length > 0) {
+        // Deliberately NOT cached: a partial corpus in memory would let the next
+        // invocation decide what work remains from a stale copy.
         return { corpus: rebuilt, complete: false as const, remaining: pending.length };
       }
+      cacheCompleteCorpus(projectId, rebuilt);
       return { corpus: rebuilt, complete: true as const, remaining: 0 };
     };
-
-    const fixedDuration =
-      project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
     if (fixedDuration != null && fixedDuration > 0) {
       const {
@@ -731,12 +841,9 @@ async function advanceFromMatchingFootage(projectId: string) {
         summarizeSliceCoverage,
       } = await import("@/lib/clip-slices.server");
 
-      const { data: existingSlices } = await supabaseAdmin
-        .from("render_clip_slices")
-        .select(
-          "scene_id, slice_index, clip_url, provider, provider_clip_id, in_point_seconds, duration_seconds, timeline_start_seconds, timeline_end_seconds, thumbnail_url",
-        )
-        .eq("project_id", projectId);
+      // Issued alongside the scene and audio reads above; this is where it lands.
+      const { data: existingSlices, error: slicesError } = await existingSlicesPromise!;
+      if (slicesError) throw new Error(slicesError.message);
       const eligibleExistingSlices = existingSlices ?? [];
 
       const startedAt = Date.now();
@@ -850,7 +957,11 @@ async function advanceFromMatchingFootage(projectId: string) {
       const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
       let processedSlots = 0;
 
-      stockSession = stockSession ?? (await createStockSearchSession(profile));
+      // No session is created here. Once the corpus is complete, assignment is
+      // pure CPU over pools already in hand, and building a session means loading
+      // the provider key pool and flushing usage counters afterwards — round
+      // trips an assignment-only invocation has no use for. prepareCorpus builds
+      // one lazily if, and only if, there is still searching to do.
 
       // The corpus must be whole before a single scene is assigned.
       const corpusState = await prepareCorpus();
@@ -905,7 +1016,7 @@ async function advanceFromMatchingFootage(projectId: string) {
           targetWidth,
           niche: project.niche,
           usedIds,
-          session: stockSession,
+          session: stockSession ?? undefined,
           corpus: corpusState.corpus,
           sourceUsage,
           onFallback: (event) => fallbackEvents.push(event),
@@ -1227,8 +1338,7 @@ async function advanceFromMatchingFootage(projectId: string) {
     // Time-budgeted slice loop (see fixed-duration path above for rationale).
     let processedScenes = 0;
 
-    stockSession = stockSession ?? (await createStockSearchSession(profile));
-
+    // Session created lazily by prepareCorpus — see the fixed-duration path.
     const corpusState = await prepareCorpus();
     if (!corpusState.complete) {
       await assertPipelineWritable(projectId);
@@ -1287,7 +1397,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         targetWidth,
         niche: projectNiche,
         usedIds,
-        session: stockSession,
+        session: stockSession ?? undefined,
         corpus: corpusState.corpus,
         sourceUsage,
         onFallback: (event) => fallbackEvents.push(event),

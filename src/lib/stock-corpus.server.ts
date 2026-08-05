@@ -63,7 +63,12 @@ type MatchCorpusOptions = {
   targetWidth: number;
   niche?: ProjectNiche | string | null;
   usedIds: Set<string>;
-  session: StockSearchSession;
+  /**
+   * Required only for the legacy search-at-assignment path. The corpus path does
+   * no I/O at all, so callers that pass `corpus` need not build a session — which
+   * saves loading the provider key pool on every assignment invocation.
+   */
+  session?: StockSearchSession;
   /**
    * The project-wide corpus. When present, matchStockCorpus assigns from it and
    * performs NO searches of its own — clustering and provider work already
@@ -149,16 +154,21 @@ export async function matchStockCorpus(
   // slice — the property whose loss made late scenes unmatchable.
   if (opts.corpus) return assignFromProjectCorpus(opts, opts.corpus);
 
+  if (!opts.session) {
+    throw new Error("matchStockCorpus needs a stock search session when no corpus is supplied.");
+  }
+  const session = opts.session;
+
   const buckets = clusterStockQueries(opts.demands);
   const providerQueries = buckets.map((bucket) =>
     opts.niche === "space" ? [bucket.query, "space astronomy cosmos"].join(" ") : bucket.query,
   );
   await Promise.all([
-    prefetchStockProviderCache(opts.session, "pexels", opts.orientation, providerQueries),
-    prefetchStockProviderCache(opts.session, "pixabay", opts.orientation, providerQueries),
+    prefetchStockProviderCache(session, "pexels", opts.orientation, providerQueries),
+    prefetchStockProviderCache(session, "pixabay", opts.orientation, providerQueries),
     opts.niche === "space"
       ? prefetchStockProviderCache(
-          opts.session,
+          session,
           "nasa",
           "any",
           buckets.flatMap((bucket) => expandNasaQueries(bucket.query).slice(0, 3)),
@@ -176,7 +186,7 @@ export async function matchStockCorpus(
   const recentSources: string[] = [];
   // Ranking/assignment is pure CPU over already-fetched pools; timed separately
   // from provider HTTP so the breakdown shows which dominates.
-  const profile = opts.session.profile;
+  const profile = session.profile;
   const timeAssign = <T>(fn: () => T): T => (profile ? profile.timeSync("assignment", fn) : fn());
 
   if (opts.niche === "space") {
@@ -247,10 +257,10 @@ export async function matchStockCorpus(
     buckets: buckets.length,
     matched: assignments.size,
     unmatched: opts.demands.length - assignments.size,
-    pexelsRequests: opts.session.pexelsPool.requestCount,
-    pexelsRequestLimit: opts.session.pexelsPool.requestLimit,
-    nasaHttp: opts.session.nasaMetrics ?? null,
-    nasaSearchCacheHits: opts.session.usage.get("nasa")?.cacheHits ?? 0,
+    pexelsRequests: session.pexelsPool.requestCount,
+    pexelsRequestLimit: session.pexelsPool.requestLimit,
+    nasaHttp: session.nasaMetrics ?? null,
+    nasaSearchCacheHits: session.usage.get("nasa")?.cacheHits ?? 0,
     providers: countProviders(assignments),
     sourceDuration: summarizeSelectedDurations(assignments),
   });
@@ -261,6 +271,8 @@ async function loadNasaPools(
   opts: MatchCorpusOptions,
   buckets: StockQueryBucket[],
 ): Promise<Map<string, StockVideo[]>> {
+  // Only reachable from the non-corpus path, which has already checked this.
+  const session = opts.session!;
   const pools = new Map<string, StockVideo[]>();
   // NASA resolves metadata, manifests, and captions internally. Keeping bucket
   // searches serial bounds aggregate external concurrency to six.
@@ -273,7 +285,7 @@ async function loadNasaPools(
         orientation: opts.orientation,
         targetWidth: opts.targetWidth,
         seed: `${opts.projectId}:${bucket.id}:${query}`,
-        session: opts.session,
+        session,
       }).catch((error) => {
         console.warn("[stock-corpus] NASA bucket search failed", {
           bucket: bucket.id,
@@ -295,6 +307,8 @@ async function loadProviderPools(
   provider: "pexels" | "pixabay",
   spaceBias: boolean,
 ): Promise<Map<string, StockVideo[]>> {
+  // Only reachable from the non-corpus path, which has already checked this.
+  const session = opts.session!;
   const pools = new Map<string, StockVideo[]>();
   await asyncPool(buckets, 6, async (bucket) => {
     const query = spaceBias ? `${bucket.query} space astronomy cosmos` : bucket.query;
@@ -304,7 +318,7 @@ async function loadProviderPools(
       orientation: opts.orientation,
       targetWidth: opts.targetWidth,
       seed: `${opts.projectId}:${bucket.id}`,
-      session: opts.session,
+      session,
     });
     pools.set(bucket.id, candidates);
   });

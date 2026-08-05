@@ -13,7 +13,9 @@ describe("two-project limit helpers", () => {
     [2, true, 0],
     [3, true, 0],
   ])("maps %i projects to the correct limit state", (count, atLimit, remaining) => {
-    expect(projectUsage(count)).toEqual({ count, atLimit, remaining });
+    // exempt is false for a regular account; the admin case lives in
+    // project-limit-admin.test.ts.
+    expect(projectUsage(count)).toEqual({ count, atLimit, remaining, exempt: false });
     expect(PROJECT_LIMIT).toBe(2);
   });
 
