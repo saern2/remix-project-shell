@@ -500,20 +500,74 @@ export function maxIdleMatchingRounds(): number {
  * never resolves. Past the same threshold that governs a normal failure, the
  * corpus is broken rather than merely thin, and failing says so.
  */
-export function idleTerminalDecision(opts: { totalScenes: number; unmatchedScenes: number }): {
+/**
+ * Work an invocation completed, by phase.
+ *
+ * The watchdog is driven by this whole object rather than by one counter. The
+ * first version counted only scenes assigned, which meant every corpus-building
+ * invocation looked idle — assignment does not begin until the corpus is
+ * complete, by design, so `scenesMatched` is legitimately 0 for the entire build
+ * phase. A 145-scene project needing ~12 invocations to build its corpus was
+ * killed after 3 while making perfectly steady progress.
+ *
+ * Any future phase that does real work while assigning no scenes must add its
+ * counter here. Nothing else changes: idleness is "every counter is zero", so a
+ * new phase is protected the moment it reports anything at all.
+ */
+export type MatchingProgress = {
+  /** Scenes or slots assigned a clip this invocation. */
+  scenesMatched: number;
+  /** Corpus cells searched and persisted this invocation. */
+  corpusCellsBuilt: number;
+};
+
+/**
+ * Whether an invocation advanced nothing at all.
+ *
+ * Deliberately "every counter is zero" rather than a check against named fields
+ * — that is what makes a new phase safe by default rather than one forgotten
+ * edit away from being mistaken for a stall.
+ */
+export function isIdleInvocation(progress: Record<string, number>): boolean {
+  const values = Object.values(progress);
+  if (values.length === 0) return true;
+  return values.every((value) => !Number.isFinite(value) || value <= 0);
+}
+
+/** Names the counters that advanced, so a log line can say what reset the count. */
+export function describeProgress(progress: Record<string, number>): string[] {
+  return Object.entries(progress)
+    .filter(([, value]) => Number.isFinite(value) && value > 0)
+    .map(([name, value]) => `${name}=${value}`);
+}
+
+/**
+ * What to do when matching has genuinely stopped making progress.
+ *
+ * `dominantReason` comes from the per-scene reason breakdown, so the message
+ * describes what actually happened. The first version always blamed the corpus
+ * for failing to supply footage — which was wrong, and misleading, in the one
+ * case it ever fired on.
+ */
+export function idleTerminalDecision(opts: {
+  totalScenes: number;
+  unmatchedScenes: number;
+  dominantReason?: string | null;
+}): {
   action: "complete" | "fail";
   reason: string;
 } {
   const threshold = unmatchedSceneFailureThreshold(opts.totalScenes);
+  const because = opts.dominantReason ? ` Most common reason: ${opts.dominantReason}.` : "";
   if (opts.unmatchedScenes < threshold) {
     return {
       action: "complete",
-      reason: `matching stopped making progress with ${opts.unmatchedScenes} of ${opts.totalScenes} scene(s) unmatched, which is below the ${threshold}-scene failure threshold`,
+      reason: `matching stopped making progress with ${opts.unmatchedScenes} of ${opts.totalScenes} scene(s) unmatched, which is below the ${threshold}-scene failure threshold.${because}`,
     };
   }
   return {
     action: "fail",
-    reason: `Matching stopped making progress with ${opts.unmatchedScenes} of ${opts.totalScenes} scene(s) still unmatched. Retry matching; if it recurs, the footage corpus could not supply these scenes.`,
+    reason: `Matching stopped making progress with ${opts.unmatchedScenes} of ${opts.totalScenes} scene(s) still unmatched.${because} Retry matching; if it recurs, contact support with the project id.`,
   };
 }
 
@@ -687,6 +741,8 @@ async function advanceFromMatchingFootage(projectId: string) {
     }
 
     if (reasons.size === 0) return;
+    dominantPendingReason =
+      [...reasons.entries()].sort((a, b) => b[1].length - a[1].length)[0]?.[0] ?? null;
     console.info(`[${opts.label}] why pending scenes are still pending`, {
       projectId,
       pending: opts.pendingIds.length,
@@ -711,16 +767,34 @@ async function advanceFromMatchingFootage(projectId: string) {
    * pending set and the completion check disagree — whatever the reason for the
    * disagreement.
    */
+  /**
+   * The reason most pending scenes gave last time explainPending ran. Feeds the
+   * terminal message so it describes what actually happened rather than assuming.
+   */
+  let dominantPendingReason: string | null = null;
+
   const noteProgress = async (opts: {
-    matchedThisInvocation: number;
+    progress: MatchingProgress;
     unmatchedScenes: number;
     totalScenes: number;
     priorIdleRounds: number;
     label: string;
   }): Promise<{ status: string; error_message: string | null } | null> => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const advanced = describeProgress(opts.progress);
+    const limit = maxIdleMatchingRounds();
 
-    if (opts.matchedThisInvocation > 0) {
+    if (!isIdleInvocation(opts.progress)) {
+      // Always logged, whether or not the counter needed resetting, so a
+      // misfiring watchdog is visible from one invocation rather than only from
+      // a failed project.
+      console.info(`[${opts.label}] invocation made progress`, {
+        projectId,
+        advanced,
+        idleRoundsBefore: opts.priorIdleRounds,
+        idleRoundsAfter: 0,
+        idleLimit: limit,
+      });
       if (opts.priorIdleRounds !== 0) {
         await supabaseAdmin
           .from("projects")
@@ -736,19 +810,22 @@ async function advanceFromMatchingFootage(projectId: string) {
       .update({ matching_idle_rounds: idleRounds })
       .eq("id", projectId);
 
-    const limit = maxIdleMatchingRounds();
-    console.warn(`[${opts.label}] invocation matched nothing`, {
+    console.warn(`[${opts.label}] invocation advanced nothing`, {
       projectId,
-      idleRounds,
+      progress: opts.progress,
+      idleRoundsBefore: opts.priorIdleRounds,
+      idleRoundsAfter: idleRounds,
       idleLimit: limit,
       unmatchedScenes: opts.unmatchedScenes,
       totalScenes: opts.totalScenes,
+      dominantPendingReason,
     });
     if (idleRounds < limit) return null;
 
     const decision = idleTerminalDecision({
       totalScenes: opts.totalScenes,
       unmatchedScenes: opts.unmatchedScenes,
+      dominantReason: dominantPendingReason,
     });
     console.error(`[${opts.label}] giving up after ${idleRounds} idle invocations`, {
       projectId,
@@ -780,6 +857,11 @@ async function advanceFromMatchingFootage(projectId: string) {
     throw err;
   }
   if (!lockHeld) {
+    // Returns BEFORE the progress watchdog, deliberately. This invocation did no
+    // work because a peer is doing it — that is the single-flight guard working,
+    // not a stall. Counting it would let a busy project with overlapping polls
+    // accumulate idle rounds while another invocation is actively matching.
+    console.info("[matching_footage] peer holds the lock; no work attempted", { projectId });
     return {
       status: "matching_footage",
       error_message: null,
@@ -1036,7 +1118,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       const memo = getCachedCorpus(projectId);
       if (memo) {
         profile.count("corpusCacheHit");
-        return { corpus: memo, complete: true as const, remaining: 0 };
+        return { corpus: memo, complete: true as const, remaining: 0, cellsBuilt: 0 };
       }
 
       const corpusStartedAt = Date.now();
@@ -1046,11 +1128,14 @@ async function advanceFromMatchingFootage(projectId: string) {
       }
       profile.add("corpusLoad", Date.now() - corpusStartedAt);
 
+      // Counted and returned so the progress watchdog can see that the corpus
+      // phase advanced even though no scene was assigned.
+      let cellsBuilt = 0;
       let pending = pendingCorpusWork(corpus, corpusProviders);
       profile.count("corpusCellsPending", pending.length);
       if (pending.length === 0) {
         cacheCompleteCorpus(projectId, corpus);
-        return { corpus, complete: true as const, remaining: 0 };
+        return { corpus, complete: true as const, remaining: 0, cellsBuilt: 0 };
       }
 
       stockSession = stockSession ?? (await createStockSearchSession(profile));
@@ -1070,6 +1155,7 @@ async function advanceFromMatchingFootage(projectId: string) {
           session: stockSession ?? undefined,
         });
         byId.set(updated.id, updated);
+        cellsBuilt += 1;
         profile.count("corpusCellsBuilt");
         budget.recordSlice(Date.now() - cellStartedAt);
         pending = pendingCorpusWork([...byId.values()], corpusProviders);
@@ -1079,10 +1165,10 @@ async function advanceFromMatchingFootage(projectId: string) {
       if (pending.length > 0) {
         // Deliberately NOT cached: a partial corpus in memory would let the next
         // invocation decide what work remains from a stale copy.
-        return { corpus: rebuilt, complete: false as const, remaining: pending.length };
+        return { corpus: rebuilt, complete: false as const, remaining: pending.length, cellsBuilt };
       }
       cacheCompleteCorpus(projectId, rebuilt);
-      return { corpus: rebuilt, complete: true as const, remaining: 0 };
+      return { corpus: rebuilt, complete: true as const, remaining: 0, cellsBuilt };
     };
 
     if (fixedDuration != null && fixedDuration > 0) {
@@ -1234,7 +1320,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         // Every matching_footage exit passes through the progress watchdog, so a
         // stage that stops advancing terminates instead of polling forever.
         const terminal = await noteProgress({
-          matchedThisInvocation: 0,
+          progress: { scenesMatched: 0, corpusCellsBuilt: corpusState.cellsBuilt },
           unmatchedScenes: pendingSlots.length,
           totalScenes: expectedSlots.length,
           priorIdleRounds: project.matching_idle_rounds ?? 0,
@@ -1358,7 +1444,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         // Every matching_footage exit passes through the progress watchdog, so a
         // stage that stops advancing terminates instead of polling forever.
         const terminal = await noteProgress({
-          matchedThisInvocation: processedSlots,
+          progress: { scenesMatched: processedSlots, corpusCellsBuilt: corpusState.cellsBuilt },
           unmatchedScenes: pendingSlots.length - processedSlots,
           totalScenes: expectedSlots.length,
           priorIdleRounds: project.matching_idle_rounds ?? 0,
@@ -1641,7 +1727,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       // Every matching_footage exit passes through the progress watchdog, so a
       // stage that stops advancing terminates instead of polling forever.
       const terminal = await noteProgress({
-        matchedThisInvocation: 0,
+        progress: { scenesMatched: 0, corpusCellsBuilt: corpusState.cellsBuilt },
         unmatchedScenes: pending.length,
         totalScenes: scenes.length,
         priorIdleRounds: project.matching_idle_rounds ?? 0,
@@ -1756,7 +1842,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       // Every matching_footage exit passes through the progress watchdog, so a
       // stage that stops advancing terminates instead of polling forever.
       const terminal = await noteProgress({
-        matchedThisInvocation: processedScenes,
+        progress: { scenesMatched: processedScenes, corpusCellsBuilt: corpusState.cellsBuilt },
         unmatchedScenes: pending.length - processedScenes,
         totalScenes: scenes.length,
         priorIdleRounds: project.matching_idle_rounds ?? 0,
