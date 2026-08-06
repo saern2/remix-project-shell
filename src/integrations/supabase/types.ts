@@ -501,6 +501,7 @@ export type Database = {
           created_at: string
           error_message: string | null
           id: string
+          matching_idle_rounds: number
           matching_lock_at: string | null
           name: string
           niche: string
@@ -517,6 +518,7 @@ export type Database = {
           created_at?: string
           error_message?: string | null
           id?: string
+          matching_idle_rounds?: number
           matching_lock_at?: string | null
           name?: string
           niche?: string
@@ -533,6 +535,7 @@ export type Database = {
           created_at?: string
           error_message?: string | null
           id?: string
+          matching_idle_rounds?: number
           matching_lock_at?: string | null
           name?: string
           niche?: string

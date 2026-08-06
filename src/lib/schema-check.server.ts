@@ -48,7 +48,7 @@ export const REQUIRED_SCHEMA: Array<{
   },
   {
     table: "projects",
-    columns: ["matching_lock_at", "niche", "pipeline_cancel_requested_at", "clip_duration_seconds"],
+    columns: ["matching_lock_at", "matching_idle_rounds", "niche", "pipeline_cancel_requested_at"],
     migration:
       "20260804000001_matching_footage_advisory_lock / 20260731000001_project_niche_nasa_provider",
   },

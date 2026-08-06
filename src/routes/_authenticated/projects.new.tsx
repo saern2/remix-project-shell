@@ -31,6 +31,12 @@ import {
   PROJECT_LIMIT_MESSAGE,
   projectUsage,
 } from "@/lib/project-limit";
+import {
+  checkAudioLength,
+  formatDuration,
+  MAX_AUDIO_DURATION_SECONDS,
+  readAudioDuration,
+} from "@/lib/audio-limits";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -98,6 +104,16 @@ function NewProject() {
     }
     if (file.size > MAX_BYTES) {
       toast.error("File is larger than 500 MB.");
+      return;
+    }
+
+    // Length is checked before the project row is created, so an over-long file
+    // costs nothing — no row, no upload, no transcription bill.
+    const durationSeconds = await readAudioDuration(file);
+    const lengthCheck = checkAudioLength(durationSeconds);
+    if (!lengthCheck.ok) {
+      setBusy(false);
+      toast.error(lengthCheck.message);
       return;
     }
 
@@ -325,6 +341,10 @@ function NewProject() {
                   onChange={(e) => setFile(e.target.files?.[0] ?? null)}
                   className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-medium file:text-secondary-foreground hover:file:bg-secondary/80"
                 />
+                <p className="text-xs text-muted-foreground">
+                  Up to 500 MB and {formatDuration(MAX_AUDIO_DURATION_SECONDS)} of narration. Longer
+                  scripts should be split into separate projects.
+                </p>
                 {file ? (
                   <p className="mt-2 text-xs text-muted-foreground">
                     {file.name} — {(file.size / 1024 / 1024).toFixed(1)} MB

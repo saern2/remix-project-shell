@@ -478,6 +478,45 @@ type FallbackEvent = {
  * The floor of 2 is the hard promise: a single scene NEVER fails a project, at
  * any project size. MATCHING_MAX_UNMATCHED_FRACTION overrides the 10%.
  */
+/**
+ * Consecutive invocations that may match nothing before the stage gives up.
+ *
+ * The 524-scene deadlock needed no bug at all to recur — only a pending set that
+ * cannot be satisfied and an unmatched count below the failure threshold. Three
+ * idle rounds is enough to distinguish "the budget ran out before this slice
+ * finished" from "this will never progress", without ending a slow but healthy
+ * run.
+ */
+export function maxIdleMatchingRounds(): number {
+  const configured = Number(process.env.MATCHING_MAX_IDLE_ROUNDS ?? 3);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 3;
+}
+
+/**
+ * What to do when matching has stopped making progress.
+ *
+ * Completing with a few unmatched scenes beats a project that polls forever:
+ * the render tolerates gaps far better than a user tolerates a spinner that
+ * never resolves. Past the same threshold that governs a normal failure, the
+ * corpus is broken rather than merely thin, and failing says so.
+ */
+export function idleTerminalDecision(opts: { totalScenes: number; unmatchedScenes: number }): {
+  action: "complete" | "fail";
+  reason: string;
+} {
+  const threshold = unmatchedSceneFailureThreshold(opts.totalScenes);
+  if (opts.unmatchedScenes < threshold) {
+    return {
+      action: "complete",
+      reason: `matching stopped making progress with ${opts.unmatchedScenes} of ${opts.totalScenes} scene(s) unmatched, which is below the ${threshold}-scene failure threshold`,
+    };
+  }
+  return {
+    action: "fail",
+    reason: `Matching stopped making progress with ${opts.unmatchedScenes} of ${opts.totalScenes} scene(s) still unmatched. Retry matching; if it recurs, the footage corpus could not supply these scenes.`,
+  };
+}
+
 export function unmatchedSceneFailureThreshold(totalScenes: number): number {
   const configured = Number(process.env.MATCHING_MAX_UNMATCHED_FRACTION ?? 0.1);
   const fraction = Number.isFinite(configured) && configured > 0 ? configured : 0.1;
@@ -604,6 +643,133 @@ async function advanceFromMatchingFootage(projectId: string) {
     ...profile.summary(),
   });
 
+  /**
+   * Explains, per pending scene, why it was not matched this invocation.
+   *
+   * The 524-scene deadlock cost hours because the logs could not distinguish
+   * "tried and failed" from "never tried". Those are opposite problems — one is
+   * a supply issue, the other a work-list issue — and the log said the same
+   * thing for both. This names which it was, for every scene still outstanding.
+   *
+   * Capped, because a stuck 524-scene project would otherwise write hundreds of
+   * lines per poll; the reason COUNTS are always complete even when the id list
+   * is truncated.
+   */
+  const explainPending = (opts: {
+    label: string;
+    pendingIds: string[];
+    attemptedIds: Set<string>;
+    unmatchedIds: Set<string>;
+    hasVisualQuery: (sceneId: string) => boolean;
+    inCorpus: (sceneId: string) => boolean;
+  }) => {
+    const reasons = new Map<string, string[]>();
+    const add = (reason: string, sceneId: string) => {
+      const list = reasons.get(reason) ?? [];
+      list.push(sceneId);
+      reasons.set(reason, list);
+    };
+
+    for (const sceneId of opts.pendingIds) {
+      if (!opts.hasVisualQuery(sceneId)) {
+        add("no visual_query — the scene was never given a search query", sceneId);
+      } else if (!opts.inCorpus(sceneId)) {
+        // The tail case: clustered before this scene existed, so it belongs to
+        // no bucket and has no candidate pool to draw from.
+        add("not in any corpus bucket — clustering predates this scene", sceneId);
+      } else if (opts.unmatchedIds.has(sceneId)) {
+        add("attempted, but no tier could supply a renderable clip", sceneId);
+      } else if (!opts.attemptedIds.has(sceneId)) {
+        add("NEVER ATTEMPTED — pending, in the corpus, but not reached this invocation", sceneId);
+      } else {
+        add("attempted and assigned, but the write did not settle", sceneId);
+      }
+    }
+
+    if (reasons.size === 0) return;
+    console.info(`[${opts.label}] why pending scenes are still pending`, {
+      projectId,
+      pending: opts.pendingIds.length,
+      breakdown: Object.fromEntries(
+        [...reasons].map(([reason, ids]) => [
+          reason,
+          { count: ids.length, sample: ids.slice(0, 10) },
+        ]),
+      ),
+    });
+  };
+
+  /**
+   * Records whether this invocation matched anything, and stops the stage when
+   * several in a row have not.
+   *
+   * Called on every path that would otherwise return matching_footage. Returns a
+   * terminal result when the stage must end, or null to keep polling.
+   *
+   * This is the guarantee that was missing: every exit from matching_footage now
+   * reaches ready or failed. A project can no longer poll forever because the
+   * pending set and the completion check disagree — whatever the reason for the
+   * disagreement.
+   */
+  const noteProgress = async (opts: {
+    matchedThisInvocation: number;
+    unmatchedScenes: number;
+    totalScenes: number;
+    priorIdleRounds: number;
+    label: string;
+  }): Promise<{ status: string; error_message: string | null } | null> => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    if (opts.matchedThisInvocation > 0) {
+      if (opts.priorIdleRounds !== 0) {
+        await supabaseAdmin
+          .from("projects")
+          .update({ matching_idle_rounds: 0 })
+          .eq("id", projectId);
+      }
+      return null;
+    }
+
+    const idleRounds = opts.priorIdleRounds + 1;
+    await supabaseAdmin
+      .from("projects")
+      .update({ matching_idle_rounds: idleRounds })
+      .eq("id", projectId);
+
+    const limit = maxIdleMatchingRounds();
+    console.warn(`[${opts.label}] invocation matched nothing`, {
+      projectId,
+      idleRounds,
+      idleLimit: limit,
+      unmatchedScenes: opts.unmatchedScenes,
+      totalScenes: opts.totalScenes,
+    });
+    if (idleRounds < limit) return null;
+
+    const decision = idleTerminalDecision({
+      totalScenes: opts.totalScenes,
+      unmatchedScenes: opts.unmatchedScenes,
+    });
+    console.error(`[${opts.label}] giving up after ${idleRounds} idle invocations`, {
+      projectId,
+      action: decision.action,
+      reason: decision.reason,
+      unmatchedScenes: opts.unmatchedScenes,
+      totalScenes: opts.totalScenes,
+    });
+
+    if (decision.action === "complete") {
+      await supabaseAdmin
+        .from("projects")
+        .update({ status: "ready", error_message: null, matching_idle_rounds: 0 })
+        .eq("id", projectId);
+      return { status: "ready", error_message: null };
+    }
+    await markProjectFailed(projectId, decision.reason);
+    await supabaseAdmin.from("projects").update({ matching_idle_rounds: 0 }).eq("id", projectId);
+    return { status: "failed", error_message: decision.reason };
+  };
+
   // Single-flight guard: if a peer poll is already matching this project, do not
   // start duplicate work — return matching_footage so the client keeps polling.
   let lockHeld = false;
@@ -640,7 +806,9 @@ async function advanceFromMatchingFootage(projectId: string) {
     const projectStartedAt = Date.now();
     const { data: project, error: pErr } = await supabaseAdmin
       .from("projects")
-      .select("id, aspect_ratio, clip_duration_seconds, niche, pipeline_cancel_requested_at")
+      .select(
+        "id, aspect_ratio, clip_duration_seconds, niche, pipeline_cancel_requested_at, matching_idle_rounds",
+      )
       .eq("id", projectId)
       .maybeSingle();
     profile.add("projectRead", Date.now() - projectStartedAt);
@@ -655,19 +823,56 @@ async function advanceFromMatchingFootage(projectId: string) {
     // longer selected, visual_query is read separately, and the result is held in
     // the process cache because scenes cannot change while matching runs.
     const readScenes = async () => {
+      // The scene COUNT is always read from the database, even on a cache hit.
+      //
+      // This is the split that produced the 524-scene deadlock. The pending set
+      // was computed from a cached scene list while completion was judged
+      // against the real table, and the two disagreed: matching had begun while
+      // scene generation was still writing rows, so the process cached a short
+      // list and every later invocation reused it. The unmatched scenes were the
+      // contiguous tail — exactly the rows written after the snapshot.
+      //
+      // One HEAD count is a few milliseconds and makes the disagreement
+      // impossible: a cached list that does not match the table is discarded.
+      const startedAt = Date.now();
+      const { count: sceneCount, error: countError } = await supabaseAdmin
+        .from("scenes")
+        .select("id", { count: "exact", head: true })
+        .eq("project_id", projectId);
+      if (countError) throw new Error(countError.message);
+      profile.add("sceneRead", Date.now() - startedAt);
+      profile.count("sceneCountFromDb", sceneCount ?? 0);
+
       const cached = getCachedScenes(projectId);
-      if (cached) {
+      if (cached && cached.length === (sceneCount ?? -1)) {
         profile.count("sceneCacheHit");
         return cached;
       }
-      const startedAt = Date.now();
+      if (cached) {
+        console.warn("[matching_footage] cached scene list disagreed with the database", {
+          projectId,
+          cachedScenes: cached.length,
+          databaseScenes: sceneCount ?? null,
+        });
+        profile.count("sceneCacheStale");
+      }
+
+      const readStartedAt = Date.now();
       const { data, error } = await supabaseAdmin
         .from("scenes")
         .select("id, idx, start_ts, end_ts")
         .eq("project_id", projectId)
         .order("idx", { ascending: true });
-      profile.add("sceneRead", Date.now() - startedAt);
+      profile.add("sceneRead", Date.now() - readStartedAt);
       if (error) throw new Error(error.message);
+
+      // A short read is a truncated page, not a smaller project. Caching it
+      // would reintroduce exactly the defect above.
+      if (data && data.length !== (sceneCount ?? data.length)) {
+        throw new Error(
+          `Scene list truncated: read ${data.length} of ${sceneCount} scenes. The project is too large for a single query page.`,
+        );
+      }
       if (data && data.length > 0) cacheScenes(projectId, data);
       return data ?? [];
     };
@@ -1026,6 +1231,16 @@ async function advanceFromMatchingFootage(projectId: string) {
           corpusCellsRemaining: corpusState.remaining,
           ...telemetry,
         });
+        // Every matching_footage exit passes through the progress watchdog, so a
+        // stage that stops advancing terminates instead of polling forever.
+        const terminal = await noteProgress({
+          matchedThisInvocation: 0,
+          unmatchedScenes: pendingSlots.length,
+          totalScenes: expectedSlots.length,
+          priorIdleRounds: project.matching_idle_rounds ?? 0,
+          label: "matching_footage:fixed-duration:corpus",
+        });
+        if (terminal) return terminal;
         return { status: "matching_footage", error_message: null, matching: telemetry };
       }
 
@@ -1140,6 +1355,16 @@ async function advanceFromMatchingFootage(projectId: string) {
           projectId,
           ...telemetry,
         });
+        // Every matching_footage exit passes through the progress watchdog, so a
+        // stage that stops advancing terminates instead of polling forever.
+        const terminal = await noteProgress({
+          matchedThisInvocation: processedSlots,
+          unmatchedScenes: pendingSlots.length - processedSlots,
+          totalScenes: expectedSlots.length,
+          priorIdleRounds: project.matching_idle_rounds ?? 0,
+          label: "matching_footage:fixed-duration",
+        });
+        if (terminal) return terminal;
         return { status: "matching_footage", error_message: null, matching: telemetry };
       }
 
@@ -1322,9 +1547,17 @@ async function advanceFromMatchingFootage(projectId: string) {
         providerClipId,
         Number(selection.in_point),
       );
+      // The scene is SELECTED either way — it has a row in selected_clips, which
+      // is what "already matched" means. Only the reservation is skipped when a
+      // duplicate, so uniqueness accounting stays right.
+      //
+      // Previously the `continue` skipped alreadySelected too, so a scene whose
+      // clip collided with an earlier one was pending forever: re-matched every
+      // invocation, re-writing the same colliding selection, never progressing.
+      // That is the second way this stage could spin without advancing.
+      alreadySelected.add(row.scene_id);
       if (usedIds.has(reservation)) continue;
       usedIds.add(reservation);
-      alreadySelected.add(row.scene_id);
     }
 
     const { buildSceneTimelineSlots } = await import("@/lib/clip-slices.server");
@@ -1405,6 +1638,16 @@ async function advanceFromMatchingFootage(projectId: string) {
         corpusCellsRemaining: corpusState.remaining,
         ...telemetry,
       });
+      // Every matching_footage exit passes through the progress watchdog, so a
+      // stage that stops advancing terminates instead of polling forever.
+      const terminal = await noteProgress({
+        matchedThisInvocation: 0,
+        unmatchedScenes: pending.length,
+        totalScenes: scenes.length,
+        priorIdleRounds: project.matching_idle_rounds ?? 0,
+        label: "matching_footage:plain:corpus",
+      });
+      if (terminal) return terminal;
       return { status: "matching_footage", error_message: null, matching: telemetry };
     }
 
@@ -1465,6 +1708,18 @@ async function advanceFromMatchingFootage(projectId: string) {
       budget.recordSlice(Date.now() - sliceStartedAt);
     }
 
+    {
+      const corpusDemandIds = new Set(corpusState.corpus.flatMap((bucket) => bucket.demandIds));
+      explainPending({
+        label: "matching_footage:plain",
+        pendingIds: pending.slice(processedScenes).map((scene) => scene.id),
+        attemptedIds: new Set(pending.slice(0, processedScenes).map((scene) => scene.id)),
+        unmatchedIds: unmatchedSceneIds,
+        hasVisualQuery: (id) => visualQueryByScene.has(id),
+        inCorpus: (id) => corpusDemandIds.has(id),
+      });
+    }
+
     if (unmatchedSceneIds.size > 0) {
       // Not a uniqueness failure: a scene only lands here when the corpus holds
       // nothing RENDERABLE for it under any of the four tiers — the last of
@@ -1498,6 +1753,16 @@ async function advanceFromMatchingFootage(projectId: string) {
         projectId,
         ...telemetry,
       });
+      // Every matching_footage exit passes through the progress watchdog, so a
+      // stage that stops advancing terminates instead of polling forever.
+      const terminal = await noteProgress({
+        matchedThisInvocation: processedScenes,
+        unmatchedScenes: pending.length - processedScenes,
+        totalScenes: scenes.length,
+        priorIdleRounds: project.matching_idle_rounds ?? 0,
+        label: "matching_footage:plain",
+      });
+      if (terminal) return terminal;
       return { status: "matching_footage", error_message: null, matching: telemetry };
     }
 

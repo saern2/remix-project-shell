@@ -904,6 +904,14 @@ alter table public.render_jobs drop constraint if exists render_jobs_status_chec
 alter table public.render_jobs add constraint render_jobs_status_check
   check (status in ('queued', 'downloading', 'rendering', 'completed', 'failed', 'cancelled'));
 
+-- ── 20260808000001: matching progress watchdog ──────────────────────────────
+
+alter table public.projects
+  add column if not exists matching_idle_rounds integer not null default 0;
+
+comment on column public.projects.matching_idle_rounds is
+  'Consecutive matching_footage invocations that matched zero new scenes. When it reaches the configured limit the stage terminates, so matching can never loop indefinitely.';
+
 -- ── 20260807000001: passwordless sign-in ────────────────────────────────────
 
 alter table public.access_activations
@@ -1024,5 +1032,6 @@ from (
     ('admins exempt from limit',         exists (select 1 from pg_proc where proname='enforce_two_project_limit' and prosrc like '%role = ''admin''%')),
     ('auth_login_codes (table)',         to_regclass('public.auth_login_codes') is not null),
     ('auth_login_failures (table)',      to_regclass('public.auth_login_failures') is not null),
-    ('access_activations.trusted_until', exists (select 1 from information_schema.columns where table_schema='public' and table_name='access_activations' and column_name='trusted_until'))
+    ('access_activations.trusted_until', exists (select 1 from information_schema.columns where table_schema='public' and table_name='access_activations' and column_name='trusted_until')),
+    ('projects.matching_idle_rounds',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='projects' and column_name='matching_idle_rounds'))
 ) as checks(check_name, present);
