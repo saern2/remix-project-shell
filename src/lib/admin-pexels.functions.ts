@@ -67,10 +67,9 @@ export const uploadPexelsKeysResilient = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
     z
-      .object({
-        csv: z.string().min(1).max(200_000),
-        safetyThreshold: z.number().int().min(1).max(100).default(5),
-      })
+      // safetyThreshold is gone: it gated a replacement that no longer happens.
+      // The pool floor it became is a display preference, not an upload input.
+      .object({ csv: z.string().min(1).max(200_000) })
       .parse(input),
   )
   .handler(async ({ data, context }) => {

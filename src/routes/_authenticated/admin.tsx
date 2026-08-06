@@ -38,6 +38,13 @@ import {
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "sonner";
+import {
+  DEFAULT_POOL_FLOOR,
+  describePoolHealth,
+  normalizePoolFloor,
+  POOL_FLOOR_STORAGE_KEY,
+  shouldWarnAboutPool,
+} from "@/lib/pexels-pool-health";
 import { ArrowLeft, Loader2, RefreshCw, Upload, ShieldCheck, Trash2 } from "lucide-react";
 
 export const Route = createFileRoute("/_authenticated/admin")({
@@ -525,7 +532,16 @@ function KeysTab() {
   const [previewResult, setPreviewResult] = useState<Awaited<ReturnType<typeof preview>> | null>(
     null,
   );
-  const [safetyThreshold, setSafetyThreshold] = useState(5);
+  /**
+   * The pool floor. Formerly "safety threshold", an upload gate — uploads are
+   * additive now and cannot take capacity away, so there is nothing to gate.
+   * The number does real work here instead: it is the level below which the
+   * pool is flagged as too thin.
+   */
+  const [poolFloor, setPoolFloor] = useState(() => {
+    if (typeof window === "undefined") return DEFAULT_POOL_FLOOR;
+    return normalizePoolFloor(window.localStorage.getItem(POOL_FLOOR_STORAGE_KEY));
+  });
 
   // Phase 2: upload state
   const [uploading, setUploading] = useState(false);
@@ -564,7 +580,7 @@ function KeysTab() {
     setUploading(true);
     setReport(null);
     try {
-      const res = await upload({ data: { csv: pendingCsv, safetyThreshold } });
+      const res = await upload({ data: { csv: pendingCsv } });
       setReport(res);
       setPreviewResult(null);
       setPendingCsv(null);
@@ -580,15 +596,70 @@ function KeysTab() {
     }
   }
 
+  const activeKeyCount = (data ?? []).filter((key) => key.is_active).length;
+  const poolHealth = describePoolHealth(activeKeyCount, poolFloor);
+
   return (
     <div className="space-y-4">
+      {/* The pool does not shrink from uploads — it shrinks from keys expiring,
+          being revoked at Pexels, or dying mid-run. None of that announces
+          itself, so the floor is the only thing that makes it visible before
+          matching starts failing to find footage. */}
+      {!isPending && shouldWarnAboutPool(poolHealth) ? (
+        <div
+          role="alert"
+          className={`rounded-md border p-4 ${
+            poolHealth.level === "empty"
+              ? "border-destructive/40 bg-destructive/10"
+              : "border-amber-300 bg-amber-50 text-amber-900"
+          }`}
+        >
+          <p className="text-sm font-medium">{poolHealth.headline}</p>
+          <p className="mt-1 text-xs">{poolHealth.detail}</p>
+        </div>
+      ) : null}
+
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Upload keys (CSV)</CardTitle>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <CardTitle className="text-base">Pool health</CardTitle>
+              <CardDescription>{poolHealth.headline}</CardDescription>
+            </div>
+            <div className="flex items-center gap-2 text-sm">
+              <label htmlFor="pool-floor" className="whitespace-nowrap text-muted-foreground">
+                Warn when active keys fall below
+              </label>
+              <input
+                id="pool-floor"
+                type="number"
+                min={1}
+                max={100}
+                value={poolFloor}
+                onChange={(e) => {
+                  const next = normalizePoolFloor(e.target.value);
+                  setPoolFloor(next);
+                  try {
+                    window.localStorage.setItem(POOL_FLOOR_STORAGE_KEY, String(next));
+                  } catch {
+                    // Private browsing or a hardened profile: the floor still
+                    // applies for this session, it just will not be remembered.
+                  }
+                }}
+                className="w-16 rounded-md border px-2 py-1 text-sm"
+              />
+            </div>
+          </div>
+        </CardHeader>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Add keys</CardTitle>
           <CardDescription>
-            Accepts newline-separated, comma-separated, or mixed format. Each key is tested against
-            the live Pexels API. Old active keys are only deactivated if the new batch meets the
-            safety threshold.
+            Upload a CSV or paste keys directly — newline-separated, comma-separated, or mixed. Each
+            is tested against the live Pexels API before being added. Keys already in the pool are
+            never removed or deactivated by adding more.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -667,14 +738,14 @@ function KeysTab() {
                   </Button>
                   <Button size="sm" onClick={handleCommit} disabled={uploading}>
                     {uploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                    Validate &amp; upload (threshold: {safetyThreshold})
+                    Validate &amp; add keys
                   </Button>
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                If ≥ {safetyThreshold} key{safetyThreshold !== 1 ? "s" : ""} pass Pexels validation,
-                all currently-active keys will be deactivated and the new ones activated. If fewer
-                pass, the old pool stays untouched.
+                Each key is validated against Pexels. Those that pass are added, or reactivated if
+                they were already in the pool but inactive. Existing keys are never removed or
+                deactivated by an upload — use Prune for that.
               </p>
               <div className="max-h-48 overflow-y-auto">
                 <Table>
