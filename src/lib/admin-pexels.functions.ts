@@ -117,10 +117,22 @@ export const uploadPexelsKeysResilient = createServerFn({ method: "POST" })
       pexelsKeyActiveAfterValidation(false, validations.get(key)?.status ?? "unverified"),
     );
     const validNew = newKeys.filter((key) => validations.get(key)?.status === "valid");
-    const usableCount = activeKeys.length + validInactive.length + validNew.length;
-    const safetyThresholdMet = usableCount >= data.safetyThreshold;
     let reactivated = 0;
     let inserted = 0;
+
+    // ── ADDITIVE ONLY ────────────────────────────────────────────────────────
+    //
+    // This used to be a REPLACE: after a batch met a safety threshold, every
+    // active key NOT in the upload was deactivated with "Replaced by validated
+    // upload batch". Adding two keys silently retired the rest of the pool.
+    //
+    // An upload now only ever adds or reactivates. Removing a key is a separate,
+    // explicit action, because losing the pool to a routine top-up is not a
+    // mistake anyone should be able to make by accident.
+    //
+    // The old safety threshold also gated INSERTS, so a small upload validated
+    // its keys and then discarded them. Nothing is gated now: a valid key that
+    // was uploaded gets added.
 
     for (const key of validInactive) {
       const row = existingByKey.get(key);
@@ -134,59 +146,33 @@ export const uploadPexelsKeysResilient = createServerFn({ method: "POST" })
       if (!updateError) reactivated++;
     }
 
-    if (safetyThresholdMet) {
-      const incomingExistingIds = [...activeKeys, ...validInactive].flatMap((key) => {
-        const row = existingByKey.get(key);
-        return row ? [row.id] : [];
+    for (const key of validNew) {
+      const { error } = await supabaseAdmin
+        .from("pexels_api_keys")
+        .insert({ api_key: key, is_active: true });
+      results.push({
+        line: parsed.indexOf(key) + 1,
+        masked: maskKey(key),
+        status: error ? "error" : "inserted",
+        detail: error?.message ?? "New key passed validation and was activated.",
       });
-      const activeOutsideUpload = (existing ?? []).filter(
-        (row) => row.is_active && !incomingExistingIds.includes(row.id),
-      );
-      for (const row of activeOutsideUpload) {
-        const { error } = await supabaseAdmin
-          .from("pexels_api_keys")
-          .update({
-            is_active: false,
-            last_error: "Replaced by validated upload batch",
-            last_error_at: new Date().toISOString(),
-          })
-          .eq("id", row.id);
-        if (error) throw new Error(`Failed to deactivate an old key: ${error.message}`);
-      }
-      for (const key of validNew) {
-        const { error } = await supabaseAdmin
-          .from("pexels_api_keys")
-          .insert({ api_key: key, is_active: true });
-        results.push({
-          line: parsed.indexOf(key) + 1,
-          masked: maskKey(key),
-          status: error ? "error" : "inserted",
-          detail: error?.message ?? "New key passed validation and was activated.",
-        });
-        if (!error) inserted++;
-      }
-    } else {
-      for (const key of validNew) {
-        results.push({
-          line: parsed.indexOf(key) + 1,
-          masked: maskKey(key),
-          status: "unverified",
-          detail: "Valid key was not inserted because the replacement threshold was not met.",
-        });
-      }
+      if (!error) inserted++;
     }
 
+    const { count: activePoolSize } = await supabaseAdmin
+      .from("pexels_api_keys")
+      .select("id", { count: "exact", head: true })
+      .eq("is_active", true);
+
     return {
-      committed: safetyThresholdMet,
-      safetyThresholdMet,
-      validCount: usableCount,
-      threshold: data.safetyThreshold,
-      warning: safetyThresholdMet
-        ? null
-        : `Only ${usableCount} incoming keys are usable (threshold: ${data.safetyThreshold}). Existing active keys were retained.`,
+      // Always committed: an upload cannot be rejected as a whole any more,
+      // because it can no longer take anything away.
+      committed: true as const,
+      activePoolSize: activePoolSize ?? 0,
       total: parsed.length,
       inserted,
       reactivated,
+      alreadyPresent: activeKeys.length,
       invalid: results.filter((row) => row.status === "invalid").length,
       unverified: results.filter((row) => row.status === "unverified").length,
       duplicates: results.filter((row) => row.status === "duplicate").length,

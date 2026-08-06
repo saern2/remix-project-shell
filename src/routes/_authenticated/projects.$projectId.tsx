@@ -6,11 +6,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
-import {
-  isMissingPollResult,
-  nextPollDelayMs,
-  pollIntervalWhileActive,
-} from "@/lib/polling-state";
+import { isMissingPollResult, nextPollDelayMs, pollIntervalWhileActive } from "@/lib/polling-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -38,6 +34,8 @@ import {
   Clock,
 } from "lucide-react";
 import { toast } from "sonner";
+import { describeMatchingProgress } from "@/lib/matching-progress";
+import { getMatchingProgress } from "@/lib/matching-progress.functions";
 
 export const Route = createFileRoute("/_authenticated/projects/$projectId")({
   component: ProjectDetail,
@@ -478,6 +476,18 @@ function ProjectDetail() {
     };
   }, [project?.status, projectId, queryClient, runPoll, project, navigate]);
 
+  const fetchMatchingProgress = useServerFn(getMatchingProgress);
+  const { data: matchingCounts } = useQuery({
+    queryKey: ["matching-progress", projectId],
+    queryFn: () => fetchMatchingProgress({ data: { projectIds: [projectId] } }),
+    // Only while it matters, and at the poll cadence — four HEAD counts.
+    enabled: project?.status === "matching_footage",
+    refetchInterval: () => (project?.status === "matching_footage" ? 3000 : false),
+  });
+  const matchingView = matchingCounts?.[projectId]
+    ? describeMatchingProgress(matchingCounts[projectId])
+    : null;
+
   const progressPct = useMemo(() => {
     if (!project) return 0;
     if (project.status === "failed") return 0;
@@ -564,6 +574,27 @@ function ProjectDetail() {
                 <CardTitle className="text-base">Progress</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
+                {/* Matching runs for minutes with nothing else to show — the
+                    corpus phase assigns no scenes at all, so the step list below
+                    sits still and reads as stalled. These are the numbers the
+                    poll already returns, said out loud. */}
+                {project.status === "matching_footage" && matchingView ? (
+                  <div className="space-y-2 rounded-md border bg-muted/30 p-3">
+                    <div className="flex flex-wrap items-baseline justify-between gap-2">
+                      <p className="text-sm font-medium">{matchingView.headline}</p>
+                      {matchingView.estimate ? (
+                        <p className="text-xs text-muted-foreground">
+                          {matchingView.estimate} (rough estimate)
+                        </p>
+                      ) : null}
+                    </div>
+                    <Progress
+                      value={matchingView.percent ?? 0}
+                      aria-label={matchingView.headline}
+                    />
+                    <p className="text-xs text-muted-foreground">{matchingView.detail}</p>
+                  </div>
+                ) : null}
                 <Progress value={progressPct} aria-label="Pipeline progress" />
                 <ul className="grid gap-2 text-sm sm:grid-cols-2">
                   {STATUS_STEPS.map((step) => {

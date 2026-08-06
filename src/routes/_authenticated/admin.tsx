@@ -520,6 +520,7 @@ function KeysTab() {
 
   // Phase 1: preview state
   const [pendingCsv, setPendingCsv] = useState<string | null>(null);
+  const [pastedKeys, setPastedKeys] = useState("");
   const [previewing, setPreviewing] = useState(false);
   const [previewResult, setPreviewResult] = useState<Awaited<ReturnType<typeof preview>> | null>(
     null,
@@ -537,12 +538,12 @@ function KeysTab() {
     queryFn: () => fetchKeys({}),
   });
 
-  async function handleFile(file: File) {
+  /** One path for both a chosen file and a pasted block. */
+  async function handleCsvText(csv: string) {
     setPreviewing(true);
     setPreviewResult(null);
     setReport(null);
     try {
-      const csv = await file.text();
       setPendingCsv(csv);
       const res = await preview({ data: { csv } });
       setPreviewResult(res);
@@ -552,6 +553,10 @@ function KeysTab() {
     } finally {
       setPreviewing(false);
     }
+  }
+
+  async function handleFile(file: File) {
+    await handleCsvText(await file.text());
   }
 
   async function handleCommit() {
@@ -565,11 +570,9 @@ function KeysTab() {
       setPendingCsv(null);
       await qc.invalidateQueries({ queryKey: ["admin-pexels-keys"] });
       await qc.invalidateQueries({ queryKey: ["admin-overview"] });
-      if (res.committed) {
-        toast.success(`${res.inserted} keys added and ${res.reactivated} reactivated`);
-      } else {
-        toast.warning(res.warning ?? "Upload did not meet safety threshold");
-      }
+      toast.success(
+        `${res.inserted} added, ${res.reactivated} reactivated, ${res.alreadyPresent} already present. Pool is now ${res.activePoolSize} active keys.`,
+      );
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Upload failed");
     } finally {
@@ -609,21 +612,33 @@ function KeysTab() {
                 }}
               />
             </label>
-            <div className="flex items-center gap-2 text-sm">
-              <label htmlFor="threshold" className="text-muted-foreground whitespace-nowrap">
-                Safety threshold (min valid keys before replacing pool):
-              </label>
-              <input
-                id="threshold"
-                type="number"
-                min={1}
-                max={100}
-                value={safetyThreshold}
-                onChange={(e) => setSafetyThreshold(Math.max(1, parseInt(e.target.value) || 1))}
-                className="w-16 rounded-md border px-2 py-1 text-sm"
-                disabled={uploading}
-              />
-            </div>
+          </div>
+
+          {/* Pasting is the common case: a CSV file is unnecessary friction for
+              two or three keys. The parser already splits on newlines and
+              commas, so both inputs take the same path. */}
+          <div className="space-y-2">
+            <label htmlFor="paste-keys" className="text-sm text-muted-foreground">
+              …or paste keys, one per line
+            </label>
+            <textarea
+              id="paste-keys"
+              rows={3}
+              value={pastedKeys}
+              onChange={(e) => setPastedKeys(e.target.value)}
+              disabled={previewing || uploading}
+              placeholder={"563492ad6f91700001000001…\n563492ad6f91700001000002…"}
+              className="w-full rounded-md border px-3 py-2 font-mono text-xs"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={previewing || uploading || pastedKeys.trim().length === 0}
+              onClick={() => void handleCsvText(pastedKeys)}
+            >
+              <Upload className="mr-2 h-4 w-4" />
+              Add pasted keys
+            </Button>
           </div>
 
           {/* Phase 1: Parse preview — admin confirms before committing */}
@@ -693,17 +708,13 @@ function KeysTab() {
           {/* Phase 2: Upload result */}
           {report && (
             <div className="space-y-3 rounded-md border p-4">
-              {report.committed ? (
-                <div className="flex items-center gap-2 text-sm font-medium text-green-600">
-                  ✓ Pool replaced: {report.inserted} keys activated, old keys deactivated
-                </div>
-              ) : (
-                <div className="rounded-md bg-amber-50 p-3 text-sm text-amber-800 border border-amber-200">
-                  ⚠ {report.warning}
-                </div>
-              )}
-              <div className="flex gap-4 text-sm text-muted-foreground">
-                <span>Valid: {report.validCount}</span>
+              <div className="flex items-center gap-2 text-sm font-medium text-green-600">
+                ✓ {report.inserted} added, {report.reactivated} reactivated — pool is now{" "}
+                {report.activePoolSize} active keys. No existing key was removed.
+              </div>
+              <div className="flex flex-wrap gap-4 text-sm text-muted-foreground">
+                <span>Added: {report.inserted}</span>
+                <span>Already present: {report.alreadyPresent}</span>
                 <span>Reactivated: {report.reactivated}</span>
                 <span>Invalid: {report.invalid}</span>
                 <span>Unverified: {report.unverified}</span>

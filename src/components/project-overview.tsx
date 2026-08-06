@@ -16,6 +16,9 @@ import {
 import { supabase } from "@/integrations/supabase/client";
 import { deleteProject } from "@/lib/deleteProject";
 import { useIsAdmin } from "@/hooks/use-is-admin";
+import { describeMatchingProgress, shortMatchingLabel } from "@/lib/matching-progress";
+import { getMatchingProgress } from "@/lib/matching-progress.functions";
+import { Progress } from "@/components/ui/progress";
 import {
   oldestProject,
   PROJECT_LIMIT,
@@ -103,6 +106,20 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
   const { isAdmin } = useIsAdmin();
   const usage = projectUsage(projects.length, { isAdmin });
   const oldest = oldestProject(projects);
+
+  // One request covering every matching project on the page, polled only while
+  // at least one is actually matching.
+  const matchingIds = projects
+    .filter((project) => project.status === "matching_footage")
+    .map((project) => project.id)
+    .slice(0, 20);
+  const fetchMatchingProgress = useServerFn(getMatchingProgress);
+  const { data: matchingCounts } = useQuery({
+    queryKey: ["matching-progress", matchingIds],
+    queryFn: () => fetchMatchingProgress({ data: { projectIds: matchingIds } }),
+    enabled: matchingIds.length > 0,
+    refetchInterval: matchingIds.length > 0 ? 4000 : false,
+  });
   const stats = summarizeProjectStatuses(projects);
 
   const confirmDelete = async () => {
@@ -255,14 +272,32 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
                     </span>
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">{project.name}</p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        Updated{" "}
-                        {formatDistanceToNow(new Date(project.updated_at), { addSuffix: true })} ·
-                        expires{" "}
-                        {formatDistanceToNow(addHours(new Date(project.created_at), 30), {
-                          addSuffix: true,
-                        })}
-                      </p>
+                      {/* "Updated a minute ago" is meaningless here: every poll
+                          touches updated_at even when it does no work. During
+                          matching, say what is actually happening instead. */}
+                      {project.status === "matching_footage" && matchingCounts?.[project.id] ? (
+                        <div className="mt-1 space-y-1">
+                          <p className="truncate text-xs text-muted-foreground">
+                            {shortMatchingLabel(matchingCounts[project.id])}
+                          </p>
+                          <Progress
+                            className="h-1"
+                            value={
+                              describeMatchingProgress(matchingCounts[project.id]).percent ?? 0
+                            }
+                            aria-label={shortMatchingLabel(matchingCounts[project.id])}
+                          />
+                        </div>
+                      ) : (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Updated{" "}
+                          {formatDistanceToNow(new Date(project.updated_at), { addSuffix: true })} ·
+                          expires{" "}
+                          {formatDistanceToNow(addHours(new Date(project.created_at), 30), {
+                            addSuffix: true,
+                          })}
+                        </p>
+                      )}
                     </div>
                   </div>
                 </Link>
