@@ -407,7 +407,7 @@ async function runFfmpeg({ jobId, clipInputs, audioPath, scriptPath, finalVideoL
       `-map`, `${finalVideoLabel}`,
       `-c:v`, `libx264`,
       `-pix_fmt`, `yuv420p`,
-      `-preset`, `veryfast`,
+      `-preset`, config.ffmpegPreset,
       `-crf`, `23`,
       `-threads`, String(config.ffmpegThreads),
       `-movflags`, `+faststart`,

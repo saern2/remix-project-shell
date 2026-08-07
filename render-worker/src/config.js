@@ -62,6 +62,31 @@ const config = {
   // time out deterministically (round 6, Issue 2).
   globalCdnConcurrency: intEnv('GLOBAL_CDN_CONCURRENCY', 4),
   ffmpegThreads: intEnv('FFMPEG_THREADS', 0),
+  /**
+   * x264 preset for CHUNK encodes. Stitch never re-encodes video, so this only
+   * affects chunk throughput and output size.
+   *
+   * DEFAULT STAYS veryfast, against the initial plan, because the measurement
+   * inverted the decision. Benchmarked at 1080p30 CRF 23, threads=2, on two
+   * different content types:
+   *
+   *                 high-detail            smooth/photographic
+   *   veryfast      20.9s   39.3 MB        26.2s    5.54 MB
+   *   superfast     17.4s   74.9 MB        15.2s   11.88 MB
+   *                 1.20x    1.91x         1.72x     2.14x
+   *
+   * superfast is 1.2-1.7x faster but produces roughly DOUBLE the bytes, on both
+   * content types. Outputs are already 1.2-1.4 GB and uploads were about 30% of
+   * wall-clock, so doubling the file adds more upload time than the encode
+   * saves: at the observed split, superfast is a net loss unless upload is under
+   * ~15% of the total.
+   *
+   * The benchmarks above are synthetic and were taken on different hardware, so
+   * the absolute throughput does not transfer — the SIZE RATIO is the part that
+   * does, and it reproduced across both sources. Settle it on real footage with
+   * scripts/preset-benchmark.sh, then set FFMPEG_PRESET if it disagrees.
+   */
+  ffmpegPreset: process.env.FFMPEG_PRESET || 'veryfast',
   ffmpegMaxProcesses: intEnv('FFMPEG_MAX_PROCESSES', 0),
   minFreeDiskBytes: intEnv('MIN_FREE_DISK_BYTES', 2 * 1024 * 1024 * 1024),
   minFreeMemoryBytes: intEnv('MIN_FREE_MEMORY_BYTES', 256 * 1024 * 1024),
