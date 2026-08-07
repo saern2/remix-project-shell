@@ -11,9 +11,16 @@ RUN npm ci --only=production
 FROM node:20-slim AS runtime
 
 # Install FFmpeg (system package — pinned to distro version for reproducibility)
+#
+# procps is here for diagnostics, not for the app: node:20-slim ships without
+# ps, so there was no way to see what the box was actually doing during a slow
+# render — which processes existed, their cpu, their niceness. Every performance
+# question so far has been answered from logs and HARs because the obvious tool
+# was missing. A few hundred kilobytes buys `ps`, `top` and `pgrep`.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ffmpeg \
+        procps \
         ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
