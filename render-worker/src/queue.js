@@ -7,6 +7,7 @@ const logger = require('./logger');
 const { processRenderJob, processStitchJob, closeRenderConnections } = require('./renderJob');
 const { readJobHealth } = require('./resourceControl');
 const admission = require('./admissionControl');
+const { parentProjectId, shouldPromoteTail, tailPriority } = require('./fairScheduling');
 
 const QUEUE_NAME = 'render';
 const QUEUE_CHUNK = 'render-chunk';
@@ -65,6 +66,44 @@ function telemetryKey(queueName, jobId) {
   return `${queueName}:${jobId}`;
 }
 
+/**
+ * Promotes the remaining chunks of a nearly-finished project.
+ *
+ * Runs on each chunk completion; the threshold check makes it a no-op for the
+ * first 90% of a project's life, and the sweep touches only siblings whose
+ * priority would actually improve, so re-runs after the threshold are cheap and
+ * idempotent. Reads the `prioritized` state, not `waiting` — every chunk
+ * carries a priority, and BullMQ 5 keeps prioritised jobs in their own state.
+ */
+async function promoteTailChunks(job) {
+  const projectId = parentProjectId(job);
+  if (!projectId) return;
+
+  const stitchJob = await Job.fromId(getQueue(QUEUE_STITCH), `${projectId}-stitch`);
+  const chunksTotal = stitchJob?.data?.chunks_total;
+  if (!chunksTotal || typeof stitchJob.getDependenciesCount !== 'function') return;
+
+  const counts = await stitchJob.getDependenciesCount();
+  if (!shouldPromoteTail(counts.processed || 0, chunksTotal)) return;
+
+  const boost = tailPriority(job.data?._fairness_slot, config.fairnessPriorityStride);
+  const pending = await getQueue(QUEUE_CHUNK).getPrioritized();
+  let promoted = 0;
+  for (const sibling of pending) {
+    if (!sibling || parentProjectId(sibling) !== projectId) continue;
+    const current = Number(sibling.opts?.priority ?? 0);
+    if (current <= boost) continue; // already at or ahead of the boost band
+    await sibling.changePriority({ priority: boost });
+    promoted += 1;
+  }
+  if (promoted > 0) {
+    logger.info(
+      { projectId, promoted, boost, completed: counts.processed, chunksTotal },
+      'Project is near completion; remaining chunks promoted to the front band',
+    );
+  }
+}
+
 function createWorker(queueName, processor, concurrency, timeoutMs) {
   const worker = new Worker(
     queueName,
@@ -88,6 +127,15 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
   worker.on('completed', (job, result) => {
     jobStartedAt.delete(telemetryKey(queueName, job.id));
     logger.info({ jobId: job.id, result, queue: queueName }, 'Job completed');
+    // Tail starvation (round 18): a project past 90% of its chunks gets its
+    // remaining chunks promoted, so it finishes and frees its admission slot
+    // instead of dripping behind newer projects' early chunks. Fire-and-forget:
+    // scheduling advice must never fail a completed job.
+    if (queueName === QUEUE_CHUNK && job?.data?.is_chunk) {
+      promoteTailChunks(job).catch((err) => {
+        logger.warn({ jobId: job.id, err: err.message }, 'Tail promotion sweep failed');
+      });
+    }
   });
 
   worker.on('failed', (job, err) => {

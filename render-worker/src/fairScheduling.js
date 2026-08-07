@@ -48,6 +48,36 @@ function chunkPriority(chunkIndex, slot, stride) {
   return priority;
 }
 
+// ── Tail starvation (round 18) ──────────────────────────────────────────────
+// Priorities are static: chunk N of any project always outranks chunk N+1 of
+// every project. That interleaves fairly while projects are mid-body, but a
+// project on its LAST chunks holds the highest indices in the system, so every
+// newer project's early chunks cut ahead of it — the closer a project gets to
+// done, the worse it competes. Meanwhile it is holding an admission slot that
+// nothing else can use until its stitch finishes.
+//
+// The remedy is deliberately dynamic and narrow: once a project has completed
+// this fraction of its chunks, its remaining chunks are re-prioritised into the
+// index-0 band, where they compete round-robin with other projects' FIRST
+// chunks instead of behind their entire bodies. The static formula is untouched.
+
+const TAIL_COMPLETION_FRACTION = 0.9;
+
+/** Has this project earned the tail boost? Pure; thresholds pinned by tests. */
+function shouldPromoteTail(chunksCompleted, chunksTotal) {
+  if (!Number.isFinite(chunksTotal) || chunksTotal < 2) return false;
+  if (!Number.isFinite(chunksCompleted) || chunksCompleted <= 0) return false;
+  return chunksCompleted >= Math.ceil(chunksTotal * TAIL_COMPLETION_FRACTION);
+}
+
+/**
+ * The boosted priority: chunk index 0's band, slot preserved so the intra-band
+ * round-robin between projects still applies.
+ */
+function tailPriority(slot, stride) {
+  return chunkPriority(0, Number.isInteger(slot) && slot >= 0 ? slot : 0, stride);
+}
+
 let allocationTail = Promise.resolve();
 
 function withFairnessAllocation(callback) {
@@ -62,4 +92,7 @@ module.exports = {
   chooseFairnessSlot,
   chunkPriority,
   withFairnessAllocation,
+  TAIL_COMPLETION_FRACTION,
+  shouldPromoteTail,
+  tailPriority,
 };
