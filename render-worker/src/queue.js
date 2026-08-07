@@ -69,11 +69,12 @@ function telemetryKey(queueName, jobId) {
 /**
  * Promotes the remaining chunks of a nearly-finished project.
  *
- * Runs on each chunk completion; the threshold check makes it a no-op for the
- * first 90% of a project's life, and the sweep touches only siblings whose
- * priority would actually improve, so re-runs after the threshold are cheap and
- * idempotent. Reads the `prioritized` state, not `waiting` — every chunk
- * carries a priority, and BullMQ 5 keeps prioritised jobs in their own state.
+ * Runs on each chunk completion; shouldPromoteTail makes it a no-op until a
+ * project is both substantially complete AND within its last few chunks, and
+ * the sweep touches only siblings whose priority would actually improve, so
+ * re-runs after the threshold are cheap and idempotent. Reads the `prioritized`
+ * state, not `waiting` — every chunk carries a priority, and BullMQ 5 keeps
+ * prioritised jobs in their own state.
  */
 async function promoteTailChunks(job) {
   const projectId = parentProjectId(job);
@@ -127,8 +128,8 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
   worker.on('completed', (job, result) => {
     jobStartedAt.delete(telemetryKey(queueName, job.id));
     logger.info({ jobId: job.id, result, queue: queueName }, 'Job completed');
-    // Tail starvation (round 18): a project past 90% of its chunks gets its
-    // remaining chunks promoted, so it finishes and frees its admission slot
+    // Tail starvation: a project within its last few chunks gets them promoted
+    // into the reserved band, so it finishes and frees its admission slot
     // instead of dripping behind newer projects' early chunks. Fire-and-forget:
     // scheduling advice must never fail a completed job.
     if (queueName === QUEUE_CHUNK && job?.data?.is_chunk) {
@@ -212,6 +213,7 @@ function startWorker() {
       chunkConcurrency: effectiveChunkConcurrency,
       stitchConcurrency: config.workerConcurrencyStitches,
       renderAdmissionLimit: config.renderAdmissionLimit,
+      renderAdmissionPerUserLimit: config.renderAdmissionPerUserLimit,
       admissionMinFreeMemoryMb: Math.round(config.admissionMinFreeMemoryBytes / 1024 / 1024),
     },
     'Render worker resource budget',
@@ -317,12 +319,23 @@ async function getJobStatus(job) {
     const projectId = job.id.replace(/-stitch$/, '');
     try {
       const snapshot = await admission.admissionSnapshot(getRedisConnection());
-      const position = snapshot.waiting.indexOf(projectId) + 1;
+      // The cap-aware position, not the raw rank. With a per-user cap the two
+      // diverge sharply: a user queued behind five of somebody else's projects
+      // is next in line, not sixth, because that user is already at their cap
+      // and all five are skipped.
+      const position = admission.effectiveQueuePosition({
+        projectId,
+        waiting: snapshot.waiting,
+        active: snapshot.active,
+        owners: snapshot.owners,
+        perUser: snapshot.perUserLimit,
+      });
       result.admission = {
         limit: snapshot.limit,
         active_count: snapshot.activeCount,
         waiting_count: snapshot.waitingCount,
         stitching_count: snapshot.stitchingCount,
+        per_user_limit: snapshot.perUserLimit,
         // null until this machine has measured a chunk; the caller must not
         // present a fabricated estimate as a measured one.
         seconds_per_chunk: snapshot.secondsPerChunk,
