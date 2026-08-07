@@ -386,7 +386,9 @@ async function runFfmpeg({ jobId, clipInputs, audioPath, scriptPath, finalVideoL
     let stderrLines = [];
     let killed = false;
 
-    const cmd = ffmpeg();
+    // Niced below node so a saturated encode never starves the API's event
+    // loop off the cpu — see config.ffmpegNiceness.
+    const cmd = ffmpeg({ niceness: config.ffmpegNiceness });
 
     // Add all video clip inputs with input-level trimming (-ss and -t)
     clipInputs.forEach((ci) => {
@@ -723,7 +725,7 @@ async function processStitchJob(job) {
       let killed = false;
       let stderrLines = [];
 
-      const cmd = ffmpeg()
+      const cmd = ffmpeg({ niceness: config.ffmpegNiceness })
         .input(concatFilePath)
         .inputOptions(['-f', 'concat', '-safe', '0'])
         .input(audioPath)

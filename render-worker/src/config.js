@@ -95,6 +95,19 @@ const config = {
    */
   ffmpegPreset: process.env.FFMPEG_PRESET || 'veryfast',
   ffmpegMaxProcesses: intEnv('FFMPEG_MAX_PROCESSES', 0),
+  /**
+   * Niceness for ffmpeg children (0-19; ignored on Windows). Default 10: the
+   * encodes should soak up idle cpu but always yield to the node process.
+   *
+   * WHY. The 502s during the five-project run were not a blocked event loop —
+   * the server handlers are all async I/O and the JSON body is capped at 1 MB.
+   * They line up with OS-level saturation: at full tilt this box runs 4 encodes
+   * x 2 threads plus stitches at the SAME priority as node, so node's accept
+   * queue and timers get scheduled late and the reverse proxy gives up. Nicing
+   * the encodes costs them nothing when the machine has headroom and keeps the
+   * API responsive when it does not.
+   */
+  ffmpegNiceness: intEnv('FFMPEG_NICENESS', 10),
   minFreeDiskBytes: intEnv('MIN_FREE_DISK_BYTES', 2 * 1024 * 1024 * 1024),
   minFreeMemoryBytes: intEnv('MIN_FREE_MEMORY_BYTES', 256 * 1024 * 1024),
   /**
@@ -186,6 +199,11 @@ if (config.minFreeDiskBytes < 0 || config.minFreeMemoryBytes < 0) {
 }
 if (config.fairnessPriorityStride <= 0) {
   throw new Error('FAIRNESS_PRIORITY_STRIDE must be > 0');
+}
+if (config.ffmpegNiceness < 0 || config.ffmpegNiceness > 19) {
+  // Negative niceness would put encodes ABOVE node, which is the inversion of
+  // the point; > 19 is not a valid niceness.
+  throw new Error('FFMPEG_NICENESS must be between 0 and 19, got: ' + config.ffmpegNiceness);
 }
 if (config.globalCdnConcurrency <= 0) {
   throw new Error('GLOBAL_CDN_CONCURRENCY must be > 0, got: ' + config.globalCdnConcurrency);
