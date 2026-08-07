@@ -90,8 +90,36 @@ const effectiveChunkConcurrency = Math.min(config.workerConcurrencyChunks, detec
 config.detectedCpuCount = detectedCpuCount;
 config.totalWorkerSlots =
   config.workerConcurrency + effectiveChunkConcurrency + config.workerConcurrencyStitches;
+
+/**
+ * Slots that actually compete for ENCODE cpu.
+ *
+ * The thread budget used to divide by totalWorkerSlots, which counted two
+ * things that do not encode:
+ *
+ *   - the legacy `render` queue (workerConcurrency, 2 slots). With CHUNK_SIZE
+ *     set, every job is chunked and that queue never runs, so it reserved a
+ *     quarter of the machine for nothing.
+ *   - stitch slots. Stitch concatenates with -c:v copy — no re-encode — so it
+ *     is I/O and muxing, not encode cpu.
+ *
+ * On the 8 vCPU host that produced floor(8/8) = 1 thread per chunk. Measured on
+ * that hardware at 1080p30 CRF 23: threads=1 gives 1.44x realtime, threads=2
+ * gives 3.2x, threads=4 gives 3.44x. Two threads is the knee — 2.2x the
+ * throughput of one, while a fourth thread adds 7%.
+ *
+ * Dividing by chunk concurrency alone gives floor(8/4) = 2, which lands exactly
+ * on that knee. The cap makes the relationship explicit rather than incidental:
+ * past two threads x264 returns very little, so extra cpu is better spent on
+ * another concurrent chunk.
+ */
+config.encodeWorkerSlots = Math.max(1, effectiveChunkConcurrency);
+config.maxFfmpegThreads = intEnv('MAX_FFMPEG_THREADS', 2);
 if (config.ffmpegThreads === 0) {
-  config.ffmpegThreads = Math.max(1, Math.floor(detectedCpuCount / config.totalWorkerSlots));
+  config.ffmpegThreads = Math.max(
+    1,
+    Math.min(config.maxFfmpegThreads, Math.floor(detectedCpuCount / config.encodeWorkerSlots)),
+  );
 }
 if (config.ffmpegMaxProcesses === 0) {
   config.ffmpegMaxProcesses = Math.max(1, Math.min(detectedCpuCount, config.totalWorkerSlots));

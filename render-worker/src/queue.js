@@ -150,7 +150,11 @@ function startWorker() {
     {
       cpuCount: config.detectedCpuCount,
       totalWorkerSlots: config.totalWorkerSlots,
+      // The divisor for the thread budget: chunk slots only. Legacy and stitch
+      // slots do not encode, so counting them starved every chunk of cpu.
+      encodeWorkerSlots: config.encodeWorkerSlots,
       ffmpegThreads: config.ffmpegThreads,
+      maxFfmpegThreads: config.maxFfmpegThreads,
       ffmpegMaxProcesses: config.ffmpegMaxProcesses,
       legacyConcurrency: config.workerConcurrency,
       chunkConcurrency: effectiveChunkConcurrency,
