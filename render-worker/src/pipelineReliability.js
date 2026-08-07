@@ -44,6 +44,27 @@ function buildChunkOpts(clips, cfg) {
 }
 
 /**
+ * buildStitchOpts(cfg) → BullMQ opts fields for the stitch job.
+ *
+ * Pure function — no side effects, no I/O.
+ *
+ * The stitch had NO attempts configured, so BullMQ's default of 1 applied: a
+ * stitch killed by its hard timeout failed terminally, silently discarding a
+ * project whose every chunk had rendered. "Kill and retry" requires the retry
+ * to exist. Same attempt count and backoff as the chunks — there is nothing
+ * about the stitch that deserves fewer chances than the work it combines.
+ *
+ * @param {{ jobAttempts: number, jobBackoffDelayMs: number }} cfg
+ * @returns {{ attempts: number, backoff: { type: string, delay: number } }}
+ */
+function buildStitchOpts(cfg) {
+  return {
+    attempts: cfg.jobAttempts,
+    backoff: { type: 'exponential', delay: cfg.jobBackoffDelayMs },
+  };
+}
+
+/**
  * writeCancelFlag(redis, jobId) → Promise<void>
  *
  * Sets `cancel:<jobId> = '1'` in Redis with a 3600-second TTL.
@@ -87,6 +108,7 @@ function createScopedAbortController() {
 
 module.exports = {
   buildChunkOpts,
+  buildStitchOpts,
   writeCancelFlag,
   checkCancellation,
   createScopedAbortController,

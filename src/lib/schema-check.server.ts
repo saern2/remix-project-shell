@@ -39,9 +39,11 @@ export const REQUIRED_SCHEMA: Array<{
       "chunks_completed",
       "queue_position",
       "queue_estimate_seconds",
+      "stitch_state",
+      "stitches_ahead",
     ],
     migration:
-      "20260805120000_render_job_stall_notice / 20260725101708_add_chunks_to_render_jobs / 20260809000001_render_job_queue_position",
+      "20260805120000_render_job_stall_notice / 20260725101708_add_chunks_to_render_jobs / 20260809000001_render_job_queue_position / 20260809000002_render_job_stitch_state",
   },
   {
     table: "render_clip_slices",

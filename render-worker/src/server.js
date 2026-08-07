@@ -28,7 +28,7 @@ const config = require('./config');
 const logger = require('./logger');
 const { getQueue, getJobStatus, getRedisConnection, startWorker, getFlowProducer, QUEUE_NAME, QUEUE_CHUNK, QUEUE_STITCH } = require('./queue');
 const { validatePayload } = require('./renderJob');
-const { buildChunkOpts, writeCancelFlag } = require('./pipelineReliability');
+const { buildChunkOpts, buildStitchOpts, writeCancelFlag } = require('./pipelineReliability');
 const { cancelJobsByPrefix } = require('./cancelJobs');
 const {
   getInFlightProjects,
@@ -142,6 +142,9 @@ app.post('/jobs', requireApiKey, async (req, res) => {
           },
           opts: {
             jobId: `${jobId}-stitch`,
+            // A stitch with no attempts fails terminally on its first timeout,
+            // discarding a project whose every chunk rendered. See buildStitchOpts.
+            ...buildStitchOpts(config),
           },
           children: chunkJobs
         };

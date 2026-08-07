@@ -737,6 +737,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       chunks_completed?: number | null;
       queue_position?: number | null;
       queue_estimate_seconds?: number | null;
+      stitch_state?: string | null;
+      stitches_ahead?: number | null;
       stalled?: boolean;
       health?: {
         state?: string;
@@ -772,6 +774,19 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       queuePosition != null && typeof payload.queue_estimate_seconds === "number"
         ? payload.queue_estimate_seconds
         : null;
+    // The stitch window: all chunks rendered, video not yet delivered. Values
+    // are constrained in the DB, so an unrecognised state from a mismatched
+    // worker version degrades to "no notice" rather than a failed UPDATE.
+    const stitchState =
+      payload.stitch_state === "waiting" ||
+      payload.stitch_state === "combining" ||
+      payload.stitch_state === "uploading"
+        ? payload.stitch_state
+        : null;
+    const stitchesAhead =
+      stitchState === "waiting" && typeof payload.stitches_ahead === "number"
+        ? payload.stitches_ahead
+        : null;
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -786,6 +801,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       chunks_completed?: number | null;
       queue_position?: number | null;
       queue_estimate_seconds?: number | null;
+      stitch_state?: string | null;
+      stitches_ahead?: number | null;
     } = {
       status,
       progress_pct: progress,
@@ -795,6 +812,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       chunks_completed: chunksCompleted,
       queue_position: queuePosition,
       queue_estimate_seconds: queueEstimateSeconds,
+      stitch_state: stitchState,
+      stitches_ahead: stitchesAhead,
     };
     if (status === "completed") {
       jobUpdate.completed_at = new Date().toISOString();
@@ -802,6 +821,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       jobUpdate.stall_notice = null;
       jobUpdate.queue_position = null;
       jobUpdate.queue_estimate_seconds = null;
+      jobUpdate.stitch_state = null;
+      jobUpdate.stitches_ahead = null;
       if (chunksTotal != null) jobUpdate.chunks_completed = chunksTotal;
     }
     if (status === "failed") {
@@ -846,6 +867,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
         status === "completed" && chunksTotal != null ? chunksTotal : chunksCompleted,
       queue_position: queuePosition,
       queue_estimate_seconds: queueEstimateSeconds,
+      stitch_state: stitchState,
+      stitches_ahead: stitchesAhead,
     };
   });
 

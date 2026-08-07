@@ -7,7 +7,7 @@ import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.funct
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import { isMissingPollResult, nextPollDelayMs, pollIntervalWhileActive } from "@/lib/polling-state";
-import { describeQueuePosition } from "@/lib/render-queue";
+import { describeQueuePosition, describeStitchPhase } from "@/lib/render-queue";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -315,7 +315,7 @@ function ProjectDetail() {
       const { data, error } = await supabase
         .from("render_jobs")
         .select(
-          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, queue_position, queue_estimate_seconds, created_at",
+          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, queue_position, queue_estimate_seconds, stitch_state, stitches_ahead, created_at",
         )
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
@@ -774,11 +774,12 @@ function ProjectDetail() {
                     <>
                       <div className="flex items-center gap-2 text-sm text-muted-foreground">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        {renderJob.status === "queued"
-                          ? "Queued on the render worker…"
-                          : renderJob.status === "downloading"
-                            ? "Downloading source clips…"
-                            : "Rendering video…"}
+                        {describeStitchPhase(renderJob.stitch_state, renderJob.stitches_ahead) ??
+                          (renderJob.status === "queued"
+                            ? "Queued on the render worker…"
+                            : renderJob.status === "downloading"
+                              ? "Downloading source clips…"
+                              : "Rendering video…")}
                         <span className="ml-auto font-mono text-xs">
                           {(renderJob.chunks_total ?? 0) > 0
                             ? `${renderJob.chunks_completed ?? 0} of ${renderJob.chunks_total} segments rendered`

@@ -1,6 +1,6 @@
 'use strict';
 
-const { Queue, Worker, FlowProducer } = require('bullmq');
+const { Queue, Worker, FlowProducer, Job } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('./config');
 const logger = require('./logger');
@@ -233,6 +233,33 @@ async function getJobStatus(job) {
         45,
         Math.round((result.chunks_completed / result.chunks_total) * 45),
       );
+    }
+
+    // ── Stitch visibility (round 18, item 4a) ─────────────────────────────
+    // Once every chunk is done this job's BullMQ state stops describing chunk
+    // progress and starts describing the stitch, and the client showed "51 of
+    // 51 segments rendered" for the whole 15m10s worst case. Three states the
+    // user can actually distinguish:
+    //   waiting  — chunks done, no stitch slot free yet; say how many are ahead
+    //   combining — the concat/mux is running
+    //   uploading — the finished file is leaving the machine
+    if (result.chunks_total > 0 && result.chunks_completed >= result.chunks_total) {
+      if (data._status === 'uploading') {
+        result.stitch_state = 'uploading';
+      } else if (state === 'active' || data._status === 'stitching') {
+        result.stitch_state = 'combining';
+      } else if (state === 'waiting' || state === 'delayed' || state === 'prioritized') {
+        result.stitch_state = 'waiting';
+        try {
+          // FIFO order within the stitch queue: everything before this job's
+          // index is genuinely ahead of it.
+          const waitingStitches = await getQueue(QUEUE_STITCH).getWaiting();
+          const index = waitingStitches.findIndex((waiting) => waiting?.id === job.id);
+          result.stitches_ahead = index > 0 ? index : 0;
+        } catch {
+          result.stitches_ahead = null;
+        }
+      }
     }
 
     // ── Admission queue (round 18) ────────────────────────────────────────

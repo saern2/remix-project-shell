@@ -11,7 +11,7 @@
  * number we do not have is never invented.
  */
 import { describe, expect, it } from "vitest";
-import { describeQueuePosition, describeWait } from "../render-queue";
+import { describeQueuePosition, describeStitchPhase, describeWait } from "../render-queue";
 
 describe("describeWait", () => {
   it("says nothing when there is nothing to say", () => {
@@ -74,5 +74,30 @@ describe("describeQueuePosition", () => {
     expect(text).toContain("Position 2");
     expect(text).not.toContain("estimate");
     expect(text).toContain("ahead");
+  });
+});
+
+describe("describeStitchPhase", () => {
+  // The window this covers used to show "51 of 51 segments rendered" and
+  // nothing else for up to 15 minutes.
+  it("distinguishes waiting from combining from uploading", () => {
+    expect(describeStitchPhase("waiting", 2)).toBe("Waiting to combine — 2 ahead in queue.");
+    expect(describeStitchPhase("combining", null)).toBe("Combining segments…");
+    expect(describeStitchPhase("uploading", null)).toBe("Uploading the finished video…");
+  });
+
+  it("does not claim a queue when nothing is ahead", () => {
+    // "0 ahead in queue" would raise the question of why it is waiting at all;
+    // in that instant it is simply between states.
+    expect(describeStitchPhase("waiting", 0)).toBe("Waiting to combine segments…");
+    expect(describeStitchPhase("waiting", null)).toBe("Waiting to combine segments…");
+  });
+
+  it("says nothing while chunks are still rendering", () => {
+    expect(describeStitchPhase(null, null)).toBeNull();
+    expect(describeStitchPhase(undefined, undefined)).toBeNull();
+    // An unknown state from a mismatched worker version degrades to no notice,
+    // never to a wrong one.
+    expect(describeStitchPhase("finalizing", 1)).toBeNull();
   });
 });

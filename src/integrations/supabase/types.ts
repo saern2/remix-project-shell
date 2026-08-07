@@ -664,6 +664,8 @@ export type Database = {
           settings: Json
           stall_notice: string | null
           started_at: string | null
+          stitch_state: string | null
+          stitches_ahead: number | null
           status: string
           updated_at: string
         }
@@ -683,6 +685,8 @@ export type Database = {
           stall_notice?: string | null
           started_at?: string | null
           status?: string
+          stitch_state?: string | null
+          stitches_ahead?: number | null
           updated_at?: string
         }
         Update: {
@@ -701,6 +705,8 @@ export type Database = {
           stall_notice?: string | null
           started_at?: string | null
           status?: string
+          stitch_state?: string | null
+          stitches_ahead?: number | null
           updated_at?: string
         }
         Relationships: [

@@ -62,3 +62,34 @@ export function describeQueuePosition(
 
   return `${place} — ${wait} (estimate).`;
 }
+
+/**
+ * Why a project that has finished every chunk still has no video.
+ *
+ * The window between the last chunk and the delivered file used to show
+ * "51 of 51 segments rendered" and nothing else — 15m10s in the worst observed
+ * case. Three different things happen in that window and the worker now reports
+ * which one:
+ *
+ *   waiting   — every chunk is done but both stitch slots are busy with other
+ *               projects. The one thing worth knowing is how many are ahead.
+ *   combining — the concat/mux is actually running.
+ *   uploading — the finished video is leaving the machine.
+ */
+export function describeStitchPhase(
+  state: string | null | undefined,
+  stitchesAhead: number | null | undefined,
+): string | null {
+  switch (state) {
+    case "waiting":
+      return stitchesAhead != null && stitchesAhead > 0
+        ? `Waiting to combine — ${stitchesAhead} ahead in queue.`
+        : "Waiting to combine segments…";
+    case "combining":
+      return "Combining segments…";
+    case "uploading":
+      return "Uploading the finished video…";
+    default:
+      return null;
+  }
+}

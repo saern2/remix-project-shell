@@ -923,6 +923,24 @@ comment on column public.render_jobs.queue_position is
 comment on column public.render_jobs.queue_estimate_seconds is
   'Rough seconds until this project is expected to start. An ESTIMATE — must be presented as one. Null when unknown.';
 
+-- ── 20260809000002: stitch phase visibility ─────────────────────────────────
+
+alter table public.render_jobs
+  add column if not exists stitch_state text,
+  add column if not exists stitches_ahead integer;
+
+alter table public.render_jobs
+  drop constraint if exists render_jobs_stitch_state_check;
+
+alter table public.render_jobs
+  add constraint render_jobs_stitch_state_check
+  check (stitch_state is null or stitch_state in ('waiting', 'combining', 'uploading'));
+
+comment on column public.render_jobs.stitch_state is
+  'Phase of the final combine once all chunks are rendered: waiting (no stitch slot free), combining, or uploading. Null while chunks are still rendering and after completion.';
+comment on column public.render_jobs.stitches_ahead is
+  'When stitch_state = waiting: how many other projects'' stitches are queued ahead of this one. Null otherwise or when unknown.';
+
 -- ── 20260807000001: passwordless sign-in ────────────────────────────────────
 
 alter table public.access_activations
@@ -1045,5 +1063,6 @@ from (
     ('auth_login_failures (table)',      to_regclass('public.auth_login_failures') is not null),
     ('access_activations.trusted_until', exists (select 1 from information_schema.columns where table_schema='public' and table_name='access_activations' and column_name='trusted_until')),
     ('projects.matching_idle_rounds',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='projects' and column_name='matching_idle_rounds')),
-    ('render_jobs.queue_position',       exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='queue_position'))
+    ('render_jobs.queue_position',       exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='queue_position')),
+    ('render_jobs.stitch_state',         exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='stitch_state'))
 ) as checks(check_name, present);
