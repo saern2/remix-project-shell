@@ -571,6 +571,82 @@ export function idleTerminalDecision(opts: {
   };
 }
 
+/**
+ * The rows a slice writes, built from its assignments.
+ *
+ * Extracted and pure because this is the ONLY place batching can change
+ * behaviour. The writes themselves are the same three tables they always were;
+ * what batching newly introduces is a mapping — candidate ids come back from one
+ * insert and have to be attached to the right scenes. Getting that wrong would
+ * silently pair a scene with another scene's clip, which no integration test
+ * would notice and no user would report as anything but "the video is wrong".
+ *
+ * Same inputs produce byte-identical rows to the per-scene version.
+ */
+export type SliceAssignment = {
+  sceneId: string;
+  /** end_ts - start_ts, or the timeline slot's duration when one exists. */
+  visualDurationSec: number;
+  provider: string;
+  providerClipId: string;
+  url: string;
+  fallbackUrls: string[];
+  thumbnailUrl: string | null;
+  width: number;
+  height: number;
+  sourceDurationSec: number;
+  inPoint: number;
+};
+
+export function buildCandidateRows(assignments: SliceAssignment[]) {
+  return assignments.map((a) => ({
+    scene_id: a.sceneId,
+    provider: a.provider,
+    provider_clip_id: a.providerClipId,
+    url: a.url,
+    fallback_urls: a.fallbackUrls,
+    thumbnail_url: a.thumbnailUrl,
+    width: a.width,
+    height: a.height,
+    duration_sec: a.sourceDurationSec,
+  }));
+}
+
+export function buildSelectionRows(
+  assignments: SliceAssignment[],
+  candidateIdBySceneId: Map<string, string>,
+) {
+  return assignments.flatMap((a) => {
+    const candidateId = candidateIdBySceneId.get(a.sceneId);
+    if (!candidateId) return [];
+    return [
+      {
+        scene_id: a.sceneId,
+        clip_candidate_id: candidateId,
+        in_point: a.inPoint,
+        // Identical expression to the per-scene version it replaced.
+        out_point: a.inPoint + Math.max(a.visualDurationSec, 1),
+      },
+    ];
+  });
+}
+
+/**
+ * Splits ids for a PostgREST `.in()` filter, which travels in the URL.
+ *
+ * At 37 characters per UUID, 600 ids is a 22 KB request line — past the common
+ * 8 KB default and past Cloudflare's 16 KB. 100 keeps every request under 4 KB
+ * with room to spare.
+ */
+export const IN_FILTER_CHUNK_SIZE = 100;
+
+export function chunked<T>(items: T[], size: number = IN_FILTER_CHUNK_SIZE): T[][] {
+  if (items.length === 0) return [];
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 export function unmatchedSceneFailureThreshold(totalScenes: number): number {
   const configured = Number(process.env.MATCHING_MAX_UNMATCHED_FRACTION ?? 0.1);
   const fraction = Number.isFinite(configured) && configured > 0 ? configured : 0.1;
@@ -1658,53 +1734,112 @@ async function advanceFromMatchingFootage(projectId: string) {
     const unmatchedSceneIds = new Set<string>();
     const { matchStockCorpus } = await import("@/lib/stock-corpus.server");
 
-    async function processScene(
-      scene: NonNullable<typeof scenes>[number],
+    /**
+     * Persists a whole slice in three statements instead of three per scene.
+     *
+     * WHY. Measured on a 286-scene production run: dbWriteMs 40,970-55,408 per
+     * invocation against elapsedMs ~11,000, with providerSearchMs 0 and
+     * assignmentMs 0. Assignment was not searching or computing — it was
+     * waiting on writes, ~3s per scene, three sequential round trips each at
+     * concurrency 5. Batching turns 45 round trips per slice into 3.
+     *
+     * WHAT DOES NOT CHANGE. Which clip each scene gets, and every value written
+     * for it. The assignments come from matchStockCorpus exactly as before and
+     * are only regrouped for transport — same rows, same order, fewer requests.
+     * The write ORDER is also preserved (candidate, then selection, then
+     * status), so a failure part-way leaves the same state it always did.
+     */
+    async function persistSlice(
+      sliceScenes: NonNullable<typeof scenes>,
       plainAssignments: Awaited<ReturnType<typeof matchStockCorpus>>,
     ) {
-      const visualDuration =
-        timelineSlots.get(scene.id)?.durationSeconds ??
-        Math.max(0, Number(scene.end_ts) - Number(scene.start_ts));
-      const result = plainAssignments.get(scene.id);
-      if (!result) {
-        await supabaseAdmin.from("scenes").update({ status: "failed" }).eq("id", scene.id);
-        unmatchedSceneIds.add(scene.id);
-        return;
+      const writeStartedAt = Date.now();
+
+      const matched: Array<{
+        scene: (typeof sliceScenes)[number];
+        result: NonNullable<ReturnType<typeof plainAssignments.get>>;
+      }> = [];
+      const failedSceneIds: string[] = [];
+
+      for (const scene of sliceScenes) {
+        const result = plainAssignments.get(scene.id);
+        if (!result) {
+          failedSceneIds.push(scene.id);
+          unmatchedSceneIds.add(scene.id);
+          continue;
+        }
+        matched.push({ scene, result });
       }
 
-      const { pick, chosenFile } = result;
-      const writeStartedAt = Date.now();
-      const { data: candidate, error: cErr } = await supabaseAdmin
-        .from("clip_candidates")
-        .insert({
-          scene_id: scene.id,
-          provider: pick.provider,
-          provider_clip_id: pick.provider_clip_id,
-          url: chosenFile.url,
-          fallback_urls: result.fallbackUrls,
-          thumbnail_url: pick.thumbnail_url,
-          width: chosenFile.width,
-          height: chosenFile.height,
-          duration_sec: pick.duration_sec,
-        })
-        .select("id")
-        .single();
-      if (cErr || !candidate) throw new Error(cErr?.message ?? "Failed to save candidate.");
+      if (failedSceneIds.length > 0) {
+        for (const ids of chunked(failedSceneIds)) {
+          const { error } = await supabaseAdmin
+            .from("scenes")
+            .update({ status: "failed" })
+            .in("id", ids);
+          if (error) throw new Error(error.message);
+        }
+      }
 
-      const { error: sErr } = await supabaseAdmin.from("selected_clips").upsert(
-        {
-          scene_id: scene.id,
-          clip_candidate_id: candidate.id,
-          in_point: result.inPoint,
-          out_point: result.inPoint + Math.max(visualDuration, 1),
-        },
-        { onConflict: "scene_id" },
-      );
-      if (sErr) throw new Error(sErr.message);
+      if (matched.length > 0) {
+        // 1 of 3: every candidate for the slice. scene_id comes back so the
+        // generated ids can be matched to their scenes — one scene per row
+        // within a slice, so the mapping is unambiguous.
+        const sliceAssignments: SliceAssignment[] = matched.map(({ scene, result }) => ({
+          sceneId: scene.id,
+          visualDurationSec:
+            timelineSlots.get(scene.id)?.durationSeconds ??
+            Math.max(0, Number(scene.end_ts) - Number(scene.start_ts)),
+          provider: result.pick.provider,
+          providerClipId: result.pick.provider_clip_id,
+          url: result.chosenFile.url,
+          fallbackUrls: result.fallbackUrls,
+          thumbnailUrl: result.pick.thumbnail_url,
+          width: result.chosenFile.width,
+          height: result.chosenFile.height,
+          sourceDurationSec: result.pick.duration_sec,
+          inPoint: result.inPoint,
+        }));
 
-      await supabaseAdmin.from("scenes").update({ status: "selected" }).eq("id", scene.id);
+        const { data: candidates, error: cErr } = await supabaseAdmin
+          .from("clip_candidates")
+          .insert(buildCandidateRows(sliceAssignments))
+          .select("id, scene_id");
+        if (cErr || !candidates) throw new Error(cErr?.message ?? "Failed to save candidates.");
+
+        const candidateBySceneId = new Map(candidates.map((row) => [row.scene_id, row.id]));
+
+        // 2 of 3: the selections, which are what the render actually reads.
+        const selectionRows = buildSelectionRows(sliceAssignments, candidateBySceneId);
+        // A candidate that came back without its scene would silently drop a
+        // selection, which is the shape of bug this batching could introduce.
+        if (selectionRows.length !== matched.length) {
+          throw new Error(
+            `Candidate insert returned ${candidates.length} rows for ${matched.length} scenes; refusing to write a partial slice.`,
+          );
+        }
+
+        const { error: sErr } = await supabaseAdmin
+          .from("selected_clips")
+          .upsert(selectionRows, { onConflict: "scene_id" });
+        if (sErr) throw new Error(sErr.message);
+
+        // 3 of 3: mark them selected.
+        for (const ids of chunked(matched.map(({ scene }) => scene.id))) {
+          const { error } = await supabaseAdmin
+            .from("scenes")
+            .update({ status: "selected" })
+            .in("id", ids);
+          if (error) throw new Error(error.message);
+        }
+      }
+
       profile.add("dbWrite", Date.now() - writeStartedAt);
-      profile.count("dbWriteScenes");
+      profile.count("dbWriteScenes", sliceScenes.length);
+      profile.count(
+        "dbWriteStatements",
+        (failedSceneIds.length > 0 ? 1 : 0) + (matched.length > 0 ? 3 : 0),
+      );
     }
 
     const { asyncPool } = await import("@/lib/clip-slices.server");
@@ -1788,7 +1923,7 @@ async function advanceFromMatchingFootage(projectId: string) {
         onFallback: (event) => fallbackEvents.push(event),
       });
 
-      await asyncPool(slice, CONCURRENCY, (scene) => processScene(scene, plainAssignments));
+      await persistSlice(slice, plainAssignments);
       for (const event of fallbackEvents.splice(0)) recordFallback(event);
       processedScenes += slice.length;
       budget.recordSlice(Date.now() - sliceStartedAt);
