@@ -580,6 +580,14 @@ function ProjectDetail() {
                     poll already returns, said out loud. */}
                 {project.status === "matching_footage" && matchingView ? (
                   <div className="space-y-2 rounded-md border bg-muted/30 p-3">
+                    {/* Paused is a NOTE beside the progress, never a
+                        replacement for it: the counts stay visible so it is
+                        obvious how far the work got. */}
+                    {matchingView.paused ? (
+                      <p className="rounded-md bg-amber-50 p-2 text-xs text-amber-900">
+                        {matchingView.pausedNotice}
+                      </p>
+                    ) : null}
                     <div className="flex flex-wrap items-baseline justify-between gap-2">
                       <p className="text-sm font-medium">{matchingView.headline}</p>
                       {matchingView.estimate ? (

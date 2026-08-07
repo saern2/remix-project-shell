@@ -277,7 +277,13 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
                           matching, say what is actually happening instead. */}
                       {project.status === "matching_footage" && matchingCounts?.[project.id] ? (
                         <div className="mt-1 space-y-1">
-                          <p className="truncate text-xs text-muted-foreground">
+                          <p
+                            className={`truncate text-xs ${
+                              describeMatchingProgress(matchingCounts[project.id]).paused
+                                ? "text-amber-700"
+                                : "text-muted-foreground"
+                            }`}
+                          >
                             {shortMatchingLabel(matchingCounts[project.id])}
                           </p>
                           <Progress

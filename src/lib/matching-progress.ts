@@ -23,6 +23,21 @@ export const OBSERVED_SCENES_PER_INVOCATION = 15;
 /** Seconds between polls, near enough for an estimate. */
 export const OBSERVED_SECONDS_PER_INVOCATION = 15;
 
+/**
+ * How long a project can go without progressing before it is shown as paused.
+ *
+ * Matching only advances while a tab polls — that is the design, and it is
+ * correct: closing the tab pauses the work, and reopening it resumes exactly
+ * where it stopped. The problem is that a paused project and a broken one look
+ * identical, which cost the operator two separate investigations.
+ *
+ * 90 seconds is comfortably longer than the slowest observed invocation
+ * (19,022ms) plus a poll gap, so a project that is merely working never trips
+ * it, and short enough that someone returning to a tab sees the explanation
+ * rather than a frozen bar.
+ */
+export const PAUSED_AFTER_MS = 90_000;
+
 export type MatchingCounts = {
   /** Corpus cells still to search. Null when the corpus phase is over or unknown. */
   corpusCellsPending?: number | null;
@@ -32,12 +47,25 @@ export type MatchingCounts = {
   totalScenes?: number | null;
   /** Scenes still to assign. */
   scenesRemaining?: number | null;
+  /**
+   * Milliseconds since this project last progressed, or null when unknown.
+   * Drives the paused notice only — it never changes the phase or the numbers.
+   */
+  msSinceProgress?: number | null;
 };
 
 export type MatchingPhase = "preparing" | "matching" | "finishing";
 
 export type MatchingProgressView = {
   phase: MatchingPhase;
+  /**
+   * True when nothing has advanced for a while. The work is not lost and no
+   * action is needed — polling resumes it — so this is a note beside the
+   * progress, never a replacement for it.
+   */
+  paused: boolean;
+  /** The paused explanation, or null. */
+  pausedNotice: string | null;
   /** One line, already written for a person. */
   headline: string;
   /** Second line: why an empty timeline is expected, or what happens next. */
@@ -53,6 +81,25 @@ function plural(n: number, word: string): string {
   if (n === 1) return `${n} ${word}`;
   const suffix = /(s|x|z|ch|sh)$/.test(word) ? "es" : "s";
   return `${n} ${word}${suffix}`;
+}
+
+/**
+ * Whether to show the paused note, and what it says.
+ *
+ * "Resuming now" is literally true: this page is polling, and that poll is what
+ * advances the work. The notice exists to say the project is fine, not to ask
+ * for anything.
+ */
+function pausedFields(counts: MatchingCounts): { paused: boolean; pausedNotice: string | null } {
+  const idle = counts.msSinceProgress;
+  if (idle == null || !Number.isFinite(idle) || idle < PAUSED_AFTER_MS) {
+    return { paused: false, pausedNotice: null };
+  }
+  return {
+    paused: true,
+    pausedNotice:
+      "Paused — resuming now. Matching only runs while this page is open, so it stopped when the tab was closed. It is picking up where it left off; nothing was lost.",
+  };
 }
 
 /** Rounds an estimate to something a person would say out loud. */
@@ -80,6 +127,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     const done = Math.max(0, total - cellsPending);
     const invocations = Math.ceil(cellsPending / OBSERVED_CELLS_PER_INVOCATION);
     return {
+      ...pausedFields(counts),
       phase: "preparing",
       headline: `Preparing footage library — ${plural(cellsPending, "search")} remaining of ${total}`,
       // Says the quiet part: an empty timeline right now is expected, not broken.
@@ -96,6 +144,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     const done = Math.max(0, totalScenes - remaining);
     if (remaining === 0) {
       return {
+        ...pausedFields(counts),
         phase: "finishing",
         headline: `Matching footage — ${totalScenes} of ${totalScenes} scenes`,
         detail: "Finishing up.",
@@ -105,6 +154,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     }
     const invocations = Math.ceil(remaining / OBSERVED_SCENES_PER_INVOCATION);
     return {
+      ...pausedFields(counts),
       phase: "matching",
       headline: `Matching footage — ${done} of ${totalScenes} scenes`,
       detail: "Each scene is being paired with a clip.",
@@ -116,6 +166,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
   // Known-unknown rather than a fake zero: a bar sitting at 0% reads as stuck,
   // which is the exact impression this whole module exists to prevent.
   return {
+    ...pausedFields(counts),
     phase: "preparing",
     headline: "Preparing footage library",
     detail: "Clips are chosen in the next step, so the timeline stays empty until then.",
@@ -127,5 +178,6 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
 /** The compact form for a dashboard row. */
 export function shortMatchingLabel(counts: MatchingCounts): string {
   const view = describeMatchingProgress(counts);
-  return view.percent == null ? view.headline : `${view.headline} (${view.percent}%)`;
+  const base = view.percent == null ? view.headline : `${view.headline} (${view.percent}%)`;
+  return view.paused ? `Paused — resuming now · ${base}` : base;
 }

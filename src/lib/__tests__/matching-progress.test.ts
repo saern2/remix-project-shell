@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   describeMatchingProgress,
   describeRemainingTime,
+  PAUSED_AFTER_MS,
   shortMatchingLabel,
 } from "../matching-progress";
 
@@ -148,5 +149,100 @@ describe("the dashboard row", () => {
 
   it("omits the percentage when there is nothing to measure", () => {
     expect(shortMatchingLabel({})).not.toContain("%");
+  });
+});
+
+/**
+ * A paused project must not look like a broken one.
+ *
+ * Matching only advances while a tab polls. Closing the tab pauses it; opening
+ * the tab resumes it exactly where it stopped. That behaviour is correct — the
+ * defect was that it was invisible, and a paused project was indistinguishable
+ * from a stalled one. It cost two separate investigations, by the person who
+ * built the system.
+ */
+describe("the paused notice", () => {
+  it("stays quiet while work is flowing", () => {
+    // The slowest observed invocation was 19,022ms. A project mid-work must
+    // never trip this.
+    for (const idle of [0, 5_000, 19_022, 45_000, PAUSED_AFTER_MS - 1]) {
+      const view = describeMatchingProgress({
+        corpusCellsPending: 40,
+        corpusCellsTotal: 80,
+        msSinceProgress: idle,
+      });
+      expect(view.paused).toBe(false);
+      expect(view.pausedNotice).toBeNull();
+    }
+  });
+
+  it("appears once nothing has moved for the threshold", () => {
+    const view = describeMatchingProgress({
+      corpusCellsPending: 40,
+      corpusCellsTotal: 80,
+      msSinceProgress: PAUSED_AFTER_MS,
+    });
+    expect(view.paused).toBe(true);
+    expect(view.pausedNotice).toMatch(/resuming now/i);
+  });
+
+  it("says the work is safe and asks for nothing", () => {
+    // Someone returning to a tab needs to know the project is fine, not to be
+    // given a task.
+    const view = describeMatchingProgress({ msSinceProgress: 10 * 60_000 });
+    expect(view.pausedNotice).toMatch(/nothing was lost/i);
+    expect(view.pausedNotice).toMatch(/page is open/i);
+    expect(view.pausedNotice).not.toMatch(/error|failed|retry|contact/i);
+  });
+
+  it("clears the moment progress resumes", () => {
+    const paused = describeMatchingProgress({
+      totalScenes: 286,
+      scenesRemaining: 100,
+      msSinceProgress: 120_000,
+    });
+    const resumed = describeMatchingProgress({
+      totalScenes: 286,
+      scenesRemaining: 95,
+      msSinceProgress: 1_000,
+    });
+    expect(paused.paused).toBe(true);
+    expect(resumed.paused).toBe(false);
+    expect(resumed.pausedNotice).toBeNull();
+  });
+
+  it("keeps the counts and the bar visible while paused", () => {
+    // The notice sits beside the progress; it never replaces it, so it stays
+    // obvious how far the work actually got.
+    const view = describeMatchingProgress({
+      totalScenes: 286,
+      scenesRemaining: 106,
+      msSinceProgress: 300_000,
+    });
+    expect(view.paused).toBe(true);
+    expect(view.headline).toBe("Matching footage — 180 of 286 scenes");
+    expect(view.percent).toBe(63);
+    expect(view.phase).toBe("matching");
+  });
+
+  it("is not paused when nothing has been written yet", () => {
+    // A project that has not started is not a paused one. msSinceProgress is
+    // null until the first real write.
+    expect(describeMatchingProgress({ msSinceProgress: null }).paused).toBe(false);
+    expect(describeMatchingProgress({}).paused).toBe(false);
+  });
+
+  it("leads the dashboard row so it reads at a glance", () => {
+    const label = shortMatchingLabel({
+      totalScenes: 286,
+      scenesRemaining: 106,
+      msSinceProgress: 300_000,
+    });
+    expect(label.startsWith("Paused — resuming now")).toBe(true);
+    expect(label).toContain("180 of 286");
+  });
+
+  it("uses a threshold above the slowest observed invocation", () => {
+    expect(PAUSED_AFTER_MS).toBeGreaterThan(19_022);
   });
 });
