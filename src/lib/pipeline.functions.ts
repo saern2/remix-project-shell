@@ -938,10 +938,32 @@ async function advanceFromMatchingFootage(projectId: string) {
     // not a stall. Counting it would let a busy project with overlapping polls
     // accumulate idle rounds while another invocation is actively matching.
     console.info("[matching_footage] peer holds the lock; no work attempted", { projectId });
+
+    // Doing no work is not the same as knowing nothing. A second viewer's polls
+    // all land here, and this used to be the only thing they got back:
+    // scenesProcessed 0, remaining -1 — every real number absent. The counts
+    // are one cheap read away, from the same reader the progress panel uses,
+    // so a viewer who is not driving the work still sees it moving.
+    // remaining stays -1: it means "this invocation did not compute it", and
+    // renderers must treat it as unknown, never as zero — `progress` is the
+    // field that carries the real numbers.
+    let progress = null;
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { readProjectMatchingCounts } = await import("@/lib/matching-counts.server");
+      progress = await readProjectMatchingCounts(supabaseAdmin, { id: projectId });
+    } catch (err) {
+      // Progress reporting must never break the single-flight guard; a peer is
+      // matching and this response's job is only to keep the client polling.
+      console.warn("[matching_footage] progress read failed on lock-not-held path", {
+        projectId,
+        error: (err as Error).message,
+      });
+    }
     return {
       status: "matching_footage",
       error_message: null,
-      matching: { ...matchingTelemetry({ scenesProcessed: 0, remaining: -1 }), lockHeld: 0 },
+      matching: { ...matchingTelemetry({ scenesProcessed: 0, remaining: -1 }), lockHeld: 0, progress },
     };
   }
 

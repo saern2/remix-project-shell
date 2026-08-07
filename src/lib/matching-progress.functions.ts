@@ -4,9 +4,10 @@
  * Separate from the matching handler on purpose: it touches nothing the pipeline
  * writes, so surfacing progress cannot affect the thing being measured. The
  * dashboard needs these counts without polling the pipeline, and the project page
- * needs the same numbers the poll already reports so the two never disagree.
+ * needs the same numbers the timeline shows so the two never disagree.
  *
- * Cheap by construction — four HEAD counts, no row bodies.
+ * The queries live in matching-counts.server.ts, shared with the pipeline's
+ * lock-not-held response — one reader, one opinion about how done a project is.
  */
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
@@ -34,75 +35,13 @@ export const getMatchingProgress = createServerFn({ method: "POST" })
     if (!owned || owned.length === 0) return {};
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { readProjectMatchingCounts } = await import("@/lib/matching-counts.server");
 
     const entries = await Promise.all(
-      owned.map(async (project) => {
-        const [scenes, selected, corpusTotal, corpusFilled, lastSelection, lastCorpusWrite] =
-          await Promise.all([
-            supabaseAdmin
-              .from("scenes")
-              .select("id", { count: "exact", head: true })
-              .eq("project_id", project.id),
-            supabaseAdmin
-              .from("selected_clips")
-              .select("scene_id, scenes!inner(project_id)", { count: "exact", head: true })
-              .eq("scenes.project_id", project.id),
-            supabaseAdmin
-              .from("project_stock_corpus")
-              .select("project_id", { count: "exact", head: true })
-              .eq("project_id", project.id),
-            // A bucket with candidates has been searched at least once. Close
-            // enough for a progress bar, and it costs one count rather than
-            // loading the corpus.
-            supabaseAdmin
-              .from("project_stock_corpus")
-              .select("project_id", { count: "exact", head: true })
-              .eq("project_id", project.id)
-              .neq("candidates", "[]"),
-            // Progress timestamps. projects.updated_at is useless here — every
-            // poll touches it whether or not it did any work — so the signal comes
-            // from the two tables that are only written when something advances.
-            supabaseAdmin
-              .from("selected_clips")
-              .select("created_at, scenes!inner(project_id)")
-              .eq("scenes.project_id", project.id)
-              .order("created_at", { ascending: false })
-              .limit(1)
-              .maybeSingle(),
-            supabaseAdmin
-              .from("project_stock_corpus")
-              .select("updated_at")
-              .eq("project_id", project.id)
-              .order("updated_at", { ascending: false })
-              .limit(1)
-              .maybeSingle(),
-          ]);
-
-        const totalScenes = scenes.count ?? 0;
-        const matched = selected.count ?? 0;
-        const buckets = corpusTotal.count ?? 0;
-        const built = corpusFilled.count ?? 0;
-
-        // Corpus phase only while buckets exist and some are still empty.
-        const cellsPending = buckets > 0 ? Math.max(0, buckets - built) : null;
-
-        const progressAt = [lastSelection.data?.created_at, lastCorpusWrite.data?.updated_at]
-          .filter((value): value is string => typeof value === "string")
-          .map((value) => new Date(value).getTime())
-          .filter((value) => Number.isFinite(value))
-          .sort((a, b) => b - a)[0];
-
-        const counts: MatchingCounts = {
-          // Null rather than a huge number when nothing has been written yet —
-          // a project that has not started is not a paused one.
-          msSinceProgress: progressAt == null ? null : Math.max(0, Date.now() - progressAt),
-          corpusCellsPending: cellsPending,
-          corpusCellsTotal: buckets > 0 ? buckets : null,
-          totalScenes,
-          scenesRemaining: Math.max(0, totalScenes - matched),
-        };
-        return [project.id, counts] as const;
-      }),
+      owned.map(
+        async (project) =>
+          [project.id, await readProjectMatchingCounts(supabaseAdmin, project)] as const,
+      ),
     );
 
     return Object.fromEntries(entries);

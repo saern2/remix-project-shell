@@ -191,8 +191,18 @@ describe("the paused notice", () => {
     // given a task.
     const view = describeMatchingProgress({ msSinceProgress: 10 * 60_000 });
     expect(view.pausedNotice).toMatch(/nothing was lost/i);
-    expect(view.pausedNotice).toMatch(/page is open/i);
+    expect(view.pausedNotice).toMatch(/polling/i);
     expect(view.pausedNotice).not.toMatch(/error|failed|retry|contact/i);
+  });
+
+  it("never claims the viewer's tab caused the pause", () => {
+    // The notice is computed from database timestamps, which cannot know whose
+    // tab did what. The old wording — "it stopped when the tab was closed" —
+    // was read by a second viewer as a statement about a tab they never
+    // closed, on a project that was not even paused.
+    const view = describeMatchingProgress({ msSinceProgress: 10 * 60_000 });
+    expect(view.pausedNotice).not.toMatch(/tab was closed/i);
+    expect(view.pausedNotice).not.toMatch(/stopped when/i);
   });
 
   it("clears the moment progress resumes", () => {

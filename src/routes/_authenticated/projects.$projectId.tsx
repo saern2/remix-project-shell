@@ -35,7 +35,7 @@ import {
   Clock,
 } from "lucide-react";
 import { toast } from "sonner";
-import { describeMatchingProgress } from "@/lib/matching-progress";
+import { describeMatchingProgress, expectedFixedSlicesForScenes } from "@/lib/matching-progress";
 import { getMatchingProgress } from "@/lib/matching-progress.functions";
 
 export const Route = createFileRoute("/_authenticated/projects/$projectId")({
@@ -98,16 +98,8 @@ const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching"
 /** A render in one of these is over; polling it again only produces a 404. */
 const RENDER_TERMINAL = new Set(["completed", "failed", "cancelled", "not_found"]);
 
-function expectedFixedSlicesForScenes(scenes: Scene[], fixedDuration: number): number {
-  return scenes.reduce((count, scene, index) => {
-    const sceneStart = Number(scene.start_ts);
-    const sceneEnd = Number(scene.end_ts);
-    const nextStart = index + 1 < scenes.length ? Number(scenes[index + 1].start_ts) : sceneEnd;
-    const visualEnd = nextStart > sceneEnd ? nextStart : sceneEnd;
-    const duration = Math.max(0, visualEnd - sceneStart);
-    return count + (duration > 0 ? Math.max(1, Math.ceil(duration / fixedDuration)) : 0);
-  }, 0);
-}
+// expectedFixedSlicesForScenes moved to matching-progress.ts so the timeline
+// header, the progress panel and the server count clip slots identically.
 
 function ProjectDetail() {
   const { projectId } = Route.useParams();
