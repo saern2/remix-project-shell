@@ -26,7 +26,10 @@ const fs = require('fs');
 const path = require('path');
 
 process.env.WORKER_API_KEY = process.env.WORKER_API_KEY || 'test-key';
-const REDIS_URL = process.env.TEST_REDIS_URL || 'redis://127.0.0.1:6379/9';
+// Database 8, NOT the 9 the admission suite uses. Both files touch the same
+// admission keys, vitest runs files in parallel, and sharing a database meant
+// each one's beforeEach cleared the other's state mid-test.
+const REDIS_URL = process.env.TEST_REDIS_URL || 'redis://127.0.0.1:6379/8';
 process.env.REDIS_URL = REDIS_URL;
 
 const IORedis = require('ioredis');

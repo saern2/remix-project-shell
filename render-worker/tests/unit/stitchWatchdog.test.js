@@ -84,7 +84,13 @@ describe('a killed stitch retries', () => {
     // Cleanup used to delete every chunk dir on every exit path. With retries
     // that guarantees the retry dies with "Chunk file missing for concat" —
     // a retry that cannot succeed is worse than none, because it looks like one.
-    expect(stitchFn).toMatch(/retryPending = !stitchSucceeded && willRetry\(job\)/);
+    //
+    // A maintenance freeze joined the same rule for the same reason: the work
+    // will resume and will need these files. The assertion allows that extra
+    // term but still requires willRetry, so dropping the retry case would fail
+    // here rather than pass on a technicality.
+    expect(stitchFn).toMatch(/retryPending = !stitchSucceeded && [^\n]*willRetry\(job\)/);
+    expect(stitchFn).toMatch(/retryPending = !stitchSucceeded && \(frozen\.value \|\| willRetry\(job\)\)/);
     expect(stitchFn).toMatch(/if \(!retryPending\) \{\s*\n\s*for \(let i = 0; i < payload\.chunks_total/);
   });
 

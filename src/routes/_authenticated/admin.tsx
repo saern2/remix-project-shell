@@ -16,6 +16,7 @@ import {
 } from "@/lib/admin.functions";
 import { revalidateAllPexelsKeys, uploadPexelsKeysResilient } from "@/lib/admin-pexels.functions";
 import { supabase } from "@/integrations/supabase/client";
+import { MaintenancePanel } from "@/components/maintenance-panel";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -103,9 +104,13 @@ function AdminPage() {
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="keys">Pexels keys</TabsTrigger>
+          <TabsTrigger value="maintenance">Maintenance</TabsTrigger>
         </TabsList>
         <TabsContent value="overview" className="mt-4">
           <OverviewTab />
+        </TabsContent>
+        <TabsContent value="maintenance" className="mt-4">
+          <MaintenancePanel />
         </TabsContent>
         <TabsContent value="keys" className="mt-4">
           <KeysTab />

@@ -1,4 +1,5 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
+import { MaintenanceBanner } from "@/components/maintenance-banner";
 import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useState, type ReactNode } from "react";
@@ -225,6 +226,9 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
       </header>
 
       <div className={cn("transition-[padding] duration-200", collapsed ? "lg:pl-20" : "lg:pl-64")}>
+        {/* In the shell, not per-page: a notice you can navigate away from is
+            how an admin forgets maintenance is on for three hours. */}
+        <MaintenanceBanner />
         {children}
       </div>
     </div>
