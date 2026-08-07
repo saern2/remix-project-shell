@@ -36,6 +36,8 @@ const WAITING_SEEN_KEY = 'admission:waiting-seen';
 /** Projects currently in the stitch phase. Same accounting, so the wait a user
  * is shown includes the stitch contention that caused the 15m10s. */
 const STITCHING_KEY = 'admission:stitching';
+/** projectId -> owning user id. Admission counts projects; fairness needs users. */
+const OWNER_KEY = 'admission:owner';
 /** Recent per-chunk durations, in seconds, newest first. */
 const CHUNK_SECONDS_KEY = 'admission:chunk-seconds';
 const CHUNK_SECONDS_SAMPLES = 50;
@@ -57,11 +59,16 @@ const HEARTBEAT_INTERVAL_MS = Math.floor(ADMISSION_TTL_MS / 3);
  * starts overshoot the cap — which is precisely the situation this guards.
  */
 const TRY_ADMIT_SCRIPT = `
-local activeKey, waitingKey, seenKey = KEYS[1], KEYS[2], KEYS[3]
-local projectId, now, ttl, cap = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local activeKey, waitingKey, seenKey, ownerKey = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local projectId, now, ttl, cap, perUser, ownerId =
+  ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5]), ARGV[6]
 
 -- Admissions whose worker stopped heartbeating. A container killed by the OOM
 -- reaper must not hold a slot forever, and that is exactly when it would.
+local expired = redis.call('ZRANGEBYSCORE', activeKey, '-inf', now - ttl)
+for i = 1, #expired do
+  redis.call('HDEL', ownerKey, expired[i])
+end
 redis.call('ZREMRANGEBYSCORE', activeKey, '-inf', now - ttl)
 
 -- Waiters that stopped polling: a project that was cancelled or died would
@@ -71,7 +78,25 @@ for i = 1, #seen, 2 do
   if tonumber(seen[i + 1]) < now - ttl then
     redis.call('ZREM', waitingKey, seen[i])
     redis.call('HDEL', seenKey, seen[i])
+    redis.call('HDEL', ownerKey, seen[i])
   end
+end
+
+if ownerId ~= '' then
+  redis.call('HSET', ownerKey, projectId, ownerId)
+end
+
+-- How many slots a user already holds. Counted from the live active set rather
+-- than kept as a counter: a counter and the set can disagree after a crash, and
+-- the set is what capacity is actually measured from.
+local function activeCountFor(uid)
+  if uid == '' then return 0 end
+  local members = redis.call('ZRANGE', activeKey, 0, -1)
+  local n = 0
+  for i = 1, #members do
+    if redis.call('HGET', ownerKey, members[i]) == uid then n = n + 1 end
+  end
+  return n
 end
 
 local function admit()
@@ -85,18 +110,37 @@ if redis.call('ZSCORE', activeKey, projectId) then
   return {1, 0}
 end
 
-if redis.call('ZCARD', activeKey) < cap then
-  -- Only the head of the queue may take a freed slot. Without this, whichever
-  -- project happened to poll first would jump the line and the position we
-  -- showed the others would be a lie.
-  local head = redis.call('ZRANGE', waitingKey, 0, 0)
-  if #head == 0 or head[1] == projectId then
+-- A user already at their own cap is not eligible even when the platform has
+-- room: the slot is left for somebody else rather than handed to them again.
+local mineActive = activeCountFor(ownerId)
+local eligible = (ownerId == '' or perUser <= 0 or mineActive < perUser)
+
+if eligible and redis.call('ZCARD', activeKey) < cap then
+  -- The FIRST ELIGIBLE waiter takes a freed slot, not simply the first. Taking
+  -- the plain head would let one user's queued projects block everyone behind
+  -- them, which is head-of-line blocking: the exact failure the per-user cap
+  -- exists to prevent, reintroduced one layer down.
+  local waiters = redis.call('ZRANGE', waitingKey, 0, -1)
+  local firstEligible = nil
+  local pending = {}
+  for i = 1, #waiters do
+    local wid = waiters[i]
+    local wowner = redis.call('HGET', ownerKey, wid) or ''
+    if wowner == '' or perUser <= 0 or (pending[wowner] or 0) + activeCountFor(wowner) < perUser then
+      firstEligible = wid
+      break
+    end
+    pending[wowner] = (pending[wowner] or 0) + 1
+  end
+
+  if firstEligible == nil or firstEligible == projectId then
     admit()
     return {1, 0}
   end
 end
 
--- Full. Record when this project FIRST asked, so its position is stable.
+-- Full, or this user is at their cap. Record when this project FIRST asked, so
+-- its position is stable.
 if not redis.call('ZSCORE', waitingKey, projectId) then
   redis.call('ZADD', waitingKey, now, projectId)
 end
@@ -109,7 +153,7 @@ let scriptRegistered = false;
 
 function registerScript(redis) {
   if (scriptRegistered || typeof redis.defineCommand !== 'function') return;
-  redis.defineCommand('admissionTryAdmit', { numberOfKeys: 3, lua: TRY_ADMIT_SCRIPT });
+  redis.defineCommand('admissionTryAdmit', { numberOfKeys: 4, lua: TRY_ADMIT_SCRIPT });
   scriptRegistered = true;
 }
 
@@ -119,20 +163,41 @@ function admissionLimit() {
 }
 
 /**
+ * Slots one user may hold at once, from RENDER_ADMISSION_PER_USER_LIMIT.
+ *
+ * Admission counts PROJECTS, which is right for capacity and wrong for
+ * fairness: it is first-come-first-served, so one user submitting five projects
+ * fills every slot and blocks everyone else until they are all done. The cap
+ * bounds how much of the platform any one account can hold at once. Total
+ * concurrency is unchanged — this only decides WHOSE work fills the slots.
+ *
+ * 0 disables it, which is the right escape hatch for a single-operator install.
+ */
+function perUserLimit() {
+  return config.renderAdmissionPerUserLimit;
+}
+
+/**
  * @returns {Promise<{admitted: boolean, position: number}>} position is 1-based
  *   among waiting projects, or 0 when admitted.
  */
-async function tryAdmit(redis, projectId) {
+async function tryAdmit(redis, projectId, ownerId = null) {
   if (!projectId) return { admitted: true, position: 0 };
   registerScript(redis);
   const [admitted, position] = await redis.admissionTryAdmit(
     ACTIVE_KEY,
     WAITING_KEY,
     WAITING_SEEN_KEY,
+    OWNER_KEY,
     projectId,
     String(Date.now()),
     String(ADMISSION_TTL_MS),
     String(admissionLimit()),
+    String(perUserLimit()),
+    // Empty string, not null: Lua has no null, and an absent owner must mean
+    // "unowned, exempt from the per-user cap" rather than a user literally
+    // named "null" who would then share a cap with every other unowned project.
+    ownerId ? String(ownerId) : '',
   );
   return { admitted: admitted === 1, position: Number(position) || 0 };
 }
@@ -181,6 +246,7 @@ async function release(redis, projectId) {
     redis.zrem(WAITING_KEY, projectId),
     redis.zrem(STITCHING_KEY, projectId),
     redis.hdel(WAITING_SEEN_KEY, projectId),
+    redis.hdel(OWNER_KEY, projectId),
   ]);
 }
 
@@ -227,14 +293,17 @@ async function admissionSnapshot(redis) {
     redis.zremrangebyscore(ACTIVE_KEY, '-inf', cutoff),
     redis.zremrangebyscore(STITCHING_KEY, '-inf', cutoff),
   ]);
-  const [active, waiting, stitching, secondsPerChunk] = await Promise.all([
+  const [active, waiting, stitching, secondsPerChunk, owners] = await Promise.all([
     redis.zrange(ACTIVE_KEY, 0, -1),
     redis.zrange(WAITING_KEY, 0, -1),
     redis.zrange(STITCHING_KEY, 0, -1),
     measuredChunkSeconds(redis),
+    redis.hgetall(OWNER_KEY).catch(() => ({})),
   ]);
   return {
     limit: admissionLimit(),
+    perUserLimit: perUserLimit(),
+    owners: owners ?? {},
     active,
     waiting,
     stitching,
@@ -246,7 +315,74 @@ async function admissionSnapshot(redis) {
   };
 }
 
-/** 1-based position, or 0 when the project is not waiting. */
+/**
+ * The position a user is actually told, accounting for the per-user cap.
+ *
+ * Raw FIFO rank became a lie the moment the cap existed. If user A has five
+ * projects queued ahead of user B's one, B's rank is 6 but B goes in as soon as
+ * a slot frees, because A is already at their cap and every one of those five
+ * is skipped. Telling B "position 6" would be a worse failure than showing no
+ * number: it is specific, confident and wrong.
+ *
+ * The model, stated plainly because it is an approximation: walk the queue in
+ * arrival order and count only the projects that would genuinely be admitted
+ * before this one. A project ahead counts if its owner still has room under the
+ * cap, and always counts if it belongs to the SAME user — a user's own projects
+ * queue behind each other regardless of anyone else's caps.
+ *
+ * Pure, so the rule is testable without Redis.
+ *
+ * @param {object} args
+ * @param {string} args.projectId
+ * @param {string[]} args.waiting        Waiting project ids, arrival order.
+ * @param {string[]} args.active         Currently admitted project ids.
+ * @param {Record<string,string>} args.owners  projectId -> userId.
+ * @param {number} args.perUser          Per-user cap; 0 disables.
+ * @returns {number} 1-based position, or 0 when not waiting.
+ */
+function effectiveQueuePosition({ projectId, waiting, active, owners, perUser }) {
+  const index = waiting.indexOf(projectId);
+  if (index < 0) return 0;
+  if (!perUser || perUser <= 0) return index + 1;
+
+  const myOwner = owners[projectId] ?? '';
+
+  // Slots each user already holds; the cap is measured against these.
+  const held = new Map();
+  for (const id of active) {
+    const owner = owners[id] ?? '';
+    if (!owner) continue;
+    held.set(owner, (held.get(owner) ?? 0) + 1);
+  }
+
+  let ahead = 0;
+  for (const id of waiting.slice(0, index)) {
+    const owner = owners[id] ?? '';
+
+    // Unowned projects are exempt from the cap, so they always go ahead.
+    if (!owner) {
+      ahead += 1;
+      continue;
+    }
+    // My own earlier projects are ahead of me no matter what: my queue is FIFO
+    // within itself even when I am at my cap.
+    if (owner === myOwner) {
+      ahead += 1;
+      held.set(owner, (held.get(owner) ?? 0) + 1);
+      continue;
+    }
+    if ((held.get(owner) ?? 0) < perUser) {
+      ahead += 1;
+      held.set(owner, (held.get(owner) ?? 0) + 1);
+    }
+    // Otherwise that user is at their cap and will be skipped in favour of
+    // whoever is eligible — so it is not ahead of me in any real sense.
+  }
+
+  return ahead + 1;
+}
+
+/** 1-based position among waiters, ignoring the per-user cap. Diagnostic only. */
 async function queuePosition(redis, projectId) {
   if (!projectId) return 0;
   const rank = await redis.zrank(WAITING_KEY, projectId);
@@ -280,10 +416,13 @@ module.exports = {
   WAITING_KEY,
   WAITING_SEEN_KEY,
   STITCHING_KEY,
+  OWNER_KEY,
   CHUNK_SECONDS_KEY,
   ADMISSION_TTL_MS,
   HEARTBEAT_INTERVAL_MS,
   admissionLimit,
+  perUserLimit,
+  effectiveQueuePosition,
   tryAdmit,
   refresh,
   startHeartbeat,

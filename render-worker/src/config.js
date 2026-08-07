@@ -53,6 +53,17 @@ const config = {
    * two other stitches — the 15m10s wait observed on 2026-08-07.
    */
   renderAdmissionLimit: intEnv('RENDER_ADMISSION_LIMIT', 3),
+  /**
+   * Slots any ONE user may hold at once. Total concurrency is unchanged; this
+   * only decides whose work fills the slots.
+   *
+   * Admission counts projects, which is right for capacity and wrong for
+   * fairness: first-come-first-served means one account submitting five
+   * projects fills every slot and blocks everyone else until they finish. Two
+   * keeps a heavy user moving while always leaving a slot for someone else.
+   * 0 disables the cap, which is the right setting for a single-operator box.
+   */
+  renderAdmissionPerUserLimit: intEnv('RENDER_ADMISSION_PER_USER_LIMIT', 2),
   workerConcurrencyStitches: intEnv('WORKER_CONCURRENCY_STITCHES', 2),
   maxClips: intEnv('MAX_CLIPS', 5000),
   maxDurationSeconds: intEnv('MAX_DURATION_SECONDS', 14400),

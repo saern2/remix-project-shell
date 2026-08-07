@@ -1082,7 +1082,11 @@ async function gateOnAdmission(job, token) {
     await clearMemoryWait(redis, job.id);
   }
 
-  const { admitted, position } = await admission.tryAdmit(redis, projectId);
+  // owner_id rides the payload from the app so admission can enforce per-user
+  // fairness. Absent (older payload, direct API call), the project is unowned
+  // and exempt — the cap must not become a way to reject work it cannot classify.
+  const ownerId = job.data?.owner_id ?? null;
+  const { admitted, position } = await admission.tryAdmit(redis, projectId, ownerId);
   if (admitted) return true;
 
   logger.info(

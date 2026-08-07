@@ -525,6 +525,12 @@ export const submitRenderJob = createServerFn({ method: "POST" })
 
     const body = {
       job_id: jobRow.id,
+      // Lets the worker enforce per-user fairness. Admission counts projects,
+      // which is right for capacity and wrong for fairness — without an owner
+      // one account submitting five projects fills every slot and blocks
+      // everyone else. Not used for authorisation: the worker only ever
+      // compares it to other owner ids.
+      owner_id: userId,
       clips,
       audio_url: audioSigned.signedUrl,
       ...dims,
