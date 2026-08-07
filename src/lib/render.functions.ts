@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { assertMaintenanceAllows } from "@/lib/maintenance.server";
 
 const ProjectIdInput = z.object({ projectId: z.string().uuid() });
 const JobIdInput = z.object({ jobId: z.string().uuid() });
@@ -98,6 +99,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
     const projectId = data.projectId;
+
+    await assertMaintenanceAllows("start_render", userId);
 
     const { data: project, error: projErr } = await supabase
       .from("projects")
@@ -895,6 +898,12 @@ export const cancelRenderJob = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => JobIdInput.parse(input))
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
+
+    // Cancelling is blocked too. It looks harmless, but it writes to
+    // render_jobs and projects and calls the worker — all of which is exactly
+    // what a freeze exists to stop. The render is paused, not lost, so there is
+    // nothing to escape from.
+    await assertMaintenanceAllows("cancel_render", userId);
 
     // Verify ownership
     const { data: job, error: jobErr } = await supabase

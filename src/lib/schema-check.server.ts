@@ -67,6 +67,14 @@ export const REQUIRED_SCHEMA: Array<{
     migration: "20260805000001_nasa_caption_cache",
   },
   {
+    // Absent, every gated action would fail open and maintenance mode would
+    // silently do nothing — the failure would only show up as writes landing
+    // during a migration, which is exactly when it is hardest to notice.
+    table: "maintenance_state",
+    columns: ["enabled", "message", "enabled_by", "enabled_at"],
+    migration: "20260810000001_maintenance_mode",
+  },
+  {
     table: "project_stock_corpus",
     columns: ["bucket_id", "candidates", "providers_done"],
     migration: "20260805160000_project_stock_corpus",

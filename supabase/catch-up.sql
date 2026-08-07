@@ -912,6 +912,34 @@ alter table public.projects
 comment on column public.projects.matching_idle_rounds is
   'Consecutive matching_footage invocations that matched zero new scenes. When it reaches the configured limit the stage terminates, so matching can never loop indefinitely.';
 
+-- ── 20260810000001: maintenance mode ────────────────────────────────────────
+
+create table if not exists public.maintenance_state (
+  id boolean primary key default true,
+  enabled boolean not null default false,
+  message text,
+  enabled_by uuid references public.users(id) on delete set null,
+  enabled_at timestamptz,
+  updated_at timestamptz not null default now(),
+  constraint maintenance_state_singleton check (id is true)
+);
+
+insert into public.maintenance_state (id, enabled)
+  values (true, false)
+  on conflict (id) do nothing;
+
+alter table public.maintenance_state enable row level security;
+
+drop policy if exists "maintenance readable" on public.maintenance_state;
+create policy "maintenance readable" on public.maintenance_state
+  for select to authenticated using (true);
+
+grant select on public.maintenance_state to authenticated;
+grant all on public.maintenance_state to service_role;
+
+comment on table public.maintenance_state is
+  'Single-row platform freeze flag. Overridden in both directions by the MAINTENANCE_MODE environment variable, which is resolved in the application.';
+
 -- ── 20260809000001: render queue position ───────────────────────────────────
 
 alter table public.render_jobs
@@ -1064,5 +1092,6 @@ from (
     ('access_activations.trusted_until', exists (select 1 from information_schema.columns where table_schema='public' and table_name='access_activations' and column_name='trusted_until')),
     ('projects.matching_idle_rounds',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='projects' and column_name='matching_idle_rounds')),
     ('render_jobs.queue_position',       exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='queue_position')),
+    ('maintenance_state (table)',        to_regclass('public.maintenance_state') is not null),
     ('render_jobs.stitch_state',         exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='stitch_state'))
 ) as checks(check_name, present);

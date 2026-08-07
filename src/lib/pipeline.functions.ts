@@ -2,6 +2,11 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import {
+  assertMaintenanceAllows,
+  isAdminUser,
+  readMaintenanceState,
+} from "@/lib/maintenance.server";
+import {
   createMatchingBudget,
   matchingSliceSize,
   matchingTimeBudgetMs,
@@ -122,6 +127,10 @@ export const startPipeline = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
     const projectId = data.projectId;
+
+    // Server-side, before anything else. The UI disables this button during
+    // maintenance, but a disabled button is decoration — this is the check.
+    await assertMaintenanceAllows("start_pipeline", userId);
 
     const { data: project, error: projectErr } = await supabase
       .from("projects")
@@ -332,6 +341,30 @@ export const pollPipeline = createServerFn({ method: "POST" })
       };
     }
     if (project.user_id !== userId) throw new Error("Forbidden.");
+
+    // ── Maintenance freeze ────────────────────────────────────────────────
+    // Matching advances only while a page polls, so returning here IS the
+    // freeze — no separate stop signal is needed, and none could be safer.
+    //
+    // Returns rather than throws, because the client polls this every few
+    // seconds and a thrown error would become a stream of failure toasts on a
+    // platform that is working exactly as intended. It reports the project's
+    // CURRENT status unchanged, so the client's state machine sees nothing new
+    // and simply keeps polling until maintenance lifts.
+    //
+    // Crucially this is before advanceFromMatchingFootage, so the invocation
+    // never runs, never claims the matching lock, and never counts as an idle
+    // round — a project frozen through a long deploy must not be killed by the
+    // idle-round watchdog for not progressing while it was forbidden to.
+    const maintenance = await readMaintenanceState();
+    if (maintenance.enabled && !(await isAdminUser(userId))) {
+      return {
+        status: project.status,
+        error_message: project.error_message,
+        paused_for_maintenance: true,
+        maintenance_message: maintenance.message,
+      };
+    }
 
     if (project.status === "transcribing") {
       return await advanceFromTranscribing(projectId, project.provider_job_id);
@@ -2095,6 +2128,9 @@ export const swapSceneClip = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => SwapInput.parse(input))
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
+
+    await assertMaintenanceAllows("swap_clip", userId);
+
     // Load scene + project (RLS scoped)
     const { data: scene, error: sErr } = await supabase
       .from("scenes")

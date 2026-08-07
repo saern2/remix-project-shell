@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { assertMaintenanceAllows } from "@/lib/maintenance.server";
 
 const ProjectIdInput = z.object({ projectId: z.string().uuid() });
 
@@ -17,6 +18,8 @@ export const deleteProject = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
     const projectId = data.projectId;
+
+    await assertMaintenanceAllows("delete_project", userId);
 
     // Verify ownership (REQ 4.2)
     const { data: project, error: projErr } = await supabase

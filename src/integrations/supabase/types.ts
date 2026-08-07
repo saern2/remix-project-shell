@@ -311,6 +311,41 @@ export type Database = {
         }
         Relationships: []
       }
+      maintenance_state: {
+        Row: {
+          enabled: boolean
+          enabled_at: string | null
+          enabled_by: string | null
+          id: boolean
+          message: string | null
+          updated_at: string
+        }
+        Insert: {
+          enabled?: boolean
+          enabled_at?: string | null
+          enabled_by?: string | null
+          id?: boolean
+          message?: string | null
+          updated_at?: string
+        }
+        Update: {
+          enabled?: boolean
+          enabled_at?: string | null
+          enabled_by?: string | null
+          id?: boolean
+          message?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "maintenance_state_enabled_by_fkey"
+            columns: ["enabled_by"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       nasa_asset_cache: {
         Row: {
           cached_at: string
