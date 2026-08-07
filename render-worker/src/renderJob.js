@@ -48,6 +48,7 @@ const { probeDurationSeconds, killActiveProbes } = require('./mediaProbe');
 const { DelayedError } = require('bullmq');
 const { parentProjectId } = require('./fairScheduling');
 const admission = require('./admissionControl');
+const maintenance = require('./maintenance');
 
 // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Redis client (cancel polling only) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
 // Separate connection from queue.js to avoid circular dependency.
@@ -594,11 +595,16 @@ function stitchDeadlineMs(clips) {
   return { expectedMs, noticeMs: expectedMs * 2, hardMs };
 }
 
-async function processStitchJob(job) {
+async function processStitchJob(job, token) {
   const payload = job.data;
   const jobId = job.id;
   const parentJobId = jobId.replace('-stitch', '');
-  
+
+  // Before the temp directory, before the concat list. A stitch that parks here
+  // has touched nothing, and its chunks' output.mp4 files are still on disk
+  // where the chunk jobs left them.
+  if (await gateOnMaintenance(job, token, { phase: 'stitching' })) return { status: 'frozen' };
+
   const tempDir = path.join(config.tempDir, parentJobId);
   await fsp.mkdir(tempDir, { recursive: true });
   await ensureResourceCapacity(config.tempDir, parentJobId);
@@ -677,6 +683,18 @@ async function processStitchJob(job) {
     jobId,
     [dlController, ffController],
     done,
+  );
+
+  // See the chunk pipeline for why this is a flag and not just an aborted
+  // signal: the freeze aborts the same controllers cancellation does, and only
+  // a separate flag can tell a deploy apart from a user pressing Cancel.
+  const frozen = { value: false };
+  const freezePollPromise = maintenance.pollFreezeUntilDone(
+    stitchRedis,
+    jobId,
+    [dlController, ffController],
+    done,
+    frozen,
   );
 
   let stitchSucceeded = false;
@@ -795,6 +813,29 @@ async function processStitchJob(job) {
     // cancel-flag poll. This is the sole discriminator. Checking signal.aborted
     // alone is insufficient because the hard timeout also aborts the controllers,
     // which would misclassify a timeout as a user cancellation.
+    // Maintenance is checked before the timeout and before cancellation, for
+    // the same reason the timeout is checked before cancellation: a freeze
+    // aborts the controllers all three of them read.
+    if (frozen.value) {
+      logger.warn({ jobId: parentJobId }, 'Stitch stopped for maintenance; parking it');
+      await maintenance.noteFrozen(stitchRedis, {
+        projectId: stitchProjectId,
+        jobId,
+        phase: 'stitching',
+        chunkIndex: null,
+        chunksTotal: payload.chunks_total ?? null,
+      });
+      // The client is told it is paused, not failed. `_error` stays null: a
+      // freeze is not an error, and the poll handler treats a non-null error on
+      // a finished job as a failure.
+      await job.updateData({ ...payload, _status: 'paused_for_maintenance' });
+      if (token) {
+        await job.moveToDelayed(Date.now() + maintenance.FREEZE_RECHECK_MS, token);
+        throw new DelayedError();
+      }
+      throw new Error('FROZEN: paused for maintenance');
+    }
+
     if (timedOut) {
       const timeoutSeconds = Math.round(hardTimeoutMs / 1000);
       logger.warn({ jobId: parentJobId, timeoutSeconds }, 'Stitch job timed out');
@@ -848,6 +889,7 @@ async function processStitchJob(job) {
     clearTimeout(hardTimeoutHandle);
     clearTimeout(stallTimer);
     await cancelPollPromise;
+    await freezePollPromise;
 
     // A failed stitch with an attempt remaining is not finished: it keeps its
     // slot (the retry is seconds away, and admitting a new project into that
@@ -855,7 +897,13 @@ async function processStitchJob(job) {
     // chunk outputs it will need to concat again. Deleting them here was fine
     // when a stitch could not retry; now it would guarantee every retry died
     // with "Chunk file missing for concat".
-    const retryPending = !stitchSucceeded && willRetry(job);
+    //
+    // A freeze is the same situation with a longer gap, and the same answer.
+    // It is ALSO the destructive case this feature had to get right: the loop
+    // below deletes every chunk directory of the project, so a frozen stitch
+    // that fell through here would delete all 51 finished chunk outputs and
+    // turn a deploy into a full re-render.
+    const retryPending = !stitchSucceeded && (frozen.value || willRetry(job));
 
     // THE release point for the project's admission slot, and the reason it is
     // here rather than at the last chunk: releasing when chunks finish would let
@@ -958,6 +1006,41 @@ async function clearMemoryWait(redis, jobId) {
  * out several slots must still get its full retries if it later hits a real
  * error.
  */
+/**
+ * Parks a job for the duration of a maintenance freeze.
+ *
+ * Checked before admission and before anything is downloaded, so a job that
+ * arrives during maintenance costs nothing: no temp directory, no bytes, no
+ * slot. Returns true when the caller should stop; throws DelayedError when it
+ * has a token, which is the normal path.
+ */
+async function gateOnMaintenance(job, token, { phase = 'starting' } = {}) {
+  const redis = getCancelRedis();
+  if (!(await maintenance.isFrozen(redis))) {
+    // Coming back from a freeze is the moment to take the note down; the admin
+    // list is only useful if a project that FAILS to resume stands out in it.
+    await maintenance.clearFrozen(redis, parentProjectId(job));
+    return false;
+  }
+
+  await maintenance.noteFrozen(redis, {
+    projectId: parentProjectId(job),
+    jobId: job.id,
+    phase,
+    chunkIndex: job.data?.chunk_index ?? null,
+    chunksTotal: job.data?.chunks_total ?? null,
+  });
+  logger.warn({ jobId: job.id, phase }, 'Maintenance freeze: parking job until maintenance ends');
+
+  if (token) {
+    // Delayed, not failed. The attempt count is untouched, so a project frozen
+    // through three deploys still has all three retries for a real error.
+    await job.moveToDelayed(Date.now() + maintenance.FREEZE_RECHECK_MS, token);
+    throw new DelayedError();
+  }
+  return true;
+}
+
 async function gateOnAdmission(job, token) {
   const projectId = parentProjectId(job);
   if (!projectId || !job.data?.is_chunk) return true;
@@ -1026,6 +1109,10 @@ async function processRenderJob(job, token) {
   const payload = job.data;
   const jobId = job.id;
 
+  // Maintenance before admission: a frozen platform should not be handing out
+  // slots, and a job that parks here has consumed nothing at all.
+  if (await gateOnMaintenance(job, token)) return { status: 'frozen' };
+
   // Admission first: nothing is downloaded, no temp directory is made, and no
   // capacity is consumed by a project that is only waiting for its turn.
   await gateOnAdmission(job, token);
@@ -1082,6 +1169,21 @@ async function processRenderJob(job, token) {
     jobId,
     [dlController, ffController],
     done,
+  );
+
+  // ── Maintenance freeze poll ───────────────────────────────────────────────
+  // A freeze that begins mid-chunk has to reach the running ffmpeg, and the
+  // only channel for that is the same one cancellation uses: abort the phase
+  // controllers. `frozen.value` is set BEFORE the abort so the catch block can
+  // tell the two apart — an aborted signal on its own cannot, and every round
+  // that relied on the signal alone mislabelled a retryable event as terminal.
+  const frozen = { value: false };
+  const freezePollPromise = maintenance.pollFreezeUntilDone(
+    getCancelRedis(),
+    jobId,
+    [dlController, ffController],
+    done,
+    frozen,
   );
 
   // ── Hard per-chunk watchdog (round 7) ─────────────────────────────────────
@@ -1291,6 +1393,31 @@ async function processRenderJob(job, token) {
     // controllers on its way out, so without this a watchdog kill would look
     // exactly like a user cancellation — and cancellations are not retried,
     // which would leave the hang unfixed while merely renaming it.
+    // A maintenance freeze is checked BEFORE both of them, and for the same
+    // reason the watchdog is checked before cancellation: it aborts the very
+    // controllers the others read. Left unchecked, a deploy would be recorded
+    // as "CANCELLED: user requested" — terminal, unretried, and a lie.
+    if (frozen.value) {
+      logger.warn(
+        { jobId, phase: phase.current, chunkIndex: payload.chunk_index ?? null },
+        'Chunk stopped for maintenance; parking it without spending an attempt',
+      );
+      await maintenance.noteFrozen(getCancelRedis(), {
+        projectId: parentProjectId(job),
+        jobId,
+        phase: phase.current,
+        chunkIndex: payload.chunk_index ?? null,
+        chunksTotal: payload.chunks_total ?? null,
+      });
+      if (token) {
+        await job.moveToDelayed(Date.now() + maintenance.FREEZE_RECHECK_MS, token);
+        throw new DelayedError();
+      }
+      // No token (tests, legacy path): surface it as a plainly non-terminal
+      // error rather than pretending the chunk succeeded.
+      throw new Error('FROZEN: paused for maintenance');
+    }
+
     const cancelledByUser =
       !watchdog.fired &&
       (dlController.signal.aborted || ffController.signal.aborted) &&
@@ -1355,6 +1482,7 @@ async function processRenderJob(job, token) {
     // Stop the cancellation poll loop
     done.value = true;
     await cancelPollPromise;
+    await freezePollPromise;
 
     // ── Chunk lease release (round 7) ──────────────────────────────────────
     // THIS IS THE FIX FOR THE 12/13 HANG. The lease was acquired and never
@@ -1381,7 +1509,19 @@ async function processRenderJob(job, token) {
     //   concat; delete everything else (downloaded clips, filtergraph script) to
     //   reclaim space while the stitch is in progress.
     try {
-      if (!payload.is_chunk) {
+      if (frozen.value) {
+        // THE LINE THAT MAKES A FREEZE A PAUSE. Every other exit path decides
+        // what to delete; this one deletes nothing. Downloaded sources, the
+        // filtergraph and any finished output all stay exactly as they are, so
+        // the resumed run verifies and reuses them instead of re-fetching
+        // hundreds of megabytes. Deleting here would turn "paused at chunk 30
+        // of 51" into "restart the 45-minute project", which is the outcome
+        // this whole feature exists to avoid.
+        logger.info(
+          { jobId, tempDir },
+          'Frozen for maintenance; temp directory kept intact for resume',
+        );
+      } else if (!payload.is_chunk) {
         // Non-chunk: clean everything
         await fsp.rm(tempDir, { recursive: true, force: true });
         logger.debug({ jobId, tempDir }, 'Temp directory cleaned up');

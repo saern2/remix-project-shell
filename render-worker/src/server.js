@@ -30,6 +30,8 @@ const { getQueue, getJobStatus, getRedisConnection, startWorker, getFlowProducer
 const { validatePayload } = require('./renderJob');
 const { buildChunkOpts, buildStitchOpts, writeCancelFlag } = require('./pipelineReliability');
 const { cancelJobsByPrefix } = require('./cancelJobs');
+const maintenance = require('./maintenance');
+const admission = require('./admissionControl');
 const {
   getInFlightProjects,
   chooseFairnessSlot,
@@ -223,6 +225,64 @@ app.post('/jobs/:id/cancel', requireApiKey, async (req, res) => {
   } catch (err) {
     logger.error({ err: err.message, jobId }, 'Failed to cancel job');
     return res.status(500).json({ error: 'Failed to cancel job', detail: err.message });
+  }
+});
+
+// ─── Maintenance mode ───────────────────────────────────────────────────────
+// The worker holds its own copy of the flag rather than asking the app on every
+// job: the app may be mid-deploy — that is the whole point of maintenance — and
+// a freeze that depends on the thing being deployed is not a freeze.
+
+app.get('/maintenance', requireApiKey, async (_req, res) => {
+  try {
+    const redis = getRedisConnection();
+    const [state, frozen, admissionState] = await Promise.all([
+      maintenance.readState(redis),
+      maintenance.listFrozen(redis),
+      admission.admissionSnapshot(redis).catch(() => null),
+    ]);
+    return res.json({
+      ...state,
+      frozen,
+      frozen_count: frozen.length,
+      // Feeds the admin's confirmation dialog: "3 projects rendering will pause."
+      rendering_count: admissionState?.activeCount ?? null,
+      queued_count: admissionState?.waitingCount ?? null,
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, 'Failed to read maintenance state');
+    return res.status(500).json({ error: 'Failed to read maintenance state', detail: err.message });
+  }
+});
+
+app.post('/maintenance', requireApiKey, async (req, res) => {
+  const { enabled, message, enabled_by: enabledBy } = req.body ?? {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  try {
+    const redis = getRedisConnection();
+    const before = await maintenance.readState(redis);
+    const state = await maintenance.setState(redis, { enabled, message, enabledBy });
+
+    // Every toggle is logged with who and what it caught, because the operator
+    // needs to be able to answer "what was running when I froze it" after the
+    // fact, and the frozen list only shows what is still frozen NOW.
+    logger.warn(
+      {
+        enabled: state.enabled,
+        enabledBy: state.enabledBy,
+        wasEnabled: before.enabled,
+        envOverride: state.envOverride,
+        overridden: state.overridden,
+      },
+      'Maintenance mode toggled',
+    );
+    return res.json(state);
+  } catch (err) {
+    logger.error({ err: err.message }, 'Failed to set maintenance state');
+    return res.status(500).json({ error: 'Failed to set maintenance state', detail: err.message });
   }
 });
 
