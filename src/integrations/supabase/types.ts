@@ -659,6 +659,8 @@ export type Database = {
           output_url: string | null
           progress_pct: number
           project_id: string
+          queue_estimate_seconds: number | null
+          queue_position: number | null
           settings: Json
           stall_notice: string | null
           started_at: string | null
@@ -675,6 +677,8 @@ export type Database = {
           output_url?: string | null
           progress_pct?: number
           project_id: string
+          queue_estimate_seconds?: number | null
+          queue_position?: number | null
           settings: Json
           stall_notice?: string | null
           started_at?: string | null
@@ -691,6 +695,8 @@ export type Database = {
           output_url?: string | null
           progress_pct?: number
           project_id?: string
+          queue_estimate_seconds?: number | null
+          queue_position?: number | null
           settings?: Json
           stall_notice?: string | null
           started_at?: string | null

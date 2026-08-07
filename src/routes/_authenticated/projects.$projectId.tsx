@@ -7,6 +7,7 @@ import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.funct
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import { isMissingPollResult, nextPollDelayMs, pollIntervalWhileActive } from "@/lib/polling-state";
+import { describeQueuePosition } from "@/lib/render-queue";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -314,7 +315,7 @@ function ProjectDetail() {
       const { data, error } = await supabase
         .from("render_jobs")
         .select(
-          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, created_at",
+          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, queue_position, queue_estimate_seconds, created_at",
         )
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
@@ -815,6 +816,27 @@ function ProjectDetail() {
                           <span className="ml-1">Cancel</span>
                         </Button>
                       </div>
+                      {describeQueuePosition(
+                        renderJob.queue_position,
+                        renderJob.queue_estimate_seconds,
+                      ) ? (
+                        // Neutral, not amber: being third in line is normal and
+                        // temporary. Before the render cap existed this looked
+                        // identical to a hang — queued, 0 segments, nothing
+                        // moving, no reason given.
+                        <div
+                          role="status"
+                          className="flex items-start gap-2 rounded-md border border-border bg-muted/50 p-3 text-sm text-muted-foreground"
+                        >
+                          <Clock className="mt-0.5 h-4 w-4 shrink-0" />
+                          <span>
+                            {describeQueuePosition(
+                              renderJob.queue_position,
+                              renderJob.queue_estimate_seconds,
+                            )}
+                          </span>
+                        </div>
+                      ) : null}
                       {renderJob.stall_notice ? (
                         // A render that is stuck must say so. Previously this
                         // panel showed "12 of 13 segments rendered" unchanged

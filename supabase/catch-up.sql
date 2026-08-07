@@ -912,6 +912,17 @@ alter table public.projects
 comment on column public.projects.matching_idle_rounds is
   'Consecutive matching_footage invocations that matched zero new scenes. When it reaches the configured limit the stage terminates, so matching can never loop indefinitely.';
 
+-- ── 20260809000001: render queue position ───────────────────────────────────
+
+alter table public.render_jobs
+  add column if not exists queue_position integer,
+  add column if not exists queue_estimate_seconds integer;
+
+comment on column public.render_jobs.queue_position is
+  '1-based position among projects waiting for a render slot, or null when this project is not waiting.';
+comment on column public.render_jobs.queue_estimate_seconds is
+  'Rough seconds until this project is expected to start. An ESTIMATE — must be presented as one. Null when unknown.';
+
 -- ── 20260807000001: passwordless sign-in ────────────────────────────────────
 
 alter table public.access_activations
@@ -1033,5 +1044,6 @@ from (
     ('auth_login_codes (table)',         to_regclass('public.auth_login_codes') is not null),
     ('auth_login_failures (table)',      to_regclass('public.auth_login_failures') is not null),
     ('access_activations.trusted_until', exists (select 1 from information_schema.columns where table_schema='public' and table_name='access_activations' and column_name='trusted_until')),
-    ('projects.matching_idle_rounds',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='projects' and column_name='matching_idle_rounds'))
+    ('projects.matching_idle_rounds',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='projects' and column_name='matching_idle_rounds')),
+    ('render_jobs.queue_position',       exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='queue_position'))
 ) as checks(check_name, present);

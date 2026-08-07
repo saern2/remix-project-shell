@@ -735,6 +735,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       error?: string | null;
       chunks_total?: number | null;
       chunks_completed?: number | null;
+      queue_position?: number | null;
+      queue_estimate_seconds?: number | null;
       stalled?: boolean;
       health?: {
         state?: string;
@@ -759,6 +761,17 @@ export const pollRenderJob = createServerFn({ method: "POST" })
     // half its watchdog budget or is being retried. Round 7, Problem 3 — the
     // deployed hang showed 12/13 with no indication anything was wrong.
     const stallNotice = describeStall(payload.stalled === true, payload.health ?? null);
+    // A project waiting for a render slot is not stalled and is not failing —
+    // it is third in line. Kept in its own columns rather than folded into
+    // stall_notice, which the UI renders as a warning.
+    const queuePosition =
+      typeof payload.queue_position === "number" && payload.queue_position > 0
+        ? payload.queue_position
+        : null;
+    const queueEstimateSeconds =
+      queuePosition != null && typeof payload.queue_estimate_seconds === "number"
+        ? payload.queue_estimate_seconds
+        : null;
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -771,6 +784,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       output_url?: string | null;
       chunks_total?: number | null;
       chunks_completed?: number | null;
+      queue_position?: number | null;
+      queue_estimate_seconds?: number | null;
     } = {
       status,
       progress_pct: progress,
@@ -778,11 +793,15 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       stall_notice: stallNotice,
       chunks_total: chunksTotal,
       chunks_completed: chunksCompleted,
+      queue_position: queuePosition,
+      queue_estimate_seconds: queueEstimateSeconds,
     };
     if (status === "completed") {
       jobUpdate.completed_at = new Date().toISOString();
       jobUpdate.progress_pct = 100;
       jobUpdate.stall_notice = null;
+      jobUpdate.queue_position = null;
+      jobUpdate.queue_estimate_seconds = null;
       if (chunksTotal != null) jobUpdate.chunks_completed = chunksTotal;
     }
     if (status === "failed") {
@@ -825,6 +844,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       chunks_total: chunksTotal,
       chunks_completed:
         status === "completed" && chunksTotal != null ? chunksTotal : chunksCompleted,
+      queue_position: queuePosition,
+      queue_estimate_seconds: queueEstimateSeconds,
     };
   });
 
