@@ -81,17 +81,56 @@ async function readNumericFile(filePath) {
   }
 }
 
+/**
+ * Reclaimable page cache inside the cgroup, from memory.stat.
+ *
+ * `memory.current` counts the page cache, and this worker generates page cache
+ * by the gigabyte: every chunk writes an output file, and the stitch reads all
+ * of them back. Charging that against available memory would make the machine
+ * look starved precisely when it is busiest — and since the kernel drops clean
+ * file pages on demand rather than OOM-killing, it is memory that IS available.
+ *
+ * Counting it as used is not a harmless overestimate: it would make the
+ * admission gate defer every chunk on a machine with plenty of room.
+ */
+async function reclaimableCacheBytes(statPath, keys) {
+  try {
+    const text = await fsp.readFile(statPath, 'utf8');
+    let total = 0;
+    for (const line of text.split('\n')) {
+      const [key, value] = line.split(/\s+/);
+      if (keys.includes(key)) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) total += parsed;
+      }
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+
 async function availableMemoryBytes() {
   const cgroupV2Max = await readNumericFile('/sys/fs/cgroup/memory.max');
   const cgroupV2Current = await readNumericFile('/sys/fs/cgroup/memory.current');
   if (cgroupV2Max != null && cgroupV2Current != null) {
-    return Math.max(0, cgroupV2Max - cgroupV2Current);
+    // inactive_file is what the kernel reclaims first; slab_reclaimable follows.
+    // Deliberately NOT active_file — those pages are in use and reclaiming them
+    // would cost re-reads.
+    const reclaimable = await reclaimableCacheBytes('/sys/fs/cgroup/memory.stat', [
+      'inactive_file',
+      'slab_reclaimable',
+    ]);
+    return Math.max(0, cgroupV2Max - Math.max(0, cgroupV2Current - reclaimable));
   }
 
   const cgroupV1Max = await readNumericFile('/sys/fs/cgroup/memory/memory.limit_in_bytes');
   const cgroupV1Current = await readNumericFile('/sys/fs/cgroup/memory/memory.usage_in_bytes');
   if (cgroupV1Max != null && cgroupV1Current != null && cgroupV1Max < Number.MAX_SAFE_INTEGER) {
-    return Math.max(0, cgroupV1Max - cgroupV1Current);
+    const reclaimable = await reclaimableCacheBytes('/sys/fs/cgroup/memory/memory.stat', [
+      'inactive_file',
+    ]);
+    return Math.max(0, cgroupV1Max - Math.max(0, cgroupV1Current - reclaimable));
   }
 
   return os.freemem();
@@ -127,6 +166,27 @@ async function ensureResourceCapacity(baseDir, jobId) {
   }
   logger.info({ jobId, ...snapshot }, 'Render resource preflight passed');
   return snapshot;
+}
+
+/**
+ * Is there enough free memory to START another chunk?
+ *
+ * Distinct from ensureResourceCapacity's minFreeMemoryBytes, which is a hard
+ * floor that FAILS the job: this is an admission gate that DEFERS it, so the
+ * chunk waits for headroom instead of burning an attempt on a transient spike.
+ *
+ * It has to hold at 24 GB, not just at the 8 GB that OOM-killed the container:
+ * raising the limit raises the ceiling, it does not remove the spike. Concurrent
+ * stitches of multi-GB files are the spike, and they scale with the work in
+ * flight rather than with the limit.
+ */
+async function hasAdmissionMemoryHeadroom() {
+  const availableBytes = await availableMemoryBytes();
+  return {
+    ok: availableBytes >= config.admissionMinFreeMemoryBytes,
+    availableBytes,
+    requiredBytes: config.admissionMinFreeMemoryBytes,
+  };
 }
 
 async function readyChunkOutput(outputPath) {
@@ -312,6 +372,8 @@ module.exports = {
   acquireFfmpegSlot,
   resourceSnapshot,
   ensureResourceCapacity,
+  availableMemoryBytes,
+  hasAdmissionMemoryHeadroom,
   readyChunkOutput,
   acquireChunkLease,
   markChunkReady,

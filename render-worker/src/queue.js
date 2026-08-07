@@ -6,6 +6,7 @@ const config = require('./config');
 const logger = require('./logger');
 const { processRenderJob, processStitchJob, closeRenderConnections } = require('./renderJob');
 const { readJobHealth } = require('./resourceControl');
+const admission = require('./admissionControl');
 
 const QUEUE_NAME = 'render';
 const QUEUE_CHUNK = 'render-chunk';
@@ -67,10 +68,13 @@ function telemetryKey(queueName, jobId) {
 function createWorker(queueName, processor, concurrency, timeoutMs) {
   const worker = new Worker(
     queueName,
-    async (job) => {
+    // The token is threaded through so a processor can move its own job back to
+    // delayed — the admission gate needs it to defer a chunk without consuming
+    // a retry attempt.
+    async (job, token) => {
       jobStartedAt.set(telemetryKey(queueName, job.id), Date.now());
       logger.info({ jobId: job.id, queue: queueName }, 'Worker picked up job');
-      return processor(job);
+      return processor(job, token);
     },
     {
       connection: createRedisConnection(),
@@ -159,6 +163,8 @@ function startWorker() {
       legacyConcurrency: config.workerConcurrency,
       chunkConcurrency: effectiveChunkConcurrency,
       stitchConcurrency: config.workerConcurrencyStitches,
+      renderAdmissionLimit: config.renderAdmissionLimit,
+      admissionMinFreeMemoryMb: Math.round(config.admissionMinFreeMemoryBytes / 1024 / 1024),
     },
     'Render worker resource budget',
   );
@@ -229,9 +235,42 @@ async function getJobStatus(job) {
       );
     }
 
+    // ── Admission queue (round 18) ────────────────────────────────────────
+    // A queued project used to be indistinguishable from a stuck one: status
+    // "waiting", 0 chunks done, nothing moving, no explanation. The worker knows
+    // exactly where it is in line, so say so.
+    const projectId = job.id.replace(/-stitch$/, '');
+    try {
+      const snapshot = await admission.admissionSnapshot(getRedisConnection());
+      const position = snapshot.waiting.indexOf(projectId) + 1;
+      result.admission = {
+        limit: snapshot.limit,
+        active_count: snapshot.activeCount,
+        waiting_count: snapshot.waitingCount,
+        stitching_count: snapshot.stitchingCount,
+        // null until this machine has measured a chunk; the caller must not
+        // present a fabricated estimate as a measured one.
+        seconds_per_chunk: snapshot.secondsPerChunk,
+      };
+      if (position > 0) {
+        result.status = 'queued';
+        result.queue_position = position;
+        result.queue_estimate_seconds = admission.estimateWaitSeconds({
+          position,
+          chunksAhead: (result.chunks_total || 0) * position,
+          secondsPerChunk: snapshot.secondsPerChunk,
+          chunkConcurrency: snapshot.chunkConcurrency,
+        });
+      }
+    } catch (err) {
+      // Advisory only. A project that is actually rendering must not report a
+      // failure because the queue view was unavailable.
+      logger.warn({ jobId: job.id, err: err.message }, 'Admission snapshot unavailable');
+    }
+
     // A child chunk in trouble is otherwise invisible here: this job's own
     // status stays "waiting-children" while chunks_completed silently stops.
-    const health = await readJobHealth(getRedisConnection(), job.id.replace(/-stitch$/, ''));
+    const health = await readJobHealth(getRedisConnection(), projectId);
     if (health) {
       result.health = health;
       result.stalled = health.state === 'stalled' || health.state === 'retrying';

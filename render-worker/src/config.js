@@ -46,6 +46,13 @@ const config = {
   stitchTimeoutSeconds: intEnv('STITCH_TIMEOUT_SECONDS', 600),
   chunkSize: intEnv('CHUNK_SIZE', 12),
   workerConcurrencyChunks: intEnv('WORKER_CONCURRENCY_CHUNKS', 4),
+  /**
+   * Projects allowed to RENDER at once. Beyond this they queue, and are told
+   * where they are. Three keeps the four chunk slots busy while leaving the two
+   * stitch slots enough headroom that a finishing project is not stuck behind
+   * two other stitches — the 15m10s wait observed on 2026-08-07.
+   */
+  renderAdmissionLimit: intEnv('RENDER_ADMISSION_LIMIT', 3),
   workerConcurrencyStitches: intEnv('WORKER_CONCURRENCY_STITCHES', 2),
   maxClips: intEnv('MAX_CLIPS', 5000),
   maxDurationSeconds: intEnv('MAX_DURATION_SECONDS', 14400),
@@ -90,6 +97,20 @@ const config = {
   ffmpegMaxProcesses: intEnv('FFMPEG_MAX_PROCESSES', 0),
   minFreeDiskBytes: intEnv('MIN_FREE_DISK_BYTES', 2 * 1024 * 1024 * 1024),
   minFreeMemoryBytes: intEnv('MIN_FREE_MEMORY_BYTES', 256 * 1024 * 1024),
+  /**
+   * Free memory a chunk needs before it may START. Below this it is deferred,
+   * not failed — waiting for headroom is not an error, and burning a retry
+   * attempt on a transient spike is how a busy machine turns pressure into
+   * permanent failures.
+   *
+   * Much higher than minFreeMemoryBytes (256 MB) because they answer different
+   * questions: that one is the floor below which a render cannot work at all,
+   * this one is the headroom a new chunk should leave for the stitches and
+   * uploads already in flight. 2 GB is roughly one concurrent stitch's working
+   * set plus margin, and it stays meaningful at the raised 24 GB container limit
+   * — the spike scales with work in flight, not with the limit.
+   */
+  admissionMinFreeMemoryBytes: intEnv('ADMISSION_MIN_FREE_MEMORY_BYTES', 2 * 1024 * 1024 * 1024),
   chunkLeaseRenewMs: intEnv('CHUNK_LEASE_RENEW_MS', 20_000),
   fairnessPriorityStride: intEnv('FAIRNESS_PRIORITY_STRIDE', 1000),
 
