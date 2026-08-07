@@ -1101,16 +1101,25 @@ async function advanceFromMatchingFootage(projectId: string) {
       }
 
       const startedAt = Date.now();
-      const { data, error: queryError } = await supabaseAdmin
-        .from("scenes")
-        .select("id, visual_query")
-        .in("id", sceneIds);
-      profile.add("sceneRead", Date.now() - startedAt);
-      profile.count("sceneReadRows", data?.length ?? 0);
-      if (queryError) throw new Error(queryError.message);
-      for (const row of data ?? []) {
-        if (row.visual_query) queries.set(row.id, row.visual_query);
+      // Chunked: the id list travels in the URL. At 37 characters per UUID, 600
+      // scenes is a 22 KB request line — past the common 8 KB default and past
+      // Cloudflare's 16 KB. The process cache usually spares us this query
+      // entirely, but a server restart mid-run removes that protection, which is
+      // exactly when the list is longest.
+      let rowsRead = 0;
+      for (const ids of chunked(sceneIds)) {
+        const { data, error: queryError } = await supabaseAdmin
+          .from("scenes")
+          .select("id, visual_query")
+          .in("id", ids);
+        if (queryError) throw new Error(queryError.message);
+        rowsRead += data?.length ?? 0;
+        for (const row of data ?? []) {
+          if (row.visual_query) queries.set(row.id, row.visual_query);
+        }
       }
+      profile.add("sceneRead", Date.now() - startedAt);
+      profile.count("sceneReadRows", rowsRead);
       mergeVisualQueries(projectId, queries);
       return queries;
     };
@@ -1627,11 +1636,13 @@ async function advanceFromMatchingFootage(projectId: string) {
           ...newlySelectedSceneIds,
         ]),
       ];
-      if (sceneIdsToMarkSelected.length > 0) {
-        await supabaseAdmin
+      // Same URL-length reason as loadVisualQueries above.
+      for (const ids of chunked(sceneIdsToMarkSelected)) {
+        const { error } = await supabaseAdmin
           .from("scenes")
           .update({ status: "selected" })
-          .in("id", sceneIdsToMarkSelected);
+          .in("id", ids);
+        if (error) throw new Error(error.message);
       }
 
       console.info("[matching_footage:fixed-duration]", {
