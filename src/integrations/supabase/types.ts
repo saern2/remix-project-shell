@@ -346,6 +346,41 @@ export type Database = {
           },
         ]
       }
+      maintenance_state: {
+        Row: {
+          enabled: boolean
+          enabled_at: string | null
+          enabled_by: string | null
+          id: boolean
+          message: string | null
+          updated_at: string
+        }
+        Insert: {
+          enabled?: boolean
+          enabled_at?: string | null
+          enabled_by?: string | null
+          id?: boolean
+          message?: string | null
+          updated_at?: string
+        }
+        Update: {
+          enabled?: boolean
+          enabled_at?: string | null
+          enabled_by?: string | null
+          id?: boolean
+          message?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "maintenance_state_enabled_by_fkey"
+            columns: ["enabled_by"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       nasa_asset_cache: {
         Row: {
           cached_at: string
@@ -658,6 +693,8 @@ export type Database = {
       }
       render_jobs: {
         Row: {
+          chunk_state: string | null
+          chunks_ahead: number | null
           chunks_completed: number | null
           chunks_total: number | null
           completed_at: string | null
@@ -678,6 +715,8 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          chunk_state?: string | null
+          chunks_ahead?: number | null
           chunks_completed?: number | null
           chunks_total?: number | null
           completed_at?: string | null
@@ -698,6 +737,8 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          chunk_state?: string | null
+          chunks_ahead?: number | null
           chunks_completed?: number | null
           chunks_total?: number | null
           completed_at?: string | null
