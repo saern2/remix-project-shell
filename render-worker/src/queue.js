@@ -7,6 +7,7 @@ const logger = require('./logger');
 const { processRenderJob, processStitchJob, closeRenderConnections } = require('./renderJob');
 const { readJobHealth, publishJobHealth } = require('./resourceControl');
 const { recoverFailedChunk, clearRecovery } = require('./chunkRecovery');
+const { startReconciler, stopReconciler } = require('./reconciler');
 const admission = require('./admissionControl');
 const { parentProjectId, shouldPromoteTail, tailPriority } = require('./fairScheduling');
 
@@ -230,6 +231,14 @@ function startWorker() {
       config.stitchTimeoutSeconds * 1000,
     ),
   );
+
+  // The safety net for work that leaves the runnable path without telling
+  // anyone. Started with the workers so it lives exactly as long as they do.
+  startReconciler({
+    stitchQueue: getQueue(QUEUE_STITCH),
+    chunkQueue: getQueue(QUEUE_CHUNK),
+    redis: getRedisConnection(),
+  });
 
   logger.info(
     {

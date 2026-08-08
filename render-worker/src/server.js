@@ -364,9 +364,44 @@ async function sweepOrphanedTempDirs() {
   const now = Date.now();
   let sweptCount = 0;
   let sweptBytes = 0;
+  let protectedCount = 0;
+
+  // Projects whose stitch is still waiting for its children. Their chunk
+  // outputs are NOT orphans however old they look.
+  //
+  // The 2026-08-09 incident made this urgent rather than theoretical: the sweep
+  // deleted 61 directories and 968 MB belonging to two of the four stalled
+  // projects, because it judges by mtime alone and their chunks had finished
+  // six hours earlier. Recovering those chunks afterwards could not have
+  // worked — the stitch would have died on "Chunk file missing for concat".
+  // A repair path is worthless if the janitor throws away the parts first.
+  let liveProjects = new Set();
+  try {
+    const waitingParents = await getQueue(QUEUE_STITCH).getWaitingChildren();
+    liveProjects = new Set(
+      (waitingParents ?? [])
+        .map((job) => (job?.id ? String(job.id).replace(/-stitch$/, '') : null))
+        .filter(Boolean),
+    );
+  } catch (err) {
+    // Cannot tell which projects are live: sweep nothing rather than risk
+    // deleting work in progress. Disk is recoverable; a render is not.
+    logger.warn(
+      { err: err.message },
+      'Temp sweep: cannot determine live projects; skipping this sweep',
+    );
+    return;
+  }
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+
+    const owningProject = entry.name.replace(/-chunk-\d+$/, '');
+    if (liveProjects.has(owningProject)) {
+      protectedCount += 1;
+      continue;
+    }
+
     const fullPath = path.join(baseDir, entry.name);
     let stat;
     try {
@@ -391,11 +426,14 @@ async function sweepOrphanedTempDirs() {
 
   if (sweptCount > 0) {
     logger.info(
-      { sweptCount, sweptBytes, sweptMB: (sweptBytes / 1024 / 1024).toFixed(1) },
+      { sweptCount, sweptBytes, sweptMB: (sweptBytes / 1024 / 1024).toFixed(1), protectedCount },
       'Temp sweep complete',
     );
   } else {
-    logger.info({ baseDir, dirCount: entries.length }, 'Temp sweep: no orphaned directories found');
+    logger.info(
+      { baseDir, dirCount: entries.length, protectedCount },
+      'Temp sweep: no orphaned directories found',
+    );
   }
 }
 
