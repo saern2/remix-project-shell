@@ -219,6 +219,80 @@ export type Database = {
           },
         ]
       }
+      auth_login_codes: {
+        Row: {
+          attempts: number
+          client_token_hash: string
+          code_hash: string | null
+          consumed_at: string | null
+          created_at: string
+          email_normalized: string
+          expires_at: string
+          id: string
+          invalidated_at: string | null
+          max_attempts: number
+          user_id: string
+        }
+        Insert: {
+          attempts?: number
+          client_token_hash: string
+          code_hash?: string | null
+          consumed_at?: string | null
+          created_at?: string
+          email_normalized: string
+          expires_at: string
+          id?: string
+          invalidated_at?: string | null
+          max_attempts?: number
+          user_id: string
+        }
+        Update: {
+          attempts?: number
+          client_token_hash?: string
+          code_hash?: string | null
+          consumed_at?: string | null
+          created_at?: string
+          email_normalized?: string
+          expires_at?: string
+          id?: string
+          invalidated_at?: string | null
+          max_attempts?: number
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "auth_login_codes_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      auth_login_failures: {
+        Row: {
+          created_at: string
+          email_normalized: string | null
+          id: number
+          ip_address: string | null
+          stage: string
+        }
+        Insert: {
+          created_at?: string
+          email_normalized?: string | null
+          id?: never
+          ip_address?: string | null
+          stage: string
+        }
+        Update: {
+          created_at?: string
+          email_normalized?: string | null
+          id?: never
+          ip_address?: string | null
+          stage?: string
+        }
+        Relationships: []
+      }
       clip_candidates: {
         Row: {
           created_at: string
@@ -272,6 +346,36 @@ export type Database = {
           },
         ]
       }
+      nasa_asset_cache: {
+        Row: {
+          cached_at: string
+          duration_known: boolean
+          duration_seconds: number | null
+          files: Json
+          has_captions: boolean | null
+          nasa_id: string
+          thumbnail_url: string | null
+        }
+        Insert: {
+          cached_at?: string
+          duration_known?: boolean
+          duration_seconds?: number | null
+          files?: Json
+          has_captions?: boolean | null
+          nasa_id: string
+          thumbnail_url?: string | null
+        }
+        Update: {
+          cached_at?: string
+          duration_known?: boolean
+          duration_seconds?: number | null
+          files?: Json
+          has_captions?: boolean | null
+          nasa_id?: string
+          thumbnail_url?: string | null
+        }
+        Relationships: []
+      }
       pexels_api_keys: {
         Row: {
           added_at: string
@@ -308,71 +412,6 @@ export type Database = {
           rate_limit_remaining?: number | null
           rate_limit_reset_at?: string | null
           request_count?: number
-        }
-        Relationships: []
-      }
-      maintenance_state: {
-        Row: {
-          enabled: boolean
-          enabled_at: string | null
-          enabled_by: string | null
-          id: boolean
-          message: string | null
-          updated_at: string
-        }
-        Insert: {
-          enabled?: boolean
-          enabled_at?: string | null
-          enabled_by?: string | null
-          id?: boolean
-          message?: string | null
-          updated_at?: string
-        }
-        Update: {
-          enabled?: boolean
-          enabled_at?: string | null
-          enabled_by?: string | null
-          id?: boolean
-          message?: string | null
-          updated_at?: string
-        }
-        Relationships: [
-          {
-            foreignKeyName: "maintenance_state_enabled_by_fkey"
-            columns: ["enabled_by"]
-            isOneToOne: false
-            referencedRelation: "users"
-            referencedColumns: ["id"]
-          },
-        ]
-      }
-      nasa_asset_cache: {
-        Row: {
-          cached_at: string
-          duration_known: boolean
-          duration_seconds: number | null
-          files: Json
-          has_captions: boolean | null
-          nasa_id: string
-          thumbnail_url: string | null
-        }
-        Insert: {
-          cached_at?: string
-          duration_known?: boolean
-          duration_seconds?: number | null
-          files?: Json
-          has_captions?: boolean | null
-          nasa_id: string
-          thumbnail_url?: string | null
-        }
-        Update: {
-          cached_at?: string
-          duration_known?: boolean
-          duration_seconds?: number | null
-          files?: Json
-          has_captions?: boolean | null
-          nasa_id?: string
-          thumbnail_url?: string | null
         }
         Relationships: []
       }
@@ -461,72 +500,6 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
-      }
-      auth_login_codes: {
-        Row: {
-          id: string
-          user_id: string
-          email_normalized: string
-          code_hash: string | null
-          client_token_hash: string
-          attempts: number
-          max_attempts: number
-          expires_at: string
-          consumed_at: string | null
-          invalidated_at: string | null
-          created_at: string
-        }
-        Insert: {
-          id?: string
-          user_id: string
-          email_normalized: string
-          code_hash?: string | null
-          client_token_hash: string
-          attempts?: number
-          max_attempts?: number
-          expires_at: string
-          consumed_at?: string | null
-          invalidated_at?: string | null
-          created_at?: string
-        }
-        Update: {
-          id?: string
-          user_id?: string
-          email_normalized?: string
-          code_hash?: string | null
-          client_token_hash?: string
-          attempts?: number
-          max_attempts?: number
-          expires_at?: string
-          consumed_at?: string | null
-          invalidated_at?: string | null
-          created_at?: string
-        }
-        Relationships: []
-      }
-      auth_login_failures: {
-        Row: {
-          id: number
-          email_normalized: string | null
-          ip_address: string | null
-          stage: string
-          created_at: string
-        }
-        Insert: {
-          id?: number
-          email_normalized?: string | null
-          ip_address?: string | null
-          stage: string
-          created_at?: string
-        }
-        Update: {
-          id?: number
-          email_normalized?: string | null
-          ip_address?: string | null
-          stage?: string
-          created_at?: string
-        }
-        Relationships: []
       }
       projects: {
         Row: {
@@ -686,8 +659,6 @@ export type Database = {
       render_jobs: {
         Row: {
           chunks_completed: number | null
-          chunk_state: string | null
-          chunks_ahead: number | null
           chunks_total: number | null
           completed_at: string | null
           created_at: string
@@ -701,15 +672,13 @@ export type Database = {
           settings: Json
           stall_notice: string | null
           started_at: string | null
+          status: string
           stitch_state: string | null
           stitches_ahead: number | null
-          status: string
           updated_at: string
         }
         Insert: {
           chunks_completed?: number | null
-          chunk_state?: string | null
-          chunks_ahead?: number | null
           chunks_total?: number | null
           completed_at?: string | null
           created_at?: string
@@ -730,8 +699,6 @@ export type Database = {
         }
         Update: {
           chunks_completed?: number | null
-          chunk_state?: string | null
-          chunks_ahead?: number | null
           chunks_total?: number | null
           completed_at?: string | null
           created_at?: string
@@ -1094,11 +1061,7 @@ export type Database = {
       }
       is_admin: { Args: { _user_id: string }; Returns: boolean }
       record_pexels_key_response: {
-        Args: {
-          p_id: string
-          p_remaining: number | null
-          p_reset_at: string | null
-        }
+        Args: { p_id: string; p_remaining: number; p_reset_at: string }
         Returns: undefined
       }
       reset_access_secret_activations: {
