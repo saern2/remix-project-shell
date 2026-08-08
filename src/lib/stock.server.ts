@@ -403,9 +403,11 @@ async function markKeyUsed(id: string, res: Response) {
   const remaining = remainingHeader == null ? null : Number(remainingHeader);
   await supabaseAdmin.rpc("record_pexels_key_response", {
     p_id: id,
-    p_remaining: remaining !== null && Number.isFinite(remaining) ? remaining : null,
-    p_reset_at: pexelsResetAt(res),
+    // The RPC accepts nulls for both ("unknown"), but generated types mark them required.
+    p_remaining: (remaining !== null && Number.isFinite(remaining) ? remaining : null) as number,
+    p_reset_at: pexelsResetAt(res) as string,
   });
+
 }
 
 async function markKeyDead(id: string, message: string) {
