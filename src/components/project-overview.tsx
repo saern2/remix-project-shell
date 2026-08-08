@@ -18,7 +18,7 @@ import { deleteProject } from "@/lib/deleteProject";
 import { useIsAdmin } from "@/hooks/use-is-admin";
 import { describeMatchingProgress, shortMatchingLabel } from "@/lib/matching-progress";
 import { getMatchingProgress } from "@/lib/matching-progress.functions";
-import { pollWithAuthRetry } from "@/lib/auth-retry.client";
+import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
 import { Progress } from "@/components/ui/progress";
 import {
   oldestProject,
