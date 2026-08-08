@@ -5,7 +5,8 @@ const IORedis = require('ioredis');
 const config = require('./config');
 const logger = require('./logger');
 const { processRenderJob, processStitchJob, closeRenderConnections } = require('./renderJob');
-const { readJobHealth } = require('./resourceControl');
+const { readJobHealth, publishJobHealth } = require('./resourceControl');
+const { recoverFailedChunk, clearRecovery } = require('./chunkRecovery');
 const admission = require('./admissionControl');
 const { parentProjectId, shouldPromoteTail, tailPriority } = require('./fairScheduling');
 
@@ -136,6 +137,7 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
     // instead of dripping behind newer projects' early chunks. Fire-and-forget:
     // scheduling advice must never fail a completed job.
     if (queueName === QUEUE_CHUNK && job?.data?.is_chunk) {
+      clearRecovery(getRedisConnection(), job.id).catch(() => {});
       promoteTailChunks(job).catch((err) => {
         logger.warn({ jobId: job.id, err: err.message }, 'Tail promotion sweep failed');
       });
@@ -145,6 +147,33 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
   worker.on('failed', (job, err) => {
     if (job?.id) jobStartedAt.delete(telemetryKey(queueName, job.id));
     logger.error({ jobId: job?.id, err: err.message, queue: queueName }, 'Job failed');
+
+    // A chunk that exhausts its attempts leaves its stitch parent in
+    // waiting-children FOREVER — BullMQ resolves a dependency only on child
+    // COMPLETION. That is what stranded four projects for five hours on an idle
+    // machine. Put it back, boundedly, so the parent is never orphaned in
+    // silence. Fire-and-forget: recovery must never fail the failure handler.
+    if (queueName === QUEUE_CHUNK && job?.data?.is_chunk) {
+      recoverFailedChunk({ redis: getRedisConnection(), job, error: err })
+        .then((outcome) => {
+          if (outcome.action !== 'exhausted') return;
+          // Out of recoveries: say so where the client can see it, rather than
+          // letting the project go quiet.
+          return publishJobHealth(getRedisConnection(), parentProjectId(job), {
+            state: 'failing',
+            reason: 'chunk-unrecoverable',
+            phase: 'encoding',
+            chunkIndex: job.data?.chunk_index ?? null,
+            chunksTotal: job.data?.chunks_total ?? null,
+          });
+        })
+        .catch((recoveryErr) => {
+          logger.error(
+            { jobId: job.id, err: recoveryErr.message },
+            'Chunk recovery handler failed',
+          );
+        });
+    }
   });
 
   worker.on('stalled', (jobId) => {
