@@ -3,6 +3,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { AlertTriangle, Wrench } from "lucide-react";
 
 import { describeMaintenanceNotice } from "@/lib/maintenance";
+import { pollWithAuthRetry } from "@/lib/auth-retry.client";
 import { getMaintenanceState } from "@/lib/maintenance.functions";
 import { cn } from "@/lib/utils";
 
@@ -22,7 +23,7 @@ export function MaintenanceBanner() {
   const fetchState = useServerFn(getMaintenanceState);
   const { data } = useQuery({
     queryKey: ["maintenance-state"],
-    queryFn: () => fetchState(),
+    queryFn: () => pollWithAuthRetry(() => fetchState()),
     // Frequent enough that a user who was blocked mid-session sees the reason
     // appear, and cheap: one cached read on the server for most calls.
     refetchInterval: 20_000,

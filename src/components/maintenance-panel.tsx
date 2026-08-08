@@ -20,6 +20,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { describeFreezeImpact } from "@/lib/maintenance";
+import { pollWithAuthRetry } from "@/lib/auth-retry.client";
 import { getMaintenanceState, setMaintenanceState } from "@/lib/maintenance.functions";
 
 /**
@@ -38,7 +39,7 @@ export function MaintenancePanel() {
 
   const { data, isLoading } = useQuery({
     queryKey: ["maintenance-state"],
-    queryFn: () => fetchState(),
+    queryFn: () => pollWithAuthRetry(() => fetchState()),
     refetchInterval: 10_000,
   });
 

@@ -18,6 +18,7 @@ import { deleteProject } from "@/lib/deleteProject";
 import { useIsAdmin } from "@/hooks/use-is-admin";
 import { describeMatchingProgress, shortMatchingLabel } from "@/lib/matching-progress";
 import { getMatchingProgress } from "@/lib/matching-progress.functions";
+import { pollWithAuthRetry } from "@/lib/auth-retry.client";
 import { Progress } from "@/components/ui/progress";
 import {
   oldestProject,
@@ -116,7 +117,8 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
   const fetchMatchingProgress = useServerFn(getMatchingProgress);
   const { data: matchingCounts } = useQuery({
     queryKey: ["matching-progress", matchingIds],
-    queryFn: () => fetchMatchingProgress({ data: { projectIds: matchingIds } }),
+    queryFn: () =>
+      pollWithAuthRetry(() => fetchMatchingProgress({ data: { projectIds: matchingIds } })),
     enabled: matchingIds.length > 0,
     refetchInterval: matchingIds.length > 0 ? 4000 : false,
   });

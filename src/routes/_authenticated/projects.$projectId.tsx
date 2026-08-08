@@ -8,6 +8,7 @@ import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.fu
 import { deleteProject } from "@/lib/deleteProject";
 import { isMissingPollResult, nextPollDelayMs, pollIntervalWhileActive } from "@/lib/polling-state";
 import { describeQueuePosition, describeStitchPhase } from "@/lib/render-queue";
+import { pollWithAuthRetry } from "@/lib/auth-retry.client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -350,7 +351,9 @@ function ProjectDetail() {
     const tick = async () => {
       let reachedTerminalState = false;
       try {
-        const result = await runPollRender({ data: { jobId: renderJobId } });
+        const result = await pollWithAuthRetry(() =>
+          runPollRender({ data: { jobId: renderJobId } }),
+        );
         if (isMissingPollResult(result)) {
           cancelled = true;
           toast.info("This render job no longer exists.");
@@ -396,7 +399,9 @@ function ProjectDetail() {
     let cancelled = false;
     (async () => {
       try {
-        const result = await runPollRender({ data: { jobId: renderJobId } });
+        const result = await pollWithAuthRetry(() =>
+          runPollRender({ data: { jobId: renderJobId } }),
+        );
         if (isMissingPollResult(result)) {
           cancelled = true;
           toast.info("This render job no longer exists.");
@@ -435,7 +440,7 @@ function ProjectDetail() {
     const tick = async () => {
       let hadError = false;
       try {
-        const result = await runPoll({ data: { projectId } });
+        const result = await pollWithAuthRetry(() => runPoll({ data: { projectId } }));
         if (isMissingPollResult(result)) {
           cancelled = true;
           toast.info(
@@ -472,7 +477,8 @@ function ProjectDetail() {
   const fetchMatchingProgress = useServerFn(getMatchingProgress);
   const { data: matchingCounts } = useQuery({
     queryKey: ["matching-progress", projectId],
-    queryFn: () => fetchMatchingProgress({ data: { projectIds: [projectId] } }),
+    queryFn: () =>
+      pollWithAuthRetry(() => fetchMatchingProgress({ data: { projectIds: [projectId] } })),
     // Only while it matters, and at the poll cadence — four HEAD counts.
     enabled: project?.status === "matching_footage",
     refetchInterval: () => (project?.status === "matching_footage" ? 3000 : false),
