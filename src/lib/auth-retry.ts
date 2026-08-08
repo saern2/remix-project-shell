@@ -13,7 +13,7 @@
  *
  * Pure and dependency-injected so the classifier and the retry policy can be
  * tested without a session, a network or a clock. The call sites bind the real
- * Supabase client in auth-retry.client.ts.
+ * Supabase client in auth-retry.browser.ts.
  */
 
 /**

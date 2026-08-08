@@ -3,7 +3,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { AlertTriangle, Wrench } from "lucide-react";
 
 import { describeMaintenanceNotice } from "@/lib/maintenance";
-import { pollWithAuthRetry } from "@/lib/auth-retry.client";
+import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
 import { getMaintenanceState } from "@/lib/maintenance.functions";
 import { cn } from "@/lib/utils";
 

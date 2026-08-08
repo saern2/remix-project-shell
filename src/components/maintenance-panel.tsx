@@ -20,7 +20,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { describeFreezeImpact } from "@/lib/maintenance";
-import { pollWithAuthRetry } from "@/lib/auth-retry.client";
+import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
 import { getMaintenanceState, setMaintenanceState } from "@/lib/maintenance.functions";
 
 /**
