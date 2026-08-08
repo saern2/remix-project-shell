@@ -748,6 +748,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       queue_estimate_seconds?: number | null;
       stitch_state?: string | null;
       stitches_ahead?: number | null;
+      chunk_state?: string | null;
+      chunks_ahead?: number | null;
       stalled?: boolean;
       health?: {
         state?: string;
@@ -796,6 +798,16 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       stitchState === "waiting" && typeof payload.stitches_ahead === "number"
         ? payload.stitches_ahead
         : null;
+    // The mirror image at the other end of the render: admitted, but no chunk
+    // worker free yet. Same degrade-to-null rule for an unrecognised value.
+    const chunkState =
+      payload.chunk_state === "waiting" || payload.chunk_state === "encoding"
+        ? payload.chunk_state
+        : null;
+    const chunksAhead =
+      chunkState === "waiting" && typeof payload.chunks_ahead === "number"
+        ? payload.chunks_ahead
+        : null;
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
@@ -812,6 +824,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       queue_estimate_seconds?: number | null;
       stitch_state?: string | null;
       stitches_ahead?: number | null;
+      chunk_state?: string | null;
+      chunks_ahead?: number | null;
     } = {
       status,
       progress_pct: progress,
@@ -823,6 +837,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       queue_estimate_seconds: queueEstimateSeconds,
       stitch_state: stitchState,
       stitches_ahead: stitchesAhead,
+      chunk_state: chunkState,
+      chunks_ahead: chunksAhead,
     };
     if (status === "completed") {
       jobUpdate.completed_at = new Date().toISOString();
@@ -830,6 +846,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       jobUpdate.stall_notice = null;
       jobUpdate.queue_position = null;
       jobUpdate.queue_estimate_seconds = null;
+      jobUpdate.chunk_state = null;
+      jobUpdate.chunks_ahead = null;
       jobUpdate.stitch_state = null;
       jobUpdate.stitches_ahead = null;
       if (chunksTotal != null) jobUpdate.chunks_completed = chunksTotal;
@@ -878,6 +896,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       queue_estimate_seconds: queueEstimateSeconds,
       stitch_state: stitchState,
       stitches_ahead: stitchesAhead,
+      chunk_state: chunkState,
+      chunks_ahead: chunksAhead,
     };
   });
 

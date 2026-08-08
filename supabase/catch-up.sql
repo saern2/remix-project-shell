@@ -912,6 +912,17 @@ alter table public.projects
 comment on column public.projects.matching_idle_rounds is
   'Consecutive matching_footage invocations that matched zero new scenes. When it reaches the configured limit the stage terminates, so matching can never loop indefinitely.';
 
+-- ── 20260811000001: chunk queue visibility ──────────────────────────────────
+
+alter table public.render_jobs
+  add column if not exists chunk_state text,
+  add column if not exists chunks_ahead integer;
+
+comment on column public.render_jobs.chunk_state is
+  'While no chunk has finished: "waiting" (admitted, but every chunk worker is busy) or "encoding". Null once chunks start completing, or when unknown.';
+comment on column public.render_jobs.chunks_ahead is
+  'Chunks from other projects genuinely in front of this one. Null when unknown.';
+
 -- ── 20260810000001: maintenance mode ────────────────────────────────────────
 
 create table if not exists public.maintenance_state (
@@ -1093,5 +1104,6 @@ from (
     ('projects.matching_idle_rounds',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='projects' and column_name='matching_idle_rounds')),
     ('render_jobs.queue_position',       exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='queue_position')),
     ('maintenance_state (table)',        to_regclass('public.maintenance_state') is not null),
+    ('render_jobs.chunk_state',          exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='chunk_state')),
     ('render_jobs.stitch_state',         exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='stitch_state'))
 ) as checks(check_name, present);

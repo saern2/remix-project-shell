@@ -9,6 +9,9 @@ const { readJobHealth } = require('./resourceControl');
 const admission = require('./admissionControl');
 const { parentProjectId, shouldPromoteTail, tailPriority } = require('./fairScheduling');
 
+/** Bound on how much of the chunk queue a status poll will scan. */
+const CHUNK_QUEUE_SCAN_LIMIT = 1000;
+
 const QUEUE_NAME = 'render';
 const QUEUE_CHUNK = 'render-chunk';
 const QUEUE_STITCH = 'render-stitch';
@@ -266,6 +269,7 @@ async function getJobStatus(job) {
   };
 
   if (data.is_stitch && typeof job.getDependenciesCount === 'function') {
+    const projectId = job.id.replace(/-stitch$/, '');
     result.chunks_total = data.chunks_total || 0;
     try {
       const counts = await job.getDependenciesCount();
@@ -283,6 +287,54 @@ async function getJobStatus(job) {
         45,
         Math.round((result.chunks_completed / result.chunks_total) * 45),
       );
+    }
+
+    // ── Chunk visibility ──────────────────────────────────────────────────
+    // A project can hold an admission slot and still not be encoding: the four
+    // chunk workers may all be busy with other projects' in-flight chunks. That
+    // state reported "rendering, 0 of 49 segments" for 36.5 minutes on
+    // 2026-08-09, which reads as a stall — the operator closed the tab assuming
+    // the project had died. It had not; it then rendered all 49 chunks in 24
+    // minutes.
+    //
+    // Only computed while nothing has finished yet, so the two extra reads
+    // happen exactly during the window they explain and stop the moment the
+    // first chunk lands.
+    if (result.chunks_total > 0 && (result.chunks_completed ?? 0) === 0) {
+      try {
+        const chunkQueue = getQueue(QUEUE_CHUNK);
+        const [activeChunks, prioritized] = await Promise.all([
+          chunkQueue.getActive(),
+          // Bounded: a poll must not pull an unbounded job list every 3s.
+          chunkQueue.getPrioritized(0, CHUNK_QUEUE_SCAN_LIMIT),
+        ]);
+        const isMine = (chunk) => parentProjectId(chunk) === projectId;
+
+        if (activeChunks.some(isMine)) {
+          // At least one chunk is on a worker right now: genuinely encoding,
+          // just not finished. Saying "waiting" here would be its own lie.
+          result.chunk_state = 'encoding';
+        } else {
+          result.chunk_state = 'waiting';
+          const minePending = prioritized.filter(isMine);
+          const myBest = minePending.length
+            ? Math.min(...minePending.map((chunk) => Number(chunk.opts?.priority ?? 0)))
+            : null;
+          // Ahead = other projects' chunks that outrank my best pending chunk,
+          // plus everything already on a worker. Both are genuinely in front.
+          const queuedAhead =
+            myBest == null
+              ? 0
+              : prioritized.filter(
+                  (chunk) => !isMine(chunk) && Number(chunk.opts?.priority ?? 0) < myBest,
+                ).length;
+          result.chunks_ahead = queuedAhead + activeChunks.filter((chunk) => !isMine(chunk)).length;
+        }
+      } catch (err) {
+        // Advisory. A project that is rendering must not report a failure
+        // because the queue view was unavailable.
+        logger.warn({ jobId: job.id, err: err.message }, 'Chunk queue depth unavailable');
+      }
     }
 
     // ── Stitch visibility (round 18, item 4a) ─────────────────────────────
@@ -316,7 +368,6 @@ async function getJobStatus(job) {
     // A queued project used to be indistinguishable from a stuck one: status
     // "waiting", 0 chunks done, nothing moving, no explanation. The worker knows
     // exactly where it is in line, so say so.
-    const projectId = job.id.replace(/-stitch$/, '');
     try {
       const snapshot = await admission.admissionSnapshot(getRedisConnection());
       // The cap-aware position, not the raw rank. With a per-user cap the two

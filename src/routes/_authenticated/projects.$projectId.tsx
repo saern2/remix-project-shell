@@ -7,7 +7,11 @@ import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.funct
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import { isMissingPollResult, nextPollDelayMs, pollIntervalWhileActive } from "@/lib/polling-state";
-import { describeQueuePosition, describeStitchPhase } from "@/lib/render-queue";
+import {
+  describeChunkPhase,
+  describeQueuePosition,
+  describeStitchPhase,
+} from "@/lib/render-queue";
 import { pollWithAuthRetry } from "@/lib/auth-retry.client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -308,7 +312,7 @@ function ProjectDetail() {
       const { data, error } = await supabase
         .from("render_jobs")
         .select(
-          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, queue_position, queue_estimate_seconds, stitch_state, stitches_ahead, created_at",
+          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, queue_position, queue_estimate_seconds, stitch_state, stitches_ahead, chunk_state, chunks_ahead, created_at",
         )
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
@@ -772,7 +776,15 @@ function ProjectDetail() {
                     <>
                       <div className="flex items-center gap-2 text-sm text-muted-foreground">
                         <Loader2 className="h-4 w-4 animate-spin" />
+                        {/* Most specific first. "Rendering video…" is the
+                            fallback and was, for 36 minutes, the only thing a
+                            waiting project ever said. */}
                         {describeStitchPhase(renderJob.stitch_state, renderJob.stitches_ahead) ??
+                          describeChunkPhase(
+                            renderJob.chunk_state,
+                            renderJob.chunks_ahead,
+                            renderJob.queue_estimate_seconds,
+                          ) ??
                           (renderJob.status === "queued"
                             ? "Queued on the render worker…"
                             : renderJob.status === "downloading"

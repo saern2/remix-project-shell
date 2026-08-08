@@ -93,3 +93,38 @@ export function describeStitchPhase(
       return null;
   }
 }
+
+/**
+ * Why a project that is "rendering" has produced nothing yet.
+ *
+ * MEASURED: a 49-chunk project showed "Rendering, 0 of 49 segments" for 36.5
+ * minutes because all four chunk workers were busy with older projects. It had
+ * an admission slot; it had no worker. The operator read it as a stall and
+ * closed the tab, and the project went on to render all 49 chunks in 24
+ * minutes.
+ *
+ * "Admitted" and "encoding" are different states and only one of them means
+ * work is happening. This is the third queue in this system to look like a
+ * hang, so the rule is now explicit: every waiting state says it is waiting.
+ *
+ * Returns null once anything has completed — from then on the segment counter
+ * is moving and speaks for itself.
+ */
+export function describeChunkPhase(
+  chunkState: string | null | undefined,
+  chunksAhead: number | null | undefined,
+  estimateSeconds?: number | null,
+): string | null {
+  if (chunkState !== "waiting") return null;
+
+  const ahead = typeof chunksAhead === "number" && chunksAhead > 0 ? chunksAhead : null;
+  if (ahead == null) {
+    // Between states, or the queue view was unavailable. Still says the true
+    // thing — it is waiting, not stuck.
+    return "Waiting for a render slot — starting shortly.";
+  }
+
+  const wait = describeWait(estimateSeconds);
+  const suffix = wait ? ` — ${wait} (estimate)` : "";
+  return `Waiting for a render slot — ${ahead} segment${ahead === 1 ? "" : "s"} ahead of you${suffix}.`;
+}
