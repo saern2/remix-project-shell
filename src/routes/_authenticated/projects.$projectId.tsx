@@ -13,6 +13,7 @@ import {
   describeStitchPhase,
 } from "@/lib/render-queue";
 import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
+import { retryModeForProject } from "@/lib/render-retry";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -142,7 +143,13 @@ function ProjectDetail() {
   const scenesQuery = useQuery({
     enabled:
       !!project &&
-      (isReady || project.status === "generating_scenes" || project.status === "matching_footage"),
+      (isReady ||
+        project.status === "generating_scenes" ||
+        project.status === "matching_footage" ||
+        // A failed project needs its scenes too: Retry decides between a
+        // render-only resubmit and a full pipeline re-run by checking whether
+        // the timeline (scenes × slices) is still complete.
+        project.status === "failed"),
     queryKey: ["scenes", projectId],
     queryFn: async (): Promise<Scene[]> => {
       const { data, error } = await supabase
@@ -499,6 +506,29 @@ function ProjectDetail() {
 
   const handleRetry = async () => {
     try {
+      // A render failure keeps its finished timeline: resubmit the RENDER
+      // only. The old behavior reset to draft and re-ran the whole pipeline —
+      // measured on 2026-08-09 at 5-6 minutes of matching re-done for a
+      // project whose failure message had just said "Nothing was lost".
+      // submitRenderJob accepts a failed project and moves it back through
+      // rendering itself; no draft reset, no matching re-run.
+      const mode = retryModeForProject({
+        latestRenderJobStatus: renderJob?.status,
+        timelineComplete: fixedSlicesComplete,
+      });
+      if (mode === "render-only") {
+        setSubmittingRender(true);
+        try {
+          await runSubmitRender({ data: { projectId } });
+        } finally {
+          setSubmittingRender(false);
+        }
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
+          queryClient.invalidateQueries({ queryKey: ["render-job", projectId] }),
+        ]);
+        return;
+      }
       await supabase
         .from("projects")
         .update({ status: "draft", error_message: null })
