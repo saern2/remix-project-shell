@@ -276,6 +276,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             scene_id: slot.sceneId,
             provider_clip_id: cached.provider_clip_id ?? null,
             fallback_urls: toFallbackUrls(cached.fallback_urls),
+            alternate_urls: alternatesFor(slot.sceneId, cached.clip_url),
           };
         });
         if (clips.length === 0) throw new Error("No clips could be prepared for rendering.");
