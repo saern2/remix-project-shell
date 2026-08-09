@@ -165,6 +165,41 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     const fixedDuration =
       project.clip_duration_seconds != null ? Number(project.clip_duration_seconds) : null;
 
+    // ── Alternate candidates per scene ────────────────────────────────────
+    // The worker has no database, so if a clip's source is dead at render time
+    // the only alternatives it can try are the ones this payload carries.
+    // fallback_urls are renditions of the SAME source and die with it; these
+    // are the scene's next-best DIFFERENT sources, mirroring matching's own
+    // degradation tiers. Two per clip: enough to survive a dead source, small
+    // enough not to bloat a 600-clip payload.
+    //
+    // Best-effort by design — a project rendered fine before alternates
+    // existed, and must not fail because this query did.
+    const alternatesByScene = new Map<string, string[]>();
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data: altRows } = await supabaseAdmin
+        .from("clip_candidates")
+        .select("scene_id, url, score, scenes!inner(project_id)")
+        .eq("scenes.project_id", projectId)
+        .order("score", { ascending: false })
+        .limit(10000);
+      for (const row of altRows ?? []) {
+        const list = alternatesByScene.get(row.scene_id) ?? [];
+        if (list.length < 6 && typeof row.url === "string") list.push(row.url);
+        alternatesByScene.set(row.scene_id, list);
+      }
+    } catch (err) {
+      console.warn("[render] alternate candidates unavailable", {
+        projectId,
+        error: (err as Error).message,
+      });
+    }
+    const alternatesFor = (sceneId: string | undefined, primaryUrl: string): string[] =>
+      sceneId
+        ? (alternatesByScene.get(sceneId) ?? []).filter((url) => url !== primaryUrl).slice(0, 2)
+        : [];
+
     // scene_id / provider_clip_id are diagnostic only: they let the worker name
     // the scene and source in its freeze-frame and in-point-guard warnings
     // instead of reporting a bare clip index.
@@ -176,6 +211,8 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       provider_clip_id?: string | null;
       /** Smaller renditions of the same source, for oversize fall-through. */
       fallback_urls?: string[];
+      /** The scene's next-best candidates, for dead-source fall-through. */
+      alternate_urls?: string[];
     }>;
     const renderTransition = "hard-cut" as const;
 
@@ -195,6 +232,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
           scene_id: slot.sceneId,
           provider_clip_id: scene.selected_clips.clip_candidates.provider_clip_id ?? null,
           fallback_urls: toFallbackUrls(scene.selected_clips.clip_candidates.fallback_urls),
+          alternate_urls: alternatesFor(slot.sceneId, scene.selected_clips.clip_candidates.url),
         };
       });
     } else {
@@ -461,6 +499,7 @@ export const submitRenderJob = createServerFn({ method: "POST" })
             scene_id: slot.sceneId,
             provider_clip_id: row.provider_clip_id ?? null,
             fallback_urls: toFallbackUrls(row.fallback_urls),
+            alternate_urls: alternatesFor(slot.sceneId, row.clip_url),
           };
         });
       }

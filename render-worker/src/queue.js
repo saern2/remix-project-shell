@@ -6,7 +6,13 @@ const config = require('./config');
 const logger = require('./logger');
 const { processRenderJob, processStitchJob, closeRenderConnections } = require('./renderJob');
 const { readJobHealth, publishJobHealth } = require('./resourceControl');
-const { recoverFailedChunk, clearRecovery } = require('./chunkRecovery');
+const {
+  recoverFailedChunk,
+  clearRecovery,
+  recordChunkFailureDetail,
+  clearChunkFailureDetail,
+  readChunkFailureDetails,
+} = require('./chunkRecovery');
 const { startReconciler, stopReconciler } = require('./reconciler');
 const admission = require('./admissionControl');
 const { parentProjectId, shouldPromoteTail, tailPriority } = require('./fairScheduling');
@@ -139,6 +145,13 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
     // scheduling advice must never fail a completed job.
     if (queueName === QUEUE_CHUNK && job?.data?.is_chunk) {
       clearRecovery(getRedisConnection(), job.id).catch(() => {});
+      // A chunk that eventually completed must not haunt the project's error
+      // message if some OTHER chunk later kills it.
+      clearChunkFailureDetail(
+        getRedisConnection(),
+        parentProjectId(job),
+        job.data?.chunk_index ?? null,
+      ).catch(() => {});
       promoteTailChunks(job).catch((err) => {
         logger.warn({ jobId: job.id, err: err.message }, 'Tail promotion sweep failed');
       });
@@ -159,14 +172,24 @@ function createWorker(queueName, processor, concurrency, timeoutMs) {
         .then((outcome) => {
           if (outcome.action !== 'exhausted') return;
           // Out of recoveries: say so where the client can see it, rather than
-          // letting the project go quiet.
-          return publishJobHealth(getRedisConnection(), parentProjectId(job), {
-            state: 'failing',
-            reason: 'chunk-unrecoverable',
-            phase: 'encoding',
-            chunkIndex: job.data?.chunk_index ?? null,
-            chunksTotal: job.data?.chunks_total ?? null,
-          });
+          // letting the project go quiet. The health record is a live notice
+          // (10-minute TTL); the failure detail is the durable copy that the
+          // eventual project-failure message reads — the reconciler may not
+          // declare the project unrecoverable until long after the TTL.
+          const redis = getRedisConnection();
+          const projectId = parentProjectId(job);
+          const detail = err?.message ?? job.failedReason ?? 'Unknown error';
+          return Promise.all([
+            publishJobHealth(redis, projectId, {
+              state: 'failing',
+              reason: 'chunk-unrecoverable',
+              phase: 'encoding',
+              chunkIndex: job.data?.chunk_index ?? null,
+              chunksTotal: job.data?.chunks_total ?? null,
+              detail,
+            }),
+            recordChunkFailureDetail(redis, projectId, job.data?.chunk_index ?? null, detail),
+          ]);
         })
         .catch((recoveryErr) => {
           logger.error(
@@ -314,6 +337,26 @@ async function getJobStatus(job) {
       result.chunks_completed = counts.processed || 0;
     } catch {
       result.chunks_completed = 0;
+    }
+
+    // A failed project must say WHICH segment died and WHY, not just a count.
+    // Two projects failed the same segment across two full re-renders on
+    // 2026-08-09 and the message gave the operator nothing to diagnose with.
+    // Recomputed per poll from the durable per-chunk record, never persisted
+    // back into the job, so it cannot double-append.
+    if (result.error) {
+      const failures = await readChunkFailureDetails(getRedisConnection(), projectId);
+      if (failures.length > 0) {
+        const total = result.chunks_total ? ` of ${result.chunks_total}` : '';
+        const lines = failures.map(
+          (failure) => `Segment ${failure.chunkIndex + 1}${total}: ${failure.reason}`,
+        );
+        result.error = `${result.error} ${lines.join(' ')}`;
+        result.failed_segments = failures.map((failure) => ({
+          segment: failure.chunkIndex + 1,
+          reason: failure.reason,
+        }));
+      }
     }
 
     // Progress for a chunked render used to sit at 0 until the stitch itself

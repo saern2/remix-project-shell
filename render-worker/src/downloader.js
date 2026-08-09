@@ -487,6 +487,9 @@ async function isCompleteDownload(destPath, url) {
 async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, signal }) {
   let totalBytes = 0;
   const clipPaths = new Map();
+  // Clips whose every source failed, with the reason. The CALLER decides what a
+  // dead clip costs; this function no longer decides it costs the whole chunk.
+  const failedClips = [];
 
   // ── Abort fan-out (round 6, Issue 5) ────────────────────────────────────────
   // Give each download its own child AbortController and attach exactly ONE
@@ -570,15 +573,34 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
           reusedDownloads += 1;
           logger.info({ url: clip_url, destPath }, 'Reusing clip already downloaded by a prior attempt');
         } else {
-          // ── Oversize fall-through (round 7) ─────────────────────────────────
-          // The primary URL plus any smaller renditions of the SAME source, in
-          // order. A source rejected by the Content-Length pre-check used to
-          // fail the entire chunk; now it costs one rejected response and moves
-          // on. Only oversize falls through — a network error or SSRF block is
-          // not something a different rendition fixes, so those still throw.
-          const candidates = [clip_url, ...(clips[i].fallback_urls ?? [])];
+          // ── Per-clip fall-through ───────────────────────────────────────────
+          // Three tiers, in order, mirroring what matching already does:
+          //   1. renditions of the SAME source (fallback_urls) — the oversize
+          //      machinery from round 7, now covering every failure class;
+          //   2. the scene's next-best CANDIDATES (alternate_urls), shipped in
+          //      the payload because the worker has no database;
+          //   3. nothing downloads — the clip is reported to the caller, which
+          //      degrades it to a neighbour extension instead of failing.
+          //
+          // WHY EVERY CLASS AND NOT JUST OVERSIZE. On 2026-08-09, "These 4
+          // Nearby Planets" failed at 20/21, was retried through a COMPLETE
+          // re-render, and failed at 20/21 again; "Time Is Not Permanent" did
+          // the same at 32/45, twice. A segment that fails identically across
+          // independent renders is content — a dead or expired source — and a
+          // dead PRIMARY was rethrown here without ever consulting the
+          // alternatives sitting next to it in the array. A single unrenderable
+          // clip must never kill a project.
+          //
+          // Two errors still abort the whole job, deliberately: cancellation
+          // (the user asked; a fallback tour would delay the stop) and the
+          // total-size ceiling (a machine limit no alternative source fixes).
+          const candidates = [
+            clip_url,
+            ...(clips[i].fallback_urls ?? []),
+            ...(clips[i].alternate_urls ?? []),
+          ];
           let downloaded = false;
-          let lastOversize = null;
+          let lastError = null;
 
           for (let attempt = 0; attempt < candidates.length; attempt++) {
             const candidate = candidates[attempt];
@@ -588,44 +610,61 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
               await markDownloadComplete(destPath, candidate, bytes);
               if (attempt > 0) {
                 oversizeFallbacks += 1;
-                logger.info(
+                logger.warn(
                   {
                     provider: providerOf(candidate),
+                    sceneId: clips[i].scene_id ?? null,
                     rejectedUrl: clip_url,
                     usedUrl: candidate,
                     attempt: attempt + 1,
                     ofCandidates: candidates.length,
                     bytes,
                   },
-                  'Recovered from an oversized source using a smaller rendition',
+                  'Recovered clip from a fallback source',
                 );
               }
               downloaded = true;
               break;
             } catch (err) {
-              if (!(err instanceof OversizedSourceError)) throw err;
-              lastOversize = err;
-              oversizeRejections += 1;
+              if (signal?.aborted) throw err;
+              if (err.message?.startsWith('Total download size exceeds')) throw err;
+              lastError = err;
+              if (err instanceof OversizedSourceError) oversizeRejections += 1;
               logger.warn(
                 {
                   provider: providerOf(candidate),
+                  sceneId: clips[i].scene_id ?? null,
                   url: candidate,
-                  contentLengthBytes: err.bytes,
-                  limitBytes: err.limit,
-                  overBy: err.bytes - err.limit,
+                  error: err.message,
                   remainingCandidates: candidates.length - attempt - 1,
                 },
-                'Source rejected as oversized',
+                'Clip source failed; trying the next candidate',
               );
             }
           }
 
           if (!downloaded) {
-            // Every rendition of this source is too large. Nothing local can fix
-            // that, so the chunk fails — but with the full picture in the message.
-            throw new Error(
-              `${lastOversize.message} (all ${candidates.length} rendition(s) of this source exceed the limit)`,
+            // Every source for this clip is unusable. The caller substitutes a
+            // neighbour; a project with one extended shot beats a project that
+            // fails at 95%, twice.
+            failedClips.push({
+              index: i,
+              sceneId: clips[i].scene_id ?? null,
+              url: clip_url,
+              candidatesTried: candidates.length,
+              reason: lastError?.message ?? 'unknown download failure',
+            });
+            logger.error(
+              {
+                clipIndex: i,
+                sceneId: clips[i].scene_id ?? null,
+                url: clip_url,
+                candidatesTried: candidates.length,
+                error: lastError?.message ?? null,
+              },
+              'CLIP UNRENDERABLE: every source failed; clip will be degraded, not the chunk',
             );
+            return;
           }
         }
 
@@ -653,7 +692,7 @@ async function downloadAll({ clips, fallbackIndices = [], audioUrl, tempDir, sig
       },
       'Required assets downloaded',
     );
-    return { clipPaths, audioPath };
+    return { clipPaths, audioPath, failedClips };
   } finally {
     if (signal) signal.removeEventListener('abort', onParentAbort);
   }

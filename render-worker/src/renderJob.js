@@ -264,7 +264,7 @@ const MIN_USABLE_SOURCE_SECONDS = 0.05;
  * The REQUESTED DURATION IS NEVER CHANGED. It is the timeline contract: shorten
  * a clip here and every downstream slot shifts.
  */
-async function reconcileClipSources(jobId, clips, clipPaths) {
+async function reconcileClipSources(jobId, clips, clipPaths, downloadFailures = []) {
   const durations = new Array(clips.length).fill(null);
   // downloader's asyncPool takes (limit, items, worker) — not the clip-slices order.
   await asyncPool(
@@ -275,6 +275,71 @@ async function reconcileClipSources(jobId, clips, clipPaths) {
       if (localPath) durations[index] = await probeSourceDuration(localPath);
     },
   );
+
+  // ── Last-resort clip substitution ─────────────────────────────────────────
+  // A clip with no usable file — every source dead, or the download landed but
+  // does not decode — is rebound to a NEIGHBOURING clip's file, continuing from
+  // where the neighbour's slot ends. The clamp/freeze pass below then bounds it
+  // exactly like any short source, so the gap renders as extended footage (or a
+  // held final frame when the neighbour has nothing left), never as a failed
+  // chunk. A project with one extended shot beats a project that fails at 95%
+  // twice, which is what the 2026-08-09 retry run measured.
+  const failureByIndex = new Map(downloadFailures.map((failure) => [failure.index, failure]));
+  const substitutions = [];
+  for (let index = 0; index < clips.length; index++) {
+    if (durations[index] != null) continue;
+    const reason =
+      failureByIndex.get(index)?.reason ??
+      (clipPaths.get(index) ? 'downloaded file does not decode' : 'no source downloaded');
+
+    // Nearest usable clip, preferring the previous one: extending backwards
+    // continues footage the viewer has already seen into the gap, which reads
+    // as a lingering shot rather than a jump.
+    let donor = -1;
+    for (let offset = 1; offset < clips.length; offset++) {
+      if (index - offset >= 0 && durations[index - offset] != null) {
+        donor = index - offset;
+        break;
+      }
+      if (index + offset < clips.length && durations[index + offset] != null) {
+        donor = index + offset;
+        break;
+      }
+    }
+    if (donor < 0) {
+      // Nothing in this chunk decodes at all. Degrading every clip to nothing
+      // is not a render; this is the one case that must still fail, and it
+      // fails saying exactly why.
+      throw new Error(
+        `NO_USABLE_SOURCES: none of the ${clips.length} clips in this chunk could be downloaded or decoded ` +
+          `(first failure: ${reason})`,
+      );
+    }
+
+    const requestedDuration = clips[index].end - clips[index].start;
+    // Continue from the donor slot's own end point, so the substitute does not
+    // replay footage the donor's slot already shows.
+    const start = clips[donor].end;
+    clipPaths.set(index, clipPaths.get(donor));
+    durations[index] = durations[donor];
+    clips = clips.map((clip, i) =>
+      i === index ? { ...clip, start, end: start + requestedDuration } : clip,
+    );
+    substitutions.push({ index, donor, sceneId: clips[index].scene_id ?? null, reason });
+    logger.error(
+      {
+        jobId,
+        clipIndex: index,
+        sceneId: clips[index].scene_id ?? null,
+        providerClipId: clips[index].provider_clip_id ?? null,
+        donorIndex: donor,
+        donorSceneId: clips[donor].scene_id ?? null,
+        requestedDurationSec: Number(requestedDuration.toFixed(3)),
+        reason,
+      },
+      'CLIP DEGRADED: unrenderable clip replaced by extending a neighbouring clip',
+    );
+  }
 
   let clampedInPoints = 0;
   let freezeFrames = 0;
@@ -323,9 +388,9 @@ async function reconcileClipSources(jobId, clips, clipPaths) {
     return { ...clip, start, end: start + requestedDuration };
   });
 
-  if (clampedInPoints > 0 || freezeFrames > 0) {
+  if (clampedInPoints > 0 || freezeFrames > 0 || substitutions.length > 0) {
     logger.warn(
-      { jobId, clips: clips.length, clampedInPoints, freezeFrames },
+      { jobId, clips: clips.length, clampedInPoints, freezeFrames, substitutions: substitutions.length },
       'Clip source reconciliation adjusted this job',
     );
   }
@@ -1269,7 +1334,7 @@ async function processRenderJob(job, token) {
       // same bytes through the same GLOBAL_CDN_CONCURRENCY permits — so measure it
       // rather than guess.
       const downloadStartedAt = Date.now();
-      const { clipPaths, audioPath } = await downloadAll({
+      const { clipPaths, audioPath, failedClips } = await downloadAll({
         clips,
         fallbackIndices,
         audioUrl: payload.is_chunk ? null : audio_url,
@@ -1285,7 +1350,7 @@ async function processRenderJob(job, token) {
       // changed — they are the timeline contract.
       phase.current = 'probing';
       const reconcileStartedAt = Date.now();
-      clips = await reconcileClipSources(jobId, clips, clipPaths);
+      clips = await reconcileClipSources(jobId, clips, clipPaths, failedClips);
       const reconcileMs = Date.now() - reconcileStartedAt;
 
       // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Status: rendering ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬

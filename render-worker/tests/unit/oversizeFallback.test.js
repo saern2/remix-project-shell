@@ -102,7 +102,10 @@ describe('oversized source fall-through', () => {
     });
   }, 60000);
 
-  test('fails only when every rendition of the source is oversized', async () => {
+  test('a clip whose every rendition is oversized is REPORTED, not thrown', async () => {
+    // Exhaustion used to reject, which cost the whole chunk. 2026-08-09
+    // measured what that costs: the same segment failing at 20/21 across two
+    // complete re-renders. The caller now decides what a dead clip costs.
     await withTempDir(async (tempDir) => {
       const clips = [
         {
@@ -112,24 +115,38 @@ describe('oversized source fall-through', () => {
           end: 1,
         },
       ];
-      await expect(
-        downloadAll({ clips, fallbackIndices: [0], audioUrl: null, tempDir }),
-      ).rejects.toThrow(/exceeds per-file limit[\s\S]*all 2 rendition/);
+      const { clipPaths, failedClips } = await downloadAll({
+        clips,
+        fallbackIndices: [0],
+        audioUrl: null,
+        tempDir,
+      });
+      expect(clipPaths.has(0)).toBe(false);
+      expect(failedClips).toHaveLength(1);
+      expect(failedClips[0]).toMatchObject({ index: 0, candidatesTried: 2 });
+      expect(failedClips[0].reason).toMatch(/exceeds per-file limit/);
     });
   }, 60000);
 
-  test('a source with no fallbacks still fails, and says so precisely', async () => {
+  test('a source with no fallbacks reports the precise reason it died', async () => {
     await withTempDir(async (tempDir) => {
       const clips = [{ clip_url: `${base}/clip_large.mp4`, start: 0, end: 1 }];
-      await expect(
-        downloadAll({ clips, fallbackIndices: [0], audioUrl: null, tempDir }),
-      ).rejects.toThrow(/Content-Length 3000000 exceeds per-file limit 2000000/);
+      const { failedClips } = await downloadAll({
+        clips,
+        fallbackIndices: [0],
+        audioUrl: null,
+        tempDir,
+      });
+      expect(failedClips).toHaveLength(1);
+      expect(failedClips[0].reason).toMatch(/Content-Length 3000000 exceeds per-file limit 2000000/);
     });
   }, 60000);
 
-  test('non-oversize failures are NOT retried against fallbacks', async () => {
-    // A 404 is not something a different rendition fixes; falling through would
-    // just multiply the wasted requests.
+  test('non-oversize failures fall through to fallbacks too', async () => {
+    // A dead PRIMARY (404, expired link, network refusal) used to be rethrown
+    // without ever consulting the alternatives sitting next to it in the
+    // payload — the exact class behind the deterministic 20/21 failures. Every
+    // failure class now walks the candidate list.
     await withTempDir(async (tempDir) => {
       const clips = [
         {
@@ -139,9 +156,16 @@ describe('oversized source fall-through', () => {
           end: 1,
         },
       ];
-      await expect(
-        downloadAll({ clips, fallbackIndices: [0], audioUrl: null, tempDir }),
-      ).rejects.toThrow(/404|HTTP/);
+      const { clipPaths, failedClips } = await downloadAll({
+        clips,
+        fallbackIndices: [0],
+        audioUrl: null,
+        tempDir,
+      });
+      expect(failedClips).toEqual([]);
+      const file = clipPaths.get(0);
+      expect(file).toBeTruthy();
+      expect((await fsp.stat(file)).size).toBe((await fsp.stat(FIXTURE)).size);
     });
   }, 60000);
 
