@@ -50,36 +50,64 @@ export function expectedSlotCount(scene: FixedDurationScene, fixedDuration: numb
   return Math.max(1, Math.ceil(total / fixedDuration));
 }
 
-function timelineStartForScene(scenes: FixedDurationScene[], index: number): number {
-  if (index === 0) return 0;
-  return Number(scenes[index].start_ts ?? 0);
-}
-
-function timelineEndForScene(
+/**
+ * Per-scene visual spans, tiled by a SINGLE monotonic cursor.
+ *
+ * THE INVARIANT: the spans tile [0, max(lastSceneEnd, audioDuration)] with no
+ * gaps and no overlaps, so the sum of their durations telescopes exactly to
+ * the timeline length — which is what the render validates against the audio.
+ *
+ * MEASURED, 2026-08-09: two retry-rebuilt timelines failed submission with
+ * "visual 2142.26s vs audio 2141.94s" (0.32s) and "visual 1526.31s vs audio
+ * 1526.20s" (0.11s). The old code derived each scene's START from its own
+ * start_ts but the PREVIOUS scene's end from max(next start, previous end) —
+ * so when scene boundaries OVERLAP (next.start_ts < previous.end_ts, which
+ * re-generated scene timings can produce), the overlap region was counted in
+ * BOTH scenes and the visual total drifted past the audio by the sum of the
+ * overlaps. The cursor makes double-counting structurally impossible: each
+ * scene begins exactly where the previous one ended, and an overlapping
+ * scene is shortened rather than re-covering ground.
+ *
+ * Every boundary is ms-quantized ONCE and shared by both neighbours, so
+ * durations sum exactly instead of accumulating per-scene rounding.
+ */
+function sceneTimelineSpans(
   scenes: FixedDurationScene[],
-  index: number,
   audioDuration?: number | null,
-): number {
-  const scene = scenes[index];
-  const sceneEnd = Number(scene.end_ts ?? 0);
-  if (index + 1 < scenes.length) {
-    const nextSceneStart = Number(scenes[index + 1].start_ts ?? sceneEnd);
-    return nextSceneStart > sceneEnd ? nextSceneStart : sceneEnd;
+): Array<{ start: number; end: number }> {
+  const spans: Array<{ start: number; end: number }> = [];
+  let cursor = 0;
+  for (let index = 0; index < scenes.length; index++) {
+    const sceneEnd = Number(scenes[index].end_ts ?? 0);
+    let rawEnd: number;
+    if (index + 1 < scenes.length) {
+      // A scene's visual span runs to the NEXT scene's start when there is a
+      // gap (the earlier scene's footage covers it), and to its own end when
+      // the next scene starts early.
+      const nextSceneStart = Number(scenes[index + 1].start_ts ?? sceneEnd);
+      rawEnd = nextSceneStart > sceneEnd ? nextSceneStart : sceneEnd;
+    } else {
+      // The last scene stretches to the end of the narration.
+      const exactAudioDuration = Number(audioDuration);
+      rawEnd =
+        Number.isFinite(exactAudioDuration) && exactAudioDuration > sceneEnd
+          ? exactAudioDuration
+          : sceneEnd;
+    }
+    const end = roundTime(Math.max(cursor, rawEnd));
+    spans.push({ start: cursor, end });
+    cursor = end;
   }
-
-  const exactAudioDuration = Number(audioDuration);
-  return Number.isFinite(exactAudioDuration) && exactAudioDuration > sceneEnd
-    ? exactAudioDuration
-    : sceneEnd;
+  return spans;
 }
 
 export function buildSceneTimelineSlots(
   scenes: FixedDurationScene[],
   audioDuration?: number | null,
 ): SceneTimelineSlot[] {
+  const spans = sceneTimelineSpans(scenes, audioDuration);
   return scenes.flatMap((scene, index) => {
-    const timelineStart = roundTime(timelineStartForScene(scenes, index));
-    const timelineEnd = roundTime(timelineEndForScene(scenes, index, audioDuration));
+    const { start: timelineStart, end: timelineEnd } = spans[index];
     const durationSeconds = roundTime(Math.max(0, timelineEnd - timelineStart));
     return durationSeconds > 0
       ? [{ sceneId: scene.id, sceneIdx: scene.idx, timelineStart, timelineEnd, durationSeconds }]
@@ -92,27 +120,35 @@ export function buildExpectedSliceSlots(
   fixedDuration: number,
   audioDuration?: number | null,
 ): ExpectedSliceSlot[] {
+  const spans = sceneTimelineSpans(scenes, audioDuration);
   const slots: ExpectedSliceSlot[] = [];
   for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
     const scene = scenes[sceneIndex];
-    const sceneStart = timelineStartForScene(scenes, sceneIndex);
-    const sceneEnd = timelineEndForScene(scenes, sceneIndex, audioDuration);
+    const { start: sceneStart, end: sceneEnd } = spans[sceneIndex];
     const total = Math.max(0, sceneEnd - sceneStart);
     const count = total > 0 ? Math.max(1, Math.ceil(total / fixedDuration)) : 0;
 
+    // Slices chain off the same cursor discipline as scenes: each begins
+    // exactly where the previous ended, and the last lands exactly on the
+    // scene boundary, so intra-scene rounding cannot accumulate either.
+    let sliceStart = sceneStart;
     for (let sliceIndex = 0; sliceIndex < count; sliceIndex++) {
-      const timelineStart = roundTime(sceneStart + sliceIndex * fixedDuration);
-      const timelineEnd = roundTime(Math.min(sceneEnd, timelineStart + fixedDuration));
-      const durationSeconds = roundTime(Math.max(0, timelineEnd - timelineStart));
-      if (durationSeconds <= 0) continue;
-      slots.push({
-        sceneId: scene.id,
-        sceneIdx: scene.idx,
-        sliceIndex,
-        timelineStart,
-        timelineEnd,
-        durationSeconds,
-      });
+      const sliceEnd =
+        sliceIndex === count - 1
+          ? sceneEnd
+          : roundTime(Math.min(sceneEnd, sliceStart + fixedDuration));
+      const durationSeconds = roundTime(Math.max(0, sliceEnd - sliceStart));
+      if (durationSeconds > 0) {
+        slots.push({
+          sceneId: scene.id,
+          sceneIdx: scene.idx,
+          sliceIndex,
+          timelineStart: sliceStart,
+          timelineEnd: sliceEnd,
+          durationSeconds,
+        });
+      }
+      sliceStart = sliceEnd;
     }
   }
   return slots;

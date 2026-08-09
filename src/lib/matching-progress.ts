@@ -237,18 +237,25 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
  *
  * A scene's visual span runs to the NEXT scene's start (not its own end), so
  * gaps between scenes are covered by the earlier scene's clips.
+ *
+ * MUST MIRROR clip-slices.server.ts's sceneTimelineSpans: spans are tiled by
+ * a single monotonic cursor (each scene begins where the previous ended), so
+ * OVERLAPPING scene timings shorten the later scene instead of being counted
+ * twice. Counting the old way against the fixed builder made this number
+ * disagree with the slices the render actually expects.
  */
 export function expectedFixedSlicesForScenes(
   scenes: Array<{ start_ts: number | string; end_ts: number | string }>,
   fixedDuration: number,
 ): number {
   if (!Number.isFinite(fixedDuration) || fixedDuration <= 0) return 0;
+  let cursor = 0;
   return scenes.reduce((count, scene, index) => {
-    const sceneStart = Number(scene.start_ts);
     const sceneEnd = Number(scene.end_ts);
     const nextStart = index + 1 < scenes.length ? Number(scenes[index + 1].start_ts) : sceneEnd;
-    const visualEnd = nextStart > sceneEnd ? nextStart : sceneEnd;
-    const duration = Math.max(0, visualEnd - sceneStart);
+    const visualEnd = Math.max(cursor, nextStart > sceneEnd ? nextStart : sceneEnd);
+    const duration = Math.max(0, visualEnd - cursor);
+    cursor = visualEnd;
     return count + (duration > 0 ? Math.max(1, Math.ceil(duration / fixedDuration)) : 0);
   }, 0);
 }

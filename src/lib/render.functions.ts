@@ -507,9 +507,21 @@ export const submitRenderJob = createServerFn({ method: "POST" })
     }
 
     const totalVisualDuration = clips.reduce((sum, clip) => sum + (clip.end - clip.start), 0);
-    if (Math.abs(totalVisualDuration - audioDuration) > 0.05) {
+    // One frame at 30fps, plus ms-quantization slack. The timeline builder
+    // chains every boundary off a single monotonic cursor, so the visual total
+    // telescopes to the audio duration EXACTLY — anything past a frame is a
+    // real construction bug, and rendering it would bake a visible A/V drift
+    // into the output. The old 0.05s tolerance was neither one frame nor two;
+    // this is exactly one (2026-08-09 saw 0.32s and 0.11s drifts from
+    // overlap double-counting, both now impossible by construction).
+    const frameToleranceSeconds = 1 / 30 + 0.002;
+    const driftSeconds = totalVisualDuration - audioDuration;
+    if (Math.abs(driftSeconds) > frameToleranceSeconds) {
       throw new Error(
-        `Render timeline duration mismatch: visual ${totalVisualDuration.toFixed(2)}s vs audio ${audioDuration.toFixed(2)}s.`,
+        `The video timeline is ${Math.abs(driftSeconds).toFixed(2)}s ${driftSeconds > 0 ? "longer" : "shorter"} than the narration ` +
+          `(visual ${totalVisualDuration.toFixed(2)}s vs audio ${audioDuration.toFixed(2)}s), so rendering would drift out of sync. ` +
+          `Press Retry to rebuild this project's timeline; if it happens again after a rebuild, the scene timings need regenerating — ` +
+          `re-run the project from the script step.`,
       );
     }
 
