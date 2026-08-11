@@ -1131,6 +1131,10 @@ export type Database = {
         }
         Returns: undefined
       }
+      get_generation_stats: {
+        Args: { p_scope: string; p_tz?: string; p_user_id: string | null }
+        Returns: Json
+      }
       has_platform_account_access: { Args: never; Returns: boolean }
       increment_pexels_key_usage: { Args: { p_id: string }; Returns: undefined }
       increment_provider_usage: {

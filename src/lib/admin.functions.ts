@@ -7,7 +7,7 @@ import type { Database } from "@/integrations/supabase/types";
 type AdminContext = { supabase: SupabaseClient<Database>; userId: string };
 
 /** Reads the caller's own role row through their RLS-scoped client (own-profile policy). */
-async function isCallerAdmin(context: AdminContext) {
+export async function isCallerAdmin(context: AdminContext) {
   const { data, error } = await context.supabase
     .from("users")
     .select("role")

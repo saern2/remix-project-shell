@@ -5,6 +5,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { useState, type ReactNode } from "react";
 import {
   AudioLines,
+  ChartColumnBig,
   ChevronLeft,
   ChevronRight,
   CircleUserRound,
@@ -35,11 +36,19 @@ import {
 } from "@/components/ui/dropdown-menu";
 
 type ShellPath =
-  "/dashboard" | "/projects/new" | "/projects" | "/settings" | "/account" | "/admin" | "/users";
+  | "/dashboard"
+  | "/stats"
+  | "/projects/new"
+  | "/projects"
+  | "/settings"
+  | "/account"
+  | "/admin"
+  | "/users";
 type NavItem = { label: string; to: ShellPath; icon: LucideIcon; exact?: boolean };
 
 const PRIMARY_NAV: NavItem[] = [
   { label: "Dashboard", to: "/dashboard", icon: LayoutDashboard, exact: true },
+  { label: "Stats", to: "/stats", icon: ChartColumnBig, exact: true },
   { label: "Audio to Video", to: "/projects/new", icon: AudioLines },
   { label: "Projects", to: "/projects", icon: FolderKanban },
 ] as const;
