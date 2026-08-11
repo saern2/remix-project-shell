@@ -346,6 +346,52 @@ export type Database = {
           },
         ]
       }
+      generation_events: {
+        Row: {
+          audio_duration_seconds: number | null
+          backfilled: boolean
+          created_at: string
+          event_type: string
+          failure_reason: string | null
+          failure_stage: string | null
+          id: string
+          project_id: string | null
+          render_duration_ms: number | null
+          scene_count: number | null
+          source: string
+          user_id: string
+        }
+        Insert: {
+          audio_duration_seconds?: number | null
+          backfilled?: boolean
+          created_at?: string
+          event_type: string
+          failure_reason?: string | null
+          failure_stage?: string | null
+          id?: string
+          project_id?: string | null
+          render_duration_ms?: number | null
+          scene_count?: number | null
+          source?: string
+          user_id: string
+        }
+        Update: {
+          audio_duration_seconds?: number | null
+          backfilled?: boolean
+          created_at?: string
+          event_type?: string
+          failure_reason?: string | null
+          failure_stage?: string | null
+          id?: string
+          project_id?: string | null
+          render_duration_ms?: number | null
+          scene_count?: number | null
+          source?: string
+          user_id?: string
+        }
+        // No foreign key on project_id: the row must outlive the project.
+        Relationships: []
+      }
       maintenance_state: {
         Row: {
           enabled: boolean

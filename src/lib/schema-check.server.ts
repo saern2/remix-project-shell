@@ -82,6 +82,18 @@ export const REQUIRED_SCHEMA: Array<{
     migration: "20260805160000_project_stock_corpus",
   },
   {
+    // Absent, nothing breaks and nothing complains: the trigger that writes it
+    // swallows its own errors so a statistic can never fail a render. The
+    // lifetime count would simply stay at zero, which is indistinguishable
+    // from "no generations yet" — and every project that finished in the
+    // meantime would be unrecoverable, because the history it was reading
+    // from is deleted on a 30-hour cycle.
+    table: "generation_events",
+    columns: ["user_id", "project_id", "event_type", "backfilled", "created_at"],
+    migration:
+      "20260812000001_generation_events / 20260812000002_generation_events_trigger / 20260812000003_generation_events_backfill",
+  },
+  {
     table: "auth_login_codes",
     columns: ["client_token_hash", "attempts", "max_attempts", "expires_at", "invalidated_at"],
     migration: "20260807000001_passwordless_sign_in",

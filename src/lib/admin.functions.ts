@@ -542,3 +542,78 @@ export const uploadPexelsKeys = createServerFn({ method: "POST" })
     };
     /* c8 ignore stop */
   });
+
+/**
+ * Is the capture trigger actually writing? Admin-only.
+ *
+ * generation_events is written by a database trigger, not by application code,
+ * so the app has no natural place to notice it failing. The trigger swallows
+ * its own errors by design — a statistic must never fail a render — which means
+ * a systematic failure would show up only as a count that stops growing, and
+ * only to someone who already knew what the count should be.
+ *
+ * This is that check. The invariant is exact: every project currently sitting
+ * in a terminal status must have an event. A non-empty `missingProjectIds`
+ * means writes are being dropped, and the Postgres log will carry a
+ * `record_generation_event failed` warning naming the project.
+ *
+ * It compares against LIVE projects only. Events whose project has since been
+ * deleted are counted separately as `orphanedEvents` — those are the whole
+ * point of the table (history outliving its project), not a discrepancy.
+ */
+export const getGenerationStatsDebug = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await assertAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const [recentRes, terminalRes, eventKeysRes] = await Promise.all([
+      supabaseAdmin
+        .from("generation_events")
+        .select(
+          "id, user_id, project_id, event_type, source, scene_count, audio_duration_seconds, render_duration_ms, failure_stage, failure_reason, backfilled, created_at",
+        )
+        .order("created_at", { ascending: false })
+        .limit(50),
+      supabaseAdmin.from("projects").select("id, status").in("status", ["completed", "failed"]),
+      supabaseAdmin.from("generation_events").select("project_id, backfilled"),
+    ]);
+    for (const res of [recentRes, terminalRes, eventKeysRes]) {
+      if (res.error) throw new Error(res.error.message);
+    }
+
+    const terminalProjects = terminalRes.data ?? [];
+    const allEvents = eventKeysRes.data ?? [];
+    const projectIdsWithEvent = new Set(
+      allEvents.map((row) => row.project_id).filter((id): id is string => id != null),
+    );
+    const terminalProjectIds = new Set(terminalProjects.map((project) => project.id));
+
+    const missingProjectIds = terminalProjects
+      .filter((project) => !projectIdsWithEvent.has(project.id))
+      .map((project) => project.id);
+
+    return {
+      recent: recentRes.data ?? [],
+      invariant: {
+        terminalProjects: terminalProjects.length,
+        // Events belonging to those same projects. Equal counts plus an empty
+        // missing list is the pass condition.
+        eventsForTerminalProjects: allEvents.filter(
+          (row) => row.project_id != null && terminalProjectIds.has(row.project_id),
+        ).length,
+        missingProjectIds,
+        ok: missingProjectIds.length === 0,
+      },
+      totals: {
+        events: allEvents.length,
+        backfilled: allEvents.filter((row) => row.backfilled).length,
+        captured: allEvents.filter((row) => !row.backfilled).length,
+        // History whose project is gone — deleted in-app or by a future
+        // cleanup run. This is the table doing its job.
+        orphanedEvents: allEvents.filter(
+          (row) => row.project_id == null || !terminalProjectIds.has(row.project_id),
+        ).length,
+      },
+    };
+  });
