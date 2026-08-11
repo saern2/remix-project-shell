@@ -41,6 +41,7 @@ const {
   acquireChunkLease,
   markChunkReady,
   publishJobHealth,
+  readJobHealth,
   clearJobHealth,
 } = require('./resourceControl');
 const resourceControl = require('./resourceControl');
@@ -1107,6 +1108,28 @@ async function gateOnMaintenance(job, token, { phase = 'starting' } = {}) {
   return true;
 }
 
+/**
+ * Takes down a "waiting for a slot / for memory" notice once the gate opens.
+ *
+ * Job health is otherwise cleared only when a chunk COMPLETES, so without this
+ * a gate notice would outlive the gate: the chunk would be downloading and
+ * encoding while the poll still reported it queued. A notice that survives the
+ * condition it describes is the same class of bug as the one being fixed here.
+ *
+ * Conditional on purpose. The health key is shared by every chunk of the
+ * project, so clearing it unconditionally would wipe another chunk's stall or
+ * retry warning. Only an admission-phase notice is this function's to remove.
+ */
+async function clearAdmissionNotice(redis, parentJobId) {
+  try {
+    const health = await readJobHealth(redis, parentJobId);
+    if (health?.phase === 'admission') await clearJobHealth(redis, parentJobId);
+  } catch {
+    // Advisory. A stale notice is a cosmetic problem; failing the chunk over
+    // one would not be.
+  }
+}
+
 async function gateOnAdmission(job, token) {
   const projectId = parentProjectId(job);
   if (!projectId || !job.data?.is_chunk) return true;
@@ -1153,12 +1176,33 @@ async function gateOnAdmission(job, token) {
   // and exempt — the cap must not become a way to reject work it cannot classify.
   const ownerId = job.data?.owner_id ?? null;
   const { admitted, position } = await admission.tryAdmit(redis, projectId, ownerId);
-  if (admitted) return true;
+  if (admitted) {
+    await clearAdmissionNotice(redis, parentJobIdOf(job.id));
+    return true;
+  }
 
   logger.info(
     { jobId: job.id, projectId, position, limit: admission.admissionLimit() },
     'Chunk deferred: project is queued for an admission slot',
   );
+
+  // A deferred chunk is moved to DELAYED, and a delayed job appears in neither
+  // getActive() nor getPrioritized(). The status poll therefore saw nothing of
+  // this project at all and reported "waiting, 0 ahead" — which reads as stuck,
+  // because zero ahead means nothing is in the way. MEASURED on 2026-08-13
+  // (project a1a7c67e): 318 seconds of exactly that, 80% of the render's total
+  // wall time, before the whole job finished in 80 seconds.
+  //
+  // The memory gate above already announces itself this way; the slot gate did
+  // not, so it announced itself only to the log. Same channel, no new one.
+  await publishJobHealth(redis, parentJobIdOf(job.id), {
+    state: 'waiting-slot',
+    phase: 'admission',
+    chunkIndex: job.data?.chunk_index ?? null,
+    position,
+    limit: admission.admissionLimit(),
+  });
+
   return deferChunk(job, token);
 }
 

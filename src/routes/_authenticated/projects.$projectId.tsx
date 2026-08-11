@@ -814,6 +814,7 @@ function ProjectDetail() {
                             renderJob.chunk_state,
                             renderJob.chunks_ahead,
                             renderJob.queue_estimate_seconds,
+                            renderJob.queue_position,
                           ) ??
                           (renderJob.status === "queued"
                             ? "Queued on the render worker…"

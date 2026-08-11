@@ -116,9 +116,8 @@ describe("the state reaches the screen", () => {
     // An unrecognised value from a mismatched worker version must degrade to
     // null rather than fail the UPDATE against the column's constraint.
     const render = read("src/lib/render.functions.ts");
-    expect(render).toMatch(
-      /payload\.chunk_state === "waiting" \|\| payload\.chunk_state === "encoding"/,
-    );
+    expect(render).toMatch(/const CHUNK_STATES = \[[^\]]*"waiting"[^\]]*"encoding"[^\]]*\]/s);
+    expect(render).toMatch(/CHUNK_STATES\.includes\(payload\.chunk_state \?\? ""\)/);
     expect(render).toMatch(/chunkState === "waiting" && typeof payload\.chunks_ahead === "number"/);
   });
 

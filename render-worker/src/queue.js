@@ -359,6 +359,25 @@ async function getJobStatus(job) {
       }
     }
 
+    // A child chunk in trouble is otherwise invisible here: this job's own
+    // status stays "waiting-children" while chunks_completed silently stops.
+    //
+    // Read once, up front, because the chunk-visibility block below now needs
+    // it too. Same single GET this function has always made — moved, not added,
+    // so the poll's cost is unchanged.
+    const health = await readJobHealth(getRedisConnection(), projectId);
+    if (health) {
+      result.health = health;
+      result.stalled = health.state === 'stalled' || health.state === 'retrying';
+    }
+    // Why a chunk is not running, when the reason is a gate rather than a
+    // queue. Both admission gates publish here before deferring.
+    const gateNotice =
+      health?.phase === 'admission' &&
+      (health.state === 'waiting-slot' || health.state === 'waiting-memory')
+        ? health
+        : null;
+
     // Progress for a chunked render used to sit at 0 until the stitch itself
     // started — the deployed run showed 0% for four and a half minutes while 12
     // of 13 chunks completed. Derive it from the children instead; the stitch
@@ -394,7 +413,38 @@ async function getJobStatus(job) {
         if (activeChunks.some(isMine)) {
           // At least one chunk is on a worker right now: genuinely encoding,
           // just not finished. Saying "waiting" here would be its own lie.
+          // Observed reality outranks any notice a gate left behind.
           result.chunk_state = 'encoding';
+        } else if (gateNotice) {
+          // ── The delayed-chunk blind spot ──────────────────────────────────
+          // A chunk held at the admission gate is moved to DELAYED, and a
+          // delayed job is in neither getActive() nor getPrioritized(). Both
+          // queries therefore saw nothing of this project, and the poll said
+          // "waiting" with chunks_ahead 0 — which states that nothing is in the
+          // way, i.e. stuck.
+          //
+          // MEASURED on 2026-08-13, project a1a7c67e: 318 consecutive seconds
+          // of "waiting, 0 ahead, 0%", 80% of the render's wall time, after
+          // which the whole thing finished in 80 seconds.
+          //
+          // The gate already records why it deferred. Read it from the health
+          // record this function fetches anyway, so the explanation costs
+          // nothing: no extra query, no new channel.
+          result.chunk_state = gateNotice.state;
+          // NOT zero. Zero is a measurement meaning "nothing in front of you",
+          // and it was the most misleading part of the old output. The gate,
+          // not the chunk queue, is what this project is behind.
+          result.chunks_ahead = null;
+          if (gateNotice.state === 'waiting-slot' && Number(gateNotice.position) > 0) {
+            // The place the gate recorded when it deferred. The admission
+            // snapshot further down recomputes this from live state and
+            // overwrites it when it finds a position of its own, so this is
+            // the floor, not the answer: it fills the gap left when the
+            // snapshot read fails or the project has already left the waiting
+            // set. The limit is not copied — result.admission.limit already
+            // carries it.
+            result.queue_position = Number(gateNotice.position);
+          }
         } else {
           result.chunk_state = 'waiting';
           const minePending = prioritized.filter(isMine);
@@ -488,13 +538,6 @@ async function getJobStatus(job) {
       logger.warn({ jobId: job.id, err: err.message }, 'Admission snapshot unavailable');
     }
 
-    // A child chunk in trouble is otherwise invisible here: this job's own
-    // status stays "waiting-children" while chunks_completed silently stops.
-    const health = await readJobHealth(getRedisConnection(), projectId);
-    if (health) {
-      result.health = health;
-      result.stalled = health.state === 'stalled' || health.state === 'retrying';
-    }
   }
 
   return result;

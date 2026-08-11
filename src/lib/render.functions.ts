@@ -852,10 +852,18 @@ export const pollRenderJob = createServerFn({ method: "POST" })
         : null;
     // The mirror image at the other end of the render: admitted, but no chunk
     // worker free yet. Same degrade-to-null rule for an unrecognised value.
-    const chunkState =
-      payload.chunk_state === "waiting" || payload.chunk_state === "encoding"
-        ? payload.chunk_state
-        : null;
+    //
+    // "waiting-slot" and "waiting-memory" say WHY nothing is running when the
+    // reason is an admission gate rather than a busy queue. The old output for
+    // both was "waiting" with chunks_ahead 0 — measured at 318 seconds on
+    // 2026-08-13 — which claims nothing is in the way.
+    const CHUNK_STATES = ["waiting", "encoding", "waiting-slot", "waiting-memory"];
+    const chunkState = CHUNK_STATES.includes(payload.chunk_state ?? "")
+      ? (payload.chunk_state as string)
+      : null;
+    // Only the plain queue produces a countable "ahead" number. A gated chunk
+    // is behind a condition, not behind a line of other work, and reporting 0
+    // there was the misleading part.
     const chunksAhead =
       chunkState === "waiting" && typeof payload.chunks_ahead === "number"
         ? payload.chunks_ahead

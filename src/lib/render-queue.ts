@@ -51,9 +51,7 @@ export function describeQueuePosition(
   if (position == null || !Number.isFinite(position) || position < 1) return null;
 
   const place =
-    position === 1
-      ? "Next in line to start rendering"
-      : `Position ${position} in the render queue`;
+    position === 1 ? "Next in line to start rendering" : `Position ${position} in the render queue`;
 
   const wait = describeWait(estimateSeconds);
   // No measurement yet on a fresh worker. Saying where they are without
@@ -114,7 +112,33 @@ export function describeChunkPhase(
   chunkState: string | null | undefined,
   chunksAhead: number | null | undefined,
   estimateSeconds?: number | null,
+  queuePosition?: number | null,
 ): string | null {
+  // ── Held at an admission gate ─────────────────────────────────────────────
+  // MEASURED on 2026-08-13, project a1a7c67e: 318 seconds — 80% of the
+  // render's total wall time — displayed as "waiting" with 0 segments ahead
+  // and 0%, because a gated chunk is moved to DELAYED and disappears from
+  // every queue the status poll inspects. Zero ahead reads as "nothing is in
+  // the way", so the only honest reading of that screen was "stuck". The
+  // render then finished in 80 seconds.
+  if (chunkState === "waiting-slot") {
+    const position = typeof queuePosition === "number" && queuePosition > 0 ? queuePosition : null;
+    // describeWait already says "about N minutes"; adding another "about" here
+    // produced "about about 40 minutes".
+    const wait = describeWait(estimateSeconds);
+    const suffix = wait ? ` — ${wait} (estimate)` : "";
+    if (position == null) {
+      return `Waiting for a render slot — your place is held and rendering starts automatically${suffix}.`;
+    }
+    return `Waiting for a render slot — ${ordinal(position)} in the queue${suffix}.`;
+  }
+
+  if (chunkState === "waiting-memory") {
+    // Deliberately no number: the wait depends on other projects releasing
+    // memory, and any figure here would be invented.
+    return "Waiting for memory on the render machine — your place is held and rendering starts automatically.";
+  }
+
   if (chunkState !== "waiting") return null;
 
   const ahead = typeof chunksAhead === "number" && chunksAhead > 0 ? chunksAhead : null;
@@ -127,4 +151,20 @@ export function describeChunkPhase(
   const wait = describeWait(estimateSeconds);
   const suffix = wait ? ` — ${wait} (estimate)` : "";
   return `Waiting for a render slot — ${ahead} segment${ahead === 1 ? "" : "s"} ahead of you${suffix}.`;
+}
+
+/** 1st, 2nd, 3rd… A bare "position 3" reads like an error code. */
+function ordinal(value: number): string {
+  const rem100 = value % 100;
+  if (rem100 >= 11 && rem100 <= 13) return `${value}th`;
+  switch (value % 10) {
+    case 1:
+      return `${value}st`;
+    case 2:
+      return `${value}nd`;
+    case 3:
+      return `${value}rd`;
+    default:
+      return `${value}th`;
+  }
 }
