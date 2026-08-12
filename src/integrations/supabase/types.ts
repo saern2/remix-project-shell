@@ -389,7 +389,6 @@ export type Database = {
           source?: string
           user_id?: string
         }
-        // No foreign key on project_id: the row must outlive the project.
         Relationships: []
       }
       maintenance_state: {
@@ -1131,8 +1130,17 @@ export type Database = {
         }
         Returns: undefined
       }
+      generation_event_payload: {
+        Args: { p_project_id: string; p_status: string }
+        Returns: {
+          audio_duration_seconds: number
+          event_type: string
+          render_duration_ms: number
+          scene_count: number
+        }[]
+      }
       get_generation_stats: {
-        Args: { p_scope: string; p_tz?: string; p_user_id: string | null }
+        Args: { p_scope: string; p_tz?: string; p_user_id: string }
         Returns: Json
       }
       has_platform_account_access: { Args: never; Returns: boolean }
