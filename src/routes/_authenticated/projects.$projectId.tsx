@@ -95,6 +95,15 @@ const STATUS_LABELS: Record<string, string> = {
   failed: "Failed",
 };
 
+/**
+ * How long a poll may be outstanding before its claim is treated as abandoned.
+ *
+ * Comfortably above the 51.9s worst case measured on 2026-08-12 under four-way
+ * load, so a merely slow poll is never pre-empted and the guard keeps doing its
+ * job; well below the point where a person would give up and reload.
+ */
+const STALE_POLL_CLAIM_MS = 90_000;
+
 const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_footage"]);
 const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching", "uploading"]);
 /** A render in one of these is over; polling it again only produces a 404. */
@@ -442,7 +451,19 @@ function ProjectDetail() {
   // overlapped a still-running predecessor, against a median call of 5.56s and
   // a maximum of 51.9s. A ref outlives the restart, so a second chain cannot
   // start a call while one is outstanding whatever churns the dependencies.
-  const pollInFlight = useRef(false);
+  // Confirmed in production on the same day: 0 of 12 launches overlapped.
+  //
+  // Holds the claim TIME, not a boolean, so the claim can expire. Nothing on
+  // this path can time out — there is no AbortSignal in auth-retry.browser.ts
+  // or polling-state.ts, and browser fetch waits forever — so a request that
+  // never settles (server wedged, connection black-holed, laptop suspended
+  // mid-flight) would hold a boolean claim permanently. Every other exit
+  // releases it, including the early return on a deleted project, because the
+  // release is in a `finally`; this is the one path that does not, and before
+  // the guard existed a hung request was harmlessly overtaken by the next
+  // poll. That accidental recovery is what the guard removes, so it has to be
+  // replaced deliberately.
+  const pollInFlight = useRef<number | null>(null);
 
   // Poll the pipeline server function whenever the project is mid-flight.
   //
@@ -463,11 +484,28 @@ function ProjectDetail() {
       // A tick that arrives while the previous call is still running is
       // dropped, not queued: piling a second invocation onto a struggling
       // server function is what turned a slow poll into a saturated runtime.
-      if (pollInFlight.current) {
+      //
+      // Unless the claim has gone stale, in which case the holder is treated
+      // as lost and this tick proceeds. Without that, one unsettling request
+      // would stop this project advancing for the rest of the session while
+      // the loop spun harmlessly, checking a flag that would never clear.
+      const startedAt = Date.now();
+      const heldFor = pollInFlight.current == null ? 0 : startedAt - pollInFlight.current;
+      if (pollInFlight.current != null && heldFor < STALE_POLL_CLAIM_MS) {
         if (!cancelled) timer = setTimeout(tick, nextPollDelayMs(0));
         return;
       }
-      pollInFlight.current = true;
+      if (pollInFlight.current != null) {
+        // Loud, because it means a request never came back. Silent recovery
+        // here would hide exactly the condition worth knowing about.
+        console.warn("[pipeline-poll] abandoning a stale in-flight claim", {
+          projectId,
+          heldForMs: heldFor,
+        });
+      }
+      // The claim is the timestamp itself, which doubles as its own identity.
+      const claim = startedAt;
+      pollInFlight.current = claim;
       let hadError = false;
       try {
         const result = await pollWithAuthRetry(() => runPoll({ data: { projectId } }));
@@ -487,9 +525,13 @@ function ProjectDetail() {
         // refetch will show the failed state and repeated toasts would be noise.
         if (!cancelled && consecutiveErrors === 1) toast.error((err as Error).message);
       } finally {
-        // Released on every path, including the early return above — a flag
+        // Released on every path, including the early return above — a claim
         // left set would stop this project polling for the rest of the session.
-        pollInFlight.current = false;
+        //
+        // Only OUR claim: a hung predecessor that finally settles after being
+        // declared stale must not clear the claim a newer poll is holding, or
+        // it would reopen the overlap it was abandoned for.
+        if (pollInFlight.current === claim) pollInFlight.current = null;
       }
       if (!cancelled) {
         // React Query is refetching the project row on its own interval;

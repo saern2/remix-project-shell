@@ -44,33 +44,33 @@ const effect = (() => {
 })();
 
 describe("the pipeline poll cannot overlap itself", () => {
-  it("holds the in-flight flag in a ref, so it survives an effect restart", () => {
+  it("holds the claim in a ref, so it survives an effect restart", () => {
     // A local variable would be re-created by the restart and guard nothing.
-    expect(page).toMatch(/const pollInFlight = useRef\(false\)/);
+    expect(page).toMatch(/const pollInFlight = useRef<number \| null>\(null\)/);
     // Declared outside the effect body.
-    expect(page.indexOf("const pollInFlight = useRef(false)")).toBeLessThan(
+    expect(page.indexOf("const pollInFlight = useRef<number | null>(null)")).toBeLessThan(
       page.indexOf("// Poll the pipeline server function"),
     );
   });
 
   it("drops a tick that arrives while a call is outstanding", () => {
-    expect(effect).toMatch(/if \(pollInFlight\.current\)/);
+    const guardAt = effect.indexOf("if (pollInFlight.current != null && heldFor");
+    expect(guardAt).toBeGreaterThan(-1);
     // Dropped, not queued: the tick reschedules and returns without calling.
-    const guard = effect.slice(effect.indexOf("if (pollInFlight.current)"));
-    const guardBody = guard.slice(0, guard.indexOf("}") + 1);
+    const guardBody = effect.slice(guardAt, effect.indexOf("}", guardAt) + 1);
     expect(guardBody).toMatch(/setTimeout\(tick/);
     expect(guardBody).not.toMatch(/runPoll|pollWithAuthRetry/);
   });
 
-  it("claims the flag before awaiting and releases it on every path", () => {
-    const claimAt = effect.indexOf("pollInFlight.current = true");
+  it("claims before awaiting and releases it on every path", () => {
+    const claimAt = effect.indexOf("pollInFlight.current = claim");
     const awaitAt = effect.indexOf("await pollWithAuthRetry");
     expect(claimAt).toBeGreaterThan(-1);
     expect(claimAt).toBeLessThan(awaitAt);
     // A `finally`, not a trailing assignment: the missing-project branch
-    // returns early, and a flag left set would stop this project polling for
+    // returns early, and a claim left set would stop this project polling for
     // the rest of the session.
-    expect(effect).toMatch(/\}\s*finally\s*\{\s*[^}]*pollInFlight\.current = false/s);
+    expect(effect).toMatch(/\}\s*finally\s*\{[\s\S]*?pollInFlight\.current = null/);
   });
 
   it("depends on the status string, never on the project object", () => {
@@ -88,6 +88,52 @@ describe("the pipeline poll cannot overlap itself", () => {
   it("keeps the error backoff that stops fixed-interval retries stacking", () => {
     // Round 6, Issue 6. The guard complements this rather than replacing it.
     expect(effect).toMatch(/nextPollDelayMs\(hadError \? consecutiveErrors : 0\)/);
+  });
+});
+
+/**
+ * The guard closes the overlap, and in doing so closes an accidental recovery:
+ * before it existed, a request that never settled was harmlessly overtaken by
+ * the next poll. Nothing on this path can time out — there is no AbortSignal in
+ * auth-retry.browser.ts or polling-state.ts, and browser fetch waits forever —
+ * so a permanent claim was reachable, and the loop would spin re-arming timers
+ * against a flag that could never clear while the pipeline stopped advancing.
+ */
+describe("a claim that never releases cannot halt the project", () => {
+  it("holds the claim time rather than a boolean, so it can expire", () => {
+    expect(page).toMatch(/const pollInFlight = useRef<number \| null>\(null\)/);
+    expect(effect).toMatch(/pollInFlight\.current = claim/);
+  });
+
+  it("bounds the wait above the measured worst case, not arbitrarily", () => {
+    // 51.9s was the slowest pollPipeline observed on 2026-08-12. The bound must
+    // sit above it or a merely slow poll gets pre-empted and the overlap
+    // returns under exactly the load that motivated the guard.
+    const match = page.match(/const STALE_POLL_CLAIM_MS = ([\d_]+)/);
+    expect(match).toBeTruthy();
+    const ms = Number(match![1].replace(/_/g, ""));
+    expect(ms).toBeGreaterThan(51_900);
+    expect(ms).toBeLessThanOrEqual(120_000);
+  });
+
+  it("proceeds once the claim is stale instead of waiting forever", () => {
+    expect(effect).toMatch(/heldFor < STALE_POLL_CLAIM_MS/);
+    // The guard returns only while the claim is BOTH present and fresh.
+    expect(effect).toMatch(/if \(pollInFlight\.current != null && heldFor < STALE_POLL_CLAIM_MS\)/);
+  });
+
+  it("says so when it abandons one, rather than recovering silently", () => {
+    // A request that never came back is worth knowing about; silent recovery
+    // would hide the condition this bound exists for.
+    expect(effect).toMatch(
+      /console\.warn\(\s*"\[pipeline-poll\] abandoning a stale in-flight claim"/,
+    );
+  });
+
+  it("releases only its own claim, so a late straggler cannot reopen the overlap", () => {
+    // The abandoned request may still settle afterwards. If its finally cleared
+    // the flag unconditionally it would free the claim a newer poll is holding.
+    expect(effect).toMatch(/if \(pollInFlight\.current === claim\) pollInFlight\.current = null/);
   });
 });
 
