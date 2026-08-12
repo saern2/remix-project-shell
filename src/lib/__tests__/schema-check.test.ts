@@ -72,12 +72,16 @@ describe("schema check", () => {
 
   it("does not block the app when the privileged schema client is unavailable", async () => {
     vi.doMock("@/integrations/supabase/client.server", () => {
-      throw new Error("Missing privileged backend credentials");
+      throw new Error(
+        "Missing Supabase environment variable(s): SUPABASE_SERVICE_ROLE_KEY / SB_SERVICE_ROLE_KEY.",
+      );
     });
     vi.resetModules();
 
     const { findSchemaProblems } = await import("../schema-check.server");
     await expect(findSchemaProblems()).resolves.toEqual([]);
+    vi.doUnmock("@/integrations/supabase/client.server");
+    vi.resetModules();
   });
 
   it("throws by default so a broken deploy cannot look healthy", async () => {
