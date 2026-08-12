@@ -70,6 +70,16 @@ describe("schema check", () => {
     expect(await findSchemaProblems()).toEqual([]);
   });
 
+  it("does not block the app when the privileged schema client is unavailable", async () => {
+    vi.doMock("@/integrations/supabase/client.server", () => {
+      throw new Error("Missing privileged backend credentials");
+    });
+    vi.resetModules();
+
+    const { findSchemaProblems } = await import("../schema-check.server");
+    await expect(findSchemaProblems()).resolves.toEqual([]);
+  });
+
   it("throws by default so a broken deploy cannot look healthy", async () => {
     state.errors["render_jobs"] = { code: "42703", message: "column ... does not exist" };
     const { runSchemaCheck } = await import("../schema-check.server");

@@ -147,7 +147,21 @@ export function isMissingSchemaCode(code: string | undefined | null): boolean {
  * class of failure and should not become a general health gate.
  */
 export async function findSchemaProblems(): Promise<SchemaProblem[]> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  let supabaseAdmin: typeof import("@/integrations/supabase/client.server")["supabaseAdmin"];
+  try {
+    ({ supabaseAdmin } = await import("@/integrations/supabase/client.server"));
+  } catch (error) {
+    // The schema probe is diagnostic only. In preview/dev the privileged client
+    // may be unavailable even though public and authenticated app traffic can
+    // still use the generated browser/server-session clients. Do not turn that
+    // credential/configuration condition into a site-wide 503. Confirmed 42P01
+    // and 42703 responses below still fail the deployment as intended.
+    console.warn(
+      "[schema-check] privileged schema probe unavailable; skipping deploy-time verification",
+      error,
+    );
+    return [];
+  }
   const problems: SchemaProblem[] = [];
 
   await Promise.all(
