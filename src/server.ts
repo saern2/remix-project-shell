@@ -66,7 +66,13 @@ function checkSchemaOnce(): Promise<string | null> {
         await runSchemaCheck();
         return null;
       })
-      .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+      .catch((error: unknown) => {
+        // Backend credentials can be injected just after the dev worker starts.
+        // Do not poison the worker for its entire lifetime when the first request
+        // wins that race; keep failing closed, but allow the next request to retry.
+        schemaCheckPromise = undefined;
+        return error instanceof Error ? error.message : String(error);
+      });
   }
   return schemaCheckPromise;
 }
