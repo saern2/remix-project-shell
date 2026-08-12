@@ -182,6 +182,56 @@ export async function loadProjectCorpus(projectId: string): Promise<CorpusBucket
 }
 
 /**
+ * Reads what the BUILD phase needs, and nothing else.
+ *
+ * pendingCorpusWork reads only `providersDone`; buildCorpusCell needs the
+ * bucket's `id` and `query` to search. None of them touch `candidates` — and
+ * candidates are the entire cost: ~98 kB per bucket on the wire against ~120 B
+ * for the rest of the row. A 40-bucket corpus is ~3.9 MB read this way and
+ * ~8 kB read that way, and the build phase runs ~20 times per project.
+ *
+ * The returned buckets carry `candidates: []` — NOT because the buckets are
+ * empty, but because this read did not ask for them. That is safe for deciding
+ * what work remains and for scheduling cells; it is NOT a corpus, and must
+ * never reach assignment, which needs every candidate to make a scene unique.
+ * prepareCorpus therefore re-reads the whole corpus with loadProjectCorpus at
+ * the moment the build finishes.
+ */
+export async function loadCorpusProgress(projectId: string): Promise<CorpusBucket[]> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  // One statement: without candidates the whole result is a few kB, nowhere
+  // near the 8s ceiling that made loadProjectCorpus page.
+  const { data, error } = await supabaseAdmin
+    .from("project_stock_corpus")
+    .select("bucket_id, query, tokens, demand_ids, providers_done")
+    .eq("project_id", projectId)
+    .order("bucket_id", { ascending: true });
+  if (error) throw new Error(`Corpus progress load failed: ${error.message}`);
+
+  return (data ?? []).map((row) => ({
+    id: row.bucket_id,
+    query: row.query,
+    tokens: Array.isArray(row.tokens) ? (row.tokens as string[]) : stockQueryTokens(row.query),
+    demandIds: Array.isArray(row.demand_ids) ? (row.demand_ids as string[]) : [],
+    candidates: [],
+    providersDone: Array.isArray(row.providers_done) ? (row.providers_done as string[]) : [],
+  }));
+}
+
+/** One bucket's stored pool — the merge base for the cell about to be written. */
+async function loadBucketCandidates(projectId: string, bucketId: string): Promise<StockVideo[]> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data, error } = await supabaseAdmin
+    .from("project_stock_corpus")
+    .select("candidates")
+    .eq("project_id", projectId)
+    .eq("bucket_id", bucketId)
+    .maybeSingle();
+  if (error) throw new Error(`Corpus bucket read failed: ${error.message}`);
+  return Array.isArray(data?.candidates) ? (data.candidates as unknown as StockVideo[]) : [];
+}
+
+/**
  * Clusters every scene in the project into buckets and persists them, once.
  *
  * Clustering is deterministic for a given demand set, but it is persisted rather
@@ -333,7 +383,14 @@ export async function buildCorpusCell(opts: {
     });
   }
 
-  const merged = dedupeById([...bucket.candidates, ...found.map(distillCandidate)]).slice(
+  // Merged against what is STORED, not against the bucket handed in. The build
+  // phase now loads progress only, so `bucket.candidates` is routinely empty
+  // while the row holds everything the earlier cells found — merging against
+  // the argument would write those away. Re-reading one bucket costs ~98 kB
+  // where reading them all costs ~3.9 MB, and it removes the whole class of
+  // bug where a stale in-memory copy overwrites the row.
+  const stored = await loadBucketCandidates(opts.projectId, bucket.id);
+  const merged = dedupeById([...stored, ...found.map(distillCandidate)]).slice(
     0,
     CORPUS_CANDIDATES_PER_BUCKET * 3,
   );

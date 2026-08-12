@@ -1206,8 +1206,13 @@ async function advanceFromMatchingFootage(projectId: string) {
     // The corpus is now clustered once over every scene and built incrementally
     // under the same time budget. Assignment does not begin until it is complete,
     // so it never runs against a partial pool.
-    const { ensureProjectBuckets, loadProjectCorpus, pendingCorpusWork, buildCorpusCell } =
-      await import("@/lib/stock-corpus-store.server");
+    const {
+      ensureProjectBuckets,
+      loadProjectCorpus,
+      loadCorpusProgress,
+      pendingCorpusWork,
+      buildCorpusCell,
+    } = await import("@/lib/stock-corpus-store.server");
 
     const corpusProviders: Array<"pexels" | "pixabay" | "nasa"> =
       projectNiche === "space" ? ["nasa", "pexels", "pixabay"] : ["pexels", "pixabay"];
@@ -1261,25 +1266,42 @@ async function advanceFromMatchingFootage(projectId: string) {
         return { corpus: memo, complete: true as const, remaining: 0, cellsBuilt: 0 };
       }
 
+      // PROGRESS, not the corpus. Deciding what work is left reads only
+      // providers_done, and searching a cell reads only the bucket's query —
+      // yet this used to load every candidate to do it: ~3.9 MB of JSON per
+      // invocation, ~20 invocations per project, essentially all of it
+      // discarded. It is also the read that hit the 8s statement timeout.
+      // These buckets carry candidates: [] and MUST NOT reach assignment; the
+      // whole corpus is re-read below, once, when the build is finished.
       const corpusStartedAt = Date.now();
-      let corpus = await loadProjectCorpus(projectId);
-      if (corpus.length === 0) {
-        corpus = await ensureProjectBuckets(projectId, await loadAllDemands());
+      let progress = await loadCorpusProgress(projectId);
+      if (progress.length === 0) {
+        progress = await ensureProjectBuckets(projectId, await loadAllDemands());
       }
       profile.add("corpusLoad", Date.now() - corpusStartedAt);
 
       // Counted and returned so the progress watchdog can see that the corpus
       // phase advanced even though no scene was assigned.
       let cellsBuilt = 0;
-      let pending = pendingCorpusWork(corpus, corpusProviders);
+      let pending = pendingCorpusWork(progress, corpusProviders);
       profile.count("corpusCellsPending", pending.length);
       if (pending.length === 0) {
-        cacheCompleteCorpus(projectId, corpus);
-        return { corpus, complete: true as const, remaining: 0, cellsBuilt: 0 };
+        // Nothing left to build, so this invocation is an assignment one: read
+        // the corpus whole. "The corpus must be whole before a single scene is
+        // assigned" is unchanged — only the reads that were never going to
+        // assign anything have stopped paying for it.
+        // Timed under the same counter, so corpusLoad keeps meaning "time spent
+        // reading the corpus" rather than dropping to the progress read's few
+        // milliseconds and reading as a win that moved rather than happened.
+        const completeStartedAt = Date.now();
+        const complete = await loadProjectCorpus(projectId);
+        profile.add("corpusLoad", Date.now() - completeStartedAt);
+        cacheCompleteCorpus(projectId, complete);
+        return { corpus: complete, complete: true as const, remaining: 0, cellsBuilt: 0 };
       }
 
       stockSession = stockSession ?? (await createStockSearchSession(profile));
-      const byId = new Map(corpus.map((bucket) => [bucket.id, bucket]));
+      const byId = new Map(progress.map((bucket) => [bucket.id, bucket]));
 
       while (pending.length > 0 && budget.shouldStartAnotherSlice()) {
         const cellStartedAt = Date.now();
@@ -1301,12 +1323,23 @@ async function advanceFromMatchingFootage(projectId: string) {
         pending = pendingCorpusWork([...byId.values()], corpusProviders);
       }
 
-      const rebuilt = [...byId.values()];
       if (pending.length > 0) {
         // Deliberately NOT cached: a partial corpus in memory would let the next
-        // invocation decide what work remains from a stale copy.
-        return { corpus: rebuilt, complete: false as const, remaining: pending.length, cellsBuilt };
+        // invocation decide what work remains from a stale copy. Only .length is
+        // read from this, for the "building corpus" log line.
+        return {
+          corpus: [...byId.values()],
+          complete: false as const,
+          remaining: pending.length,
+          cellsBuilt,
+        };
       }
+      // The build finished inside this invocation, so assignment runs next and
+      // needs every candidate. byId holds full pools only for the buckets this
+      // invocation happened to build, so it is read whole rather than assembled.
+      const rebuiltStartedAt = Date.now();
+      const rebuilt = await loadProjectCorpus(projectId);
+      profile.add("corpusLoad", Date.now() - rebuiltStartedAt);
       cacheCompleteCorpus(projectId, rebuilt);
       return { corpus: rebuilt, complete: true as const, remaining: 0, cellsBuilt };
     };

@@ -1,0 +1,251 @@
+/**
+ * The build phase reads progress, not candidates.
+ *
+ * MEASURED 2026-08-12 in production: a 40-bucket corpus is ~3.9 MB of JSON on
+ * the wire, and the matching pipeline read all of it on every one of its ~20
+ * build invocations — ~80 MB per project — to answer a question that lives
+ * entirely in providers_done. It is also the read that hit `authenticator`'s
+ * 8s statement_timeout.
+ *
+ * Two properties matter, and the second is the dangerous one:
+ *
+ *   1. the build reads only what it needs;
+ *   2. assignment still gets the WHOLE corpus. "The corpus must be whole before
+ *      a single scene is assigned" is the round-8 fix — a candidate-less bucket
+ *      reaching assignment would silently look like an exhausted pool.
+ */
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+type Row = {
+  project_id: string;
+  bucket_id: string;
+  query: string;
+  tokens: unknown;
+  demand_ids: unknown;
+  candidates: unknown;
+  providers_done: unknown;
+};
+
+const { db } = vi.hoisted(() => ({
+  db: {
+    rows: [] as Row[],
+    /** Columns each statement asked for, in order. */
+    selects: [] as string[],
+    updates: [] as Array<Record<string, unknown>>,
+    found: [] as unknown[],
+  },
+}));
+
+vi.mock("@/integrations/supabase/client.server", () => {
+  const from = () => {
+    const stmt = { columns: "", eq: {} as Record<string, string>, gt: null as string | null };
+    const rowsFor = () => {
+      let rows = db.rows.filter((row) =>
+        Object.entries(stmt.eq).every(([column, value]) => (row as never)[column] === value),
+      );
+      if (stmt.gt !== null) rows = rows.filter((row) => row.bucket_id > stmt.gt!);
+      return [...rows].sort((a, b) => (a.bucket_id < b.bucket_id ? -1 : 1));
+    };
+    const builder = {
+      select: (columns: string) => {
+        stmt.columns = columns;
+        db.selects.push(columns);
+        return builder;
+      },
+      eq: (column: string, value: string) => {
+        stmt.eq[column] = value;
+        return builder;
+      },
+      gt: (_column: string, value: string) => {
+        stmt.gt = value;
+        return builder;
+      },
+      order: () => builder,
+      limit: () => builder,
+      maybeSingle: async () => ({ data: rowsFor()[0] ?? null, error: null }),
+      update: async (patch: Record<string, unknown>) => {
+        db.updates.push(patch);
+        for (const row of rowsFor()) Object.assign(row, patch);
+        return { error: null };
+      },
+      then: (resolve: (value: { data: Row[]; error: null }) => void) =>
+        resolve({ data: rowsFor(), error: null }),
+    };
+    // `update(...).eq(...).eq(...)` — the filters come after the patch, so the
+    // update has to be applied when the chain is awaited, not when it is built.
+    const chain = {
+      ...builder,
+      update: (patch: Record<string, unknown>) => {
+        db.updates.push(patch);
+        const applying = {
+          eq: (column: string, value: string) => {
+            stmt.eq[column] = value;
+            return applying;
+          },
+          then: (resolve: (value: { error: null }) => void) => {
+            for (const row of rowsFor()) Object.assign(row, patch);
+            return resolve({ error: null });
+          },
+        };
+        return applying;
+      },
+    };
+    return chain;
+  };
+  return { supabaseAdmin: { from } };
+});
+
+vi.mock("@/lib/stock.server", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  searchProviderCandidatePool: async () => db.found,
+}));
+
+const PROJECT = "11111111-1111-4111-8111-111111111111";
+
+const candidate = (id: string) => ({
+  provider: "pexels" as const,
+  provider_clip_id: id,
+  duration_sec: 12,
+  width: 1920,
+  height: 1080,
+  thumbnail_url: `https://example.test/${id}.jpg`,
+  files: [{ url: `https://example.test/${id}.mp4`, width: 1920, height: 1080 }],
+});
+
+beforeEach(() => {
+  db.rows = [
+    {
+      project_id: PROJECT,
+      bucket_id: "bucket-0",
+      query: "slow drifting clouds",
+      tokens: ["slow", "clouds"],
+      demand_ids: ["scene-a"],
+      candidates: [candidate("stored-1"), candidate("stored-2"), candidate("stored-3")],
+      providers_done: ["pexels"],
+    },
+  ];
+  db.selects = [];
+  db.updates = [];
+  db.found = [];
+});
+
+describe("loadCorpusProgress reads what the build needs and no more", () => {
+  it("never asks for the candidates column", async () => {
+    const { loadCorpusProgress } = await import("../stock-corpus-store.server");
+    await loadCorpusProgress(PROJECT);
+    expect(db.selects).toHaveLength(1);
+    // The whole point: ~120 B a bucket instead of ~98 kB.
+    expect(db.selects[0]).not.toMatch(/candidates/);
+    expect(db.selects[0]).toMatch(/providers_done/);
+    expect(db.selects[0]).toMatch(/bucket_id/);
+    // buildCorpusCell searches on the bucket's query, so it has to come back.
+    expect(db.selects[0]).toMatch(/query/);
+  });
+
+  it("returns buckets whose pools are empty because they were not read", async () => {
+    const { loadCorpusProgress, pendingCorpusWork } = await import("../stock-corpus-store.server");
+    const [bucket] = await loadCorpusProgress(PROJECT);
+    expect(bucket.candidates).toEqual([]);
+    // Scheduling is unaffected — it reads providersDone only.
+    expect(pendingCorpusWork([bucket], ["pexels", "pixabay"]).map((c) => c.provider)).toEqual([
+      "pixabay",
+    ]);
+  });
+});
+
+describe("a cell merges into the stored pool, never over it", () => {
+  it("keeps candidates the build phase never loaded", async () => {
+    // This is the failure mode of reading progress only: the bucket in hand has
+    // an empty pool, the row has three, and a merge against the argument would
+    // write the three away and leave the project with one candidate.
+    const { buildCorpusCell, loadCorpusProgress } = await import("../stock-corpus-store.server");
+    db.found = [candidate("fresh-1")];
+    const [progressBucket] = await loadCorpusProgress(PROJECT);
+
+    const updated = await buildCorpusCell({
+      projectId: PROJECT,
+      bucket: progressBucket,
+      provider: "pixabay",
+      orientation: "landscape",
+      targetWidth: 1920,
+      session: undefined as never,
+    });
+
+    expect(updated.candidates.map((c) => c.provider_clip_id)).toEqual([
+      "stored-1",
+      "stored-2",
+      "stored-3",
+      "fresh-1",
+    ]);
+    expect(db.rows[0].candidates).toHaveLength(4);
+    expect(updated.providersDone).toEqual(["pexels", "pixabay"]);
+  });
+
+  it("still deduplicates against what is already stored", async () => {
+    const { buildCorpusCell, loadCorpusProgress } = await import("../stock-corpus-store.server");
+    db.found = [candidate("stored-2"), candidate("fresh-1")];
+    const [progressBucket] = await loadCorpusProgress(PROJECT);
+    const updated = await buildCorpusCell({
+      projectId: PROJECT,
+      bucket: progressBucket,
+      provider: "pixabay",
+      orientation: "landscape",
+      targetWidth: 1920,
+      session: undefined as never,
+    });
+    expect(updated.candidates).toHaveLength(4);
+  });
+});
+
+/**
+ * prepareCorpus lives inside advanceFromMatchingFootage, which is ~600 lines of
+ * pipeline state and cannot be called from a test. These pin the three points
+ * that decide whether assignment sees a whole corpus, read from the source.
+ */
+describe("assignment is still handed the whole corpus", () => {
+  const source = readFileSync(resolve(process.cwd(), "src/lib/pipeline.functions.ts"), "utf8");
+  const prepare = source.slice(
+    source.indexOf("const prepareCorpus = async () => {"),
+    source.indexOf("if (fixedDuration != null && fixedDuration > 0)"),
+  );
+
+  it("reads progress to decide what to build", () => {
+    expect(prepare.length).toBeGreaterThan(0);
+    expect(prepare).toMatch(/let progress = await loadCorpusProgress\(projectId\)/);
+    expect(prepare).toMatch(/pendingCorpusWork\(progress, corpusProviders\)/);
+  });
+
+  it("re-reads the whole corpus on every path that hands one to assignment", () => {
+    // Three returns say complete: the memo, the nothing-left-to-build exit, and
+    // the build finishing inside this invocation. Each must carry a corpus that
+    // came from loadProjectCorpus — directly, or from the memo, which the test
+    // below pins to the same source.
+    const completions = prepare.match(/return \{[^{}]*complete: true as const[^{}]*\}/g) ?? [];
+    expect(completions).toHaveLength(3);
+    for (const completion of completions) {
+      const returned = completion.match(/corpus: (\w+)/)?.[1];
+      expect(returned, completion).toBeTruthy();
+      if (returned === "memo") continue;
+      expect(prepare).toMatch(
+        new RegExp(`const ${returned} = await loadProjectCorpus\\(projectId\\)`),
+      );
+    }
+    // And the one incomplete return must NOT claim to be usable.
+    expect(prepare).toMatch(/complete: false as const/);
+  });
+
+  it("never caches a corpus that came from a progress read", () => {
+    for (const cached of prepare.match(/cacheCompleteCorpus\(projectId, (\w+)\)/g) ?? []) {
+      const name = cached.match(/, (\w+)\)/)![1];
+      expect(prepare).toMatch(new RegExp(`const ${name} = await loadProjectCorpus\\(projectId\\)`));
+    }
+    expect(prepare).not.toMatch(/cacheCompleteCorpus\(projectId, progress\)/);
+  });
+
+  it("leaves the memo and the round-8 invariant alone", () => {
+    expect(prepare).toMatch(/const memo = getCachedCorpus\(projectId\)/);
+    expect(source).toMatch(/The corpus must be whole before a single scene is assigned\./);
+  });
+});
