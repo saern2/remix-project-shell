@@ -70,7 +70,7 @@ export const getGenerationStats = createServerFn({ method: "GET" })
     const { data: stats, error } = await supabaseAdmin.rpc("get_generation_stats", {
       p_scope: wantsPlatform ? "platform" : "user",
       // Never from the request: user scope is always the caller's own history.
-      p_user_id: wantsPlatform ? null : context.userId,
+      p_user_id: (wantsPlatform ? null : context.userId) as unknown as string,
       p_tz: data.timeZone ?? "UTC",
     });
     if (error) {
