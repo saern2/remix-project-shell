@@ -200,6 +200,100 @@ describe("a cell merges into the stored pool, never over it", () => {
 });
 
 /**
+ * MEASURED capture 44 against 42/43: the merge-base read costs ~255 ms, and
+ * doing it per cell cost 21% of build throughput — 12.9 cells per invocation
+ * down to 9.9, about 72s per project. pendingCorpusWork is bucket-major and a
+ * space project is 5 cells per bucket (nasa x3 + pexels + pixabay, and 200
+ * pending over 40 buckets confirms it), so ~10 cells span 2-3 buckets. Reading
+ * once per bucket instead of once per cell is the difference.
+ */
+describe("the merge base is read once per bucket, not once per cell", () => {
+  const cell = async (bucket: unknown, provider: "pexels" | "pixabay" | "nasa", queryIndex = 0) => {
+    const { buildCorpusCell } = await import("../stock-corpus-store.server");
+    return buildCorpusCell({
+      projectId: PROJECT,
+      bucket: bucket as never,
+      provider,
+      queryIndex,
+      orientation: "landscape",
+      targetWidth: 1920,
+      session: undefined as never,
+    });
+  };
+  const candidateReads = () => db.selects.filter((columns) => columns === "candidates").length;
+
+  it("does not re-read for the second and third cell of the same bucket", async () => {
+    // The build loop feeds each result back through byId, which is what makes
+    // this reachable: after the first cell, the invocation holds the real pool.
+    const { loadCorpusProgress } = await import("../stock-corpus-store.server");
+    // expandNasaQueries dedupes its variants, so a three-token query yields only
+    // two and the third cell searches nothing. Five tokens gives three real
+    // queries, which is what a NASA bucket looks like in production.
+    db.rows[0].query = "aerial coastline sunrise drone footage";
+    const [progressBucket] = await loadCorpusProgress(PROJECT);
+
+    db.found = [candidate("nasa-0")];
+    let bucket = await cell(progressBucket, "nasa", 0);
+    expect(candidateReads()).toBe(1);
+
+    db.found = [candidate("nasa-1")];
+    bucket = await cell(bucket, "nasa", 1);
+    db.found = [candidate("nasa-2")];
+    bucket = await cell(bucket, "nasa", 2);
+
+    // Still one: NASA's three cells used to cost three reads of the same row.
+    expect(candidateReads()).toBe(1);
+    // And nothing was lost by trusting the pool in hand.
+    expect(bucket.candidates.map((c) => c.provider_clip_id)).toEqual([
+      "stored-1",
+      "stored-2",
+      "stored-3",
+      "nasa-0",
+      "nasa-1",
+      "nasa-2",
+    ]);
+    expect(db.rows[0].candidates).toHaveLength(6);
+  });
+
+  it("does not read at all for a bucket that came from loadProjectCorpus", async () => {
+    const { loadProjectCorpus } = await import("../stock-corpus-store.server");
+    const [full] = await loadProjectCorpus(PROJECT);
+    db.selects.length = 0;
+    db.found = [candidate("fresh-1")];
+    const updated = await cell(full, "pixabay");
+    expect(candidateReads()).toBe(0);
+    expect(updated.candidates).toHaveLength(4);
+  });
+
+  it("still reads for a bucket that carries no marker", async () => {
+    // The safe default: forgetting the flag costs a round trip, never data. A
+    // hand-built bucket with an empty pool must NOT be trusted.
+    db.found = [candidate("fresh-1")];
+    const updated = await cell(
+      {
+        id: "bucket-0",
+        query: "slow drifting clouds",
+        tokens: [],
+        demandIds: [],
+        candidates: [],
+        providersDone: [],
+      },
+      "pixabay",
+    );
+    expect(candidateReads()).toBe(1);
+    expect(updated.candidates).toHaveLength(4);
+    expect(db.rows[0].candidates).toHaveLength(4);
+  });
+
+  it("marks what it returns, or the loop would read every time", async () => {
+    const { loadCorpusProgress } = await import("../stock-corpus-store.server");
+    const [progressBucket] = await loadCorpusProgress(PROJECT);
+    expect(progressBucket.candidatesLoaded).toBeUndefined();
+    expect((await cell(progressBucket, "pixabay")).candidatesLoaded).toBe(true);
+  });
+});
+
+/**
  * prepareCorpus lives inside advanceFromMatchingFootage, which is ~600 lines of
  * pipeline state and cannot be called from a test. These pin the three points
  * that decide whether assignment sees a whole corpus, read from the source.

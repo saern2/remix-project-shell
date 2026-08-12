@@ -45,6 +45,20 @@ const MAX_FILES = 5;
 export type CorpusBucket = StockQueryBucket & {
   candidates: StockVideo[];
   providersDone: string[];
+  /**
+   * Whether `candidates` is the row's real pool, or just an empty array because
+   * the read that produced this bucket did not ask for it.
+   *
+   * Set by loadProjectCorpus and by buildCorpusCell's return; absent on
+   * loadCorpusProgress. buildCorpusCell reads the stored pool only when this is
+   * not true, so a bucket built more than once in an invocation — NASA is three
+   * cells per bucket — is fetched once rather than three times.
+   *
+   * OPTIONAL AND UNSET-MEANS-RELOAD, deliberately. A future loader that forgets
+   * to set it makes the build slower, never wrong; the opposite default would
+   * merge into an empty pool and write the row's candidates away.
+   */
+  candidatesLoaded?: boolean;
 };
 
 export type CorpusProvider = "pexels" | "pixabay" | "nasa";
@@ -169,6 +183,7 @@ export async function loadProjectCorpus(projectId: string): Promise<CorpusBucket
         candidates: Array.isArray(row.candidates)
           ? (row.candidates as unknown as StockVideo[])
           : [],
+        candidatesLoaded: true,
         providersDone: Array.isArray(row.providers_done) ? (row.providers_done as string[]) : [],
       });
     }
@@ -218,7 +233,15 @@ export async function loadCorpusProgress(projectId: string): Promise<CorpusBucke
   }));
 }
 
-/** One bucket's stored pool — the merge base for the cell about to be written. */
+/**
+ * One bucket's stored pool — the merge base for the cell about to be written.
+ *
+ * MEASURED 2026-08-12, capture 44 against 42/43: this read costs ~255 ms, and
+ * doing it per CELL cost 21% of build throughput (12.9 -> 9.9 cells per
+ * invocation). pendingCorpusWork is bucket-major and a space project is 5 cells
+ * per bucket, so ~10 cells span 2-3 buckets — hence candidatesLoaded, which
+ * makes this once per bucket rather than once per cell.
+ */
 async function loadBucketCandidates(projectId: string, bucketId: string): Promise<StockVideo[]> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { data, error } = await supabaseAdmin
@@ -269,7 +292,14 @@ export async function ensureProjectBuckets(
     scenes: allDemands.length,
     buckets: buckets.length,
   });
-  return buckets.map((bucket) => ({ ...bucket, candidates: [], providersDone: [] }));
+  // Marked: these rows were just written empty, so the pool in hand is the real
+  // one and the first cell of each bucket need not read it back.
+  return buckets.map((bucket) => ({
+    ...bucket,
+    candidates: [],
+    candidatesLoaded: true,
+    providersDone: [],
+  }));
 }
 
 /**
@@ -384,12 +414,18 @@ export async function buildCorpusCell(opts: {
   }
 
   // Merged against what is STORED, not against the bucket handed in. The build
-  // phase now loads progress only, so `bucket.candidates` is routinely empty
-  // while the row holds everything the earlier cells found — merging against
-  // the argument would write those away. Re-reading one bucket costs ~98 kB
-  // where reading them all costs ~3.9 MB, and it removes the whole class of
-  // bug where a stale in-memory copy overwrites the row.
-  const stored = await loadBucketCandidates(opts.projectId, bucket.id);
+  // phase loads progress only, so `bucket.candidates` is routinely empty while
+  // the row holds everything the earlier cells found — merging against the
+  // argument would write those away.
+  //
+  // Unless the caller already has the real pool: loadProjectCorpus marks its
+  // buckets, and so does this function's own return value, which the build loop
+  // stores back. So the row is read once per bucket per invocation, not once
+  // per cell.
+  const stored =
+    bucket.candidatesLoaded === true
+      ? bucket.candidates
+      : await loadBucketCandidates(opts.projectId, bucket.id);
   const merged = dedupeById([...stored, ...found.map(distillCandidate)]).slice(
     0,
     CORPUS_CANDIDATES_PER_BUCKET * 3,
@@ -410,7 +446,9 @@ export async function buildCorpusCell(opts: {
     .eq("bucket_id", bucket.id);
   if (error) throw new Error(`Corpus cell write failed: ${error.message}`);
 
-  return { ...bucket, candidates: merged, providersDone };
+  // Marked: `merged` is the pool that was just written, so the next cell for
+  // this bucket needs no read of its own.
+  return { ...bucket, candidates: merged, candidatesLoaded: true, providersDone };
 }
 
 /** Discards a project's corpus, so a re-match rebuilds it from scratch. */

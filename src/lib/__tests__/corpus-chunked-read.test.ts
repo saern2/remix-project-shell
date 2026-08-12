@@ -210,6 +210,9 @@ describe("the corpus that comes back is whole", () => {
       tokens: ["t0"],
       demandIds: ["demand-0"],
       candidates: [{ provider: "pexels", provider_clip_id: "0" }],
+      // This read DID ask for candidates, so the pool in hand is the real one
+      // and buildCorpusCell need not fetch it again to merge into it.
+      candidatesLoaded: true,
       providersDone: ["pexels"],
     });
   });
