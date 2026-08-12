@@ -294,6 +294,83 @@ describe("the merge base is read once per bucket, not once per cell", () => {
 });
 
 /**
+ * The (b) discriminator: is the build searching for results it then discards?
+ *
+ * A bucket is capped at CORPUS_CANDIDATES_PER_BUCKET * 3 = 120 candidates, but
+ * one Pixabay cell can return up to 160 (two pages of 80) and Pexels the same.
+ * Providers run nasa -> pexels -> pixabay on a space project, so NASA fills the
+ * pool first and the two later cells can each make two sequential HTTP calls
+ * for results the slice can only throw away. Counted rather than assumed.
+ */
+describe("cells that cannot use what they fetch are counted", () => {
+  const profileFor = async () => {
+    const { createMatchingProfile } = await import("../matching-profile");
+    return createMatchingProfile();
+  };
+  const cellWith = async (
+    profile: Awaited<ReturnType<typeof profileFor>>,
+    provider: "pexels" | "pixabay" | "nasa",
+    queryIndex = 0,
+  ) => {
+    const { buildCorpusCell, loadCorpusProgress } = await import("../stock-corpus-store.server");
+    const [bucket] = await loadCorpusProgress(PROJECT);
+    return buildCorpusCell({
+      projectId: PROJECT,
+      bucket,
+      provider,
+      queryIndex,
+      orientation: "landscape",
+      targetWidth: 1920,
+      niche: "space",
+      session: { profile } as never,
+    });
+  };
+
+  it("counts a Pexels cell that searched a bucket already at the cap", async () => {
+    db.rows[0].candidates = Array.from({ length: 120 }, (_, index) => candidate(`stored-${index}`));
+    db.found = [candidate("fresh-1"), candidate("fresh-2")];
+    const profile = await profileFor();
+    await cellWith(profile, "pexels");
+
+    const summary = profile.summary();
+    expect(summary.corpusCellAtCapPexels).toBe(1);
+    // Two results fetched, two discarded — the whole cell was wasted work.
+    expect(summary.corpusCandidatesFound).toBe(2);
+    expect(summary.corpusCandidatesDiscarded).toBe(2);
+  });
+
+  it("does not flag a cell whose results the bucket could still hold", async () => {
+    db.found = [candidate("fresh-1")];
+    const profile = await profileFor();
+    await cellWith(profile, "pixabay");
+
+    const summary = profile.summary();
+    expect(summary.corpusCellAtCapPixabay).toBeUndefined();
+    expect(summary.corpusCandidatesDiscarded).toBe(0);
+  });
+
+  it("counts a NASA cell that had no query to search", async () => {
+    // expandNasaQueries dedupes to two variants for this bucket query, so
+    // nasa#2 issues no HTTP at all while still counting as a cell built.
+    const profile = await profileFor();
+    const updated = await cellWith(profile, "nasa", 2);
+
+    expect(profile.summary().corpusCellsNoQuery).toBe(1);
+    expect(profile.summary().corpusCandidatesFound).toBe(0);
+    // Still marked done, exactly as before — this is a measurement, not a fix.
+    expect(updated.providersDone).toContain("nasa#2");
+  });
+
+  it("leaves a real NASA cell uncounted", async () => {
+    db.rows[0].query = "aerial coastline sunrise drone footage";
+    db.found = [candidate("nasa-a")];
+    const profile = await profileFor();
+    await cellWith(profile, "nasa", 2);
+    expect(profile.summary().corpusCellsNoQuery).toBeUndefined();
+  });
+});
+
+/**
  * prepareCorpus lives inside advanceFromMatchingFootage, which is ~600 lines of
  * pipeline state and cannot be called from a test. These pin the three points
  * that decide whether assignment sees a whole corpus, read from the source.

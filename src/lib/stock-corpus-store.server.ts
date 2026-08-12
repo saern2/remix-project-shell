@@ -92,6 +92,11 @@ export function distillCandidate(video: StockVideo): StockVideo {
   };
 }
 
+/** Provider name as a telemetry-key suffix: "pexels" -> "Pexels". */
+function capitalize(value: string): string {
+  return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
 function dedupeById(videos: StockVideo[]): StockVideo[] {
   const seen = new Set<string>();
   return videos.filter((video) => {
@@ -377,11 +382,18 @@ export async function buildCorpusCell(opts: {
   const queryIndex = opts.queryIndex ?? 0;
   const spaceBias = opts.niche === "space";
 
+  const profile = opts.session?.profile;
+
   let found: StockVideo[] = [];
   try {
     if (provider === "nasa") {
       // Exactly one query per cell — see CorpusCell for why this is not a loop.
       const query = expandNasaQueries(bucket.query).slice(0, NASA_QUERIES_PER_BUCKET)[queryIndex];
+      // expandNasaQueries dedupes its four variants, so a short bucket query
+      // yields fewer than NASA_QUERIES_PER_BUCKET and the trailing cells search
+      // nothing at all. They cost no HTTP but they are counted as cells built,
+      // which dilutes every per-cell average computed from that number.
+      if (!query) profile?.count("corpusCellsNoQuery");
       if (query) {
         found = await searchProviderCandidatePool({
           provider: "nasa",
@@ -426,10 +438,20 @@ export async function buildCorpusCell(opts: {
     bucket.candidatesLoaded === true
       ? bucket.candidates
       : await loadBucketCandidates(opts.projectId, bucket.id);
-  const merged = dedupeById([...stored, ...found.map(distillCandidate)]).slice(
-    0,
-    CORPUS_CANDIDATES_PER_BUCKET * 3,
-  );
+  const cap = CORPUS_CANDIDATES_PER_BUCKET * 3;
+  const deduped = dedupeById([...stored, ...found.map(distillCandidate)]);
+  const merged = deduped.slice(0, cap);
+
+  // The (b) discriminator, measured, not inferred. `stored` is the pool as it
+  // was BEFORE this cell searched — the search does not touch it — so a cell
+  // that finds the bucket already at the cap made two sequential HTTP calls
+  // (Pexels and Pixabay are page 1 then page 2) for results that the slice
+  // below can only discard. Providers run nasa -> pexels -> pixabay on a space
+  // project, so NASA fills the pool first and the later two are the exposed
+  // ones. Counted per provider because the answer differs by provider.
+  if (stored.length >= cap) profile?.count(`corpusCellAtCap${capitalize(provider)}`);
+  profile?.count("corpusCandidatesFound", found.length);
+  profile?.count("corpusCandidatesDiscarded", deduped.length - merged.length);
   const providersDone = [
     ...new Set([...bucket.providersDone, corpusCellKey(provider, queryIndex)]),
   ];

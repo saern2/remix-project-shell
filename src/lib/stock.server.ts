@@ -407,7 +407,6 @@ async function markKeyUsed(id: string, res: Response) {
     p_remaining: (remaining !== null && Number.isFinite(remaining) ? remaining : null) as number,
     p_reset_at: pexelsResetAt(res) as string,
   });
-
 }
 
 async function markKeyDead(id: string, message: string) {
@@ -504,6 +503,10 @@ async function pexelsFetch(
       const counts = session.usage.get("pexels") ?? { requests: 0, cacheHits: 0 };
       counts.requests += 1;
       session.usage.set("pexels", counts);
+      // Same count as session.pexelsPool.requestCount, but recorded as it
+      // happens. The pool's own counter is only read by a log line on the
+      // legacy assignment path, which a corpus-build invocation never reaches.
+      session.profile?.count("pexelsRequests");
     },
   });
   if (!response) console.warn("[pexels-pool] no key could serve this request");
@@ -808,6 +811,20 @@ async function searchNasaWithCacheAndSelect(
   return selectStockCandidate({ ...opts, results, requireMinDuration: false });
 }
 
+/**
+ * Timing bucket for one provider's outbound search.
+ *
+ * MEASURED capture 46: providerSearch is 4,577 ms per invocation, 39% of
+ * matching — five times the whole corpus path — but it is one bucket for three
+ * providers with very different shapes. Pexels and Pixabay are two sequential
+ * page fetches; a NASA cell is three parallel search pages plus up to twelve
+ * asset resolutions at concurrency two. Choosing a fix without knowing which of
+ * those the 4,577 ms is would be guesswork.
+ */
+function providerSearchBucket(provider: string): string {
+  return `providerSearch${provider.charAt(0).toUpperCase()}${provider.slice(1)}`;
+}
+
 async function getCachedOrSearch(opts: {
   provider: string;
   query: string;
@@ -844,11 +861,28 @@ async function getCachedOrSearch(opts: {
   }
   let searchPromise = opts.session?.inflight.get(key);
   const ownsSearch = !searchPromise;
+  // Snapshotted BEFORE the search starts so the delta below is this search's
+  // own HTTP, not the session's running total. Only for the caller that owns
+  // the search: a joiner would double-count the same requests.
+  const nasaBefore =
+    ownsSearch && opts.provider === "nasa" && profile && opts.session?.nasaMetrics
+      ? { ...opts.session.nasaMetrics }
+      : null;
   if (!searchPromise) {
     profile?.count("searchCacheMisses");
     // Single choke point for every provider (Pexels, Pixabay, NASA): all
     // outbound provider HTTP for a search flows through here.
-    searchPromise = profile ? profile.time("providerSearch", () => opts.search()) : opts.search();
+    //
+    // Timed twice on purpose. `providerSearch` is the series every capture so
+    // far has been read against and must stay comparable; the per-provider
+    // bucket is what says WHICH provider the time belongs to, which the single
+    // bucket could never answer. Buckets are allowed to overlap — see
+    // matching-profile.ts.
+    searchPromise = profile
+      ? profile.time("providerSearch", () =>
+          profile.time(providerSearchBucket(opts.provider), () => opts.search()),
+        )
+      : opts.search();
     opts.session?.inflight.set(key, searchPromise);
   } else {
     profile?.count("searchInflightJoins");
@@ -859,6 +893,24 @@ async function getCachedOrSearch(opts: {
     results = await searchPromise;
   } finally {
     opts.session?.inflight.delete(key);
+    if (nasaBefore && opts.session?.nasaMetrics) {
+      // Counted here rather than read off the session at the end of the
+      // invocation: profile.summary() is snapshotted into the response payload
+      // before flushStockSearchSession runs, so anything emitted there never
+      // reaches the client. Emitted in `finally` so a failed NASA search still
+      // reports the calls it made.
+      const after = opts.session.nasaMetrics;
+      profile?.count("nasaSearchRequests", after.searchRequests - nasaBefore.searchRequests);
+      profile?.count("nasaAssetCalls", after.assetCalls - nasaBefore.assetCalls);
+      profile?.count("nasaMetadataCalls", after.metadataCalls - nasaBefore.metadataCalls);
+      profile?.count(
+        "nasaMetadataJsonFetches",
+        after.metadataJsonFetches - nasaBefore.metadataJsonFetches,
+      );
+      profile?.count("nasaCaptionCalls", after.captionCalls - nasaBefore.captionCalls);
+      profile?.count("nasaAssetCacheHits", after.assetCacheHits - nasaBefore.assetCacheHits);
+      profile?.count("nasaAssetCacheMisses", after.assetCacheMisses - nasaBefore.assetCacheMisses);
+    }
   }
   if (ownsSearch && opts.provider === "nasa") {
     await recordUsage(opts.provider, false, opts.session);
