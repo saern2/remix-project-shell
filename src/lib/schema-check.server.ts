@@ -128,6 +128,13 @@ export type SchemaProblem = {
   detail: string;
 };
 
+function isUnavailablePrivilegedClient(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    /Missing Supabase environment variable\(s\):.*(?:SERVICE_ROLE_KEY|SUPABASE_URL)/i.test(error.message)
+  );
+}
+
 /** Postgres codes that mean "the schema does not have this", vs. any other failure. */
 const MISSING_COLUMN = "42703";
 const MISSING_TABLE = "42P01";
@@ -147,33 +154,57 @@ export function isMissingSchemaCode(code: string | undefined | null): boolean {
  * class of failure and should not become a general health gate.
  */
 export async function findSchemaProblems(): Promise<SchemaProblem[]> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  let supabaseAdmin: typeof import("@/integrations/supabase/client.server")["supabaseAdmin"];
+  try {
+    ({ supabaseAdmin } = await import("@/integrations/supabase/client.server"));
+  } catch (error) {
+    if (!isUnavailablePrivilegedClient(error)) throw error;
+    // The schema probe is diagnostic only. In preview/dev the privileged client
+    // may be unavailable even though public and authenticated app traffic can
+    // still use the generated browser/server-session clients. Do not turn that
+    // credential/configuration condition into a site-wide 503. Confirmed 42P01
+    // and 42703 responses below still fail the deployment as intended.
+    console.warn(
+      "[schema-check] privileged schema probe unavailable; skipping deploy-time verification",
+      error,
+    );
+    return [];
+  }
   const problems: SchemaProblem[] = [];
 
-  await Promise.all(
-    REQUIRED_SCHEMA.map(async ({ table, columns, migration }) => {
-      const { error } = await supabaseAdmin
-        .from(table as never)
-        .select(columns.join(", "))
-        .limit(0);
-      if (!error) return;
+  try {
+    await Promise.all(
+      REQUIRED_SCHEMA.map(async ({ table, columns, migration }) => {
+        const { error } = await supabaseAdmin
+          .from(table as never)
+          .select(columns.join(", "))
+          .limit(0);
+        if (!error) return;
 
-      if (isMissingSchemaCode(error.code)) {
-        problems.push({
+        if (isMissingSchemaCode(error.code)) {
+          problems.push({
+            table,
+            migration,
+            code: error.code ?? "unknown",
+            detail: error.message,
+          });
+          return;
+        }
+        console.warn("[schema-check] could not verify table; not treating as a missing migration", {
           table,
-          migration,
-          code: error.code ?? "unknown",
-          detail: error.message,
+          code: error.code,
+          message: error.message,
         });
-        return;
-      }
-      console.warn("[schema-check] could not verify table; not treating as a missing migration", {
-        table,
-        code: error.code,
-        message: error.message,
-      });
-    }),
-  );
+      }),
+    );
+  } catch (error) {
+    if (!isUnavailablePrivilegedClient(error)) throw error;
+    console.warn(
+      "[schema-check] privileged schema probe unavailable; skipping deploy-time verification",
+      error,
+    );
+    return [];
+  }
 
   return problems.sort((a, b) => a.table.localeCompare(b.table));
 }
