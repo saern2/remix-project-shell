@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
@@ -7,11 +7,7 @@ import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.funct
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import { isMissingPollResult, nextPollDelayMs, pollIntervalWhileActive } from "@/lib/polling-state";
-import {
-  describeChunkPhase,
-  describeQueuePosition,
-  describeStitchPhase,
-} from "@/lib/render-queue";
+import { describeChunkPhase, describeQueuePosition, describeStitchPhase } from "@/lib/render-queue";
 import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
 import { retryModeForProject } from "@/lib/render-retry";
 import { Button } from "@/components/ui/button";
@@ -439,16 +435,39 @@ function ProjectDetail() {
     navigate,
   ]);
 
+  // Survives effect restarts on purpose. The setTimeout chain below only
+  // prevents overlap WITHIN one effect instance; a restart begins a fresh chain
+  // while the previous request is still in flight, and nothing aborts it.
+  // MEASURED 2026-08-12: 31 of 83 pollPipeline launches in a single tab
+  // overlapped a still-running predecessor, against a median call of 5.56s and
+  // a maximum of 51.9s. A ref outlives the restart, so a second chain cannot
+  // start a call while one is outstanding whatever churns the dependencies.
+  const pollInFlight = useRef(false);
+
   // Poll the pipeline server function whenever the project is mid-flight.
+  //
+  // Depends on the STATUS STRING, never on the project object. `project` is a
+  // react-query result whose identity changes whenever the row changes, and
+  // trg_projects_updated_at bumps updated_at on every matching write — two to
+  // three per invocation — so the selected row changed roughly every 3s and
+  // tore this effect down and restarted it at the same rate.
+  const projectStatus = project?.status;
   useEffect(() => {
-    if (!project) return;
-    if (!IN_PROGRESS.has(project.status)) return;
+    if (!projectStatus || !IN_PROGRESS.has(projectStatus)) return;
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let consecutiveErrors = 0;
 
     const tick = async () => {
+      // A tick that arrives while the previous call is still running is
+      // dropped, not queued: piling a second invocation onto a struggling
+      // server function is what turned a slow poll into a saturated runtime.
+      if (pollInFlight.current) {
+        if (!cancelled) timer = setTimeout(tick, nextPollDelayMs(0));
+        return;
+      }
+      pollInFlight.current = true;
       let hadError = false;
       try {
         const result = await pollWithAuthRetry(() => runPoll({ data: { projectId } }));
@@ -467,6 +486,10 @@ function ProjectDetail() {
         // Surface the error only on the first failure of a streak; the query
         // refetch will show the failed state and repeated toasts would be noise.
         if (!cancelled && consecutiveErrors === 1) toast.error((err as Error).message);
+      } finally {
+        // Released on every path, including the early return above — a flag
+        // left set would stop this project polling for the rest of the session.
+        pollInFlight.current = false;
       }
       if (!cancelled) {
         // React Query is refetching the project row on its own interval;
@@ -483,7 +506,7 @@ function ProjectDetail() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [project?.status, projectId, queryClient, runPoll, project, navigate]);
+  }, [projectStatus, projectId, queryClient, runPoll, navigate]);
 
   const fetchMatchingProgress = useServerFn(getMatchingProgress);
   const { data: matchingCounts } = useQuery({
