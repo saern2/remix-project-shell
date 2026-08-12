@@ -89,28 +89,96 @@ function dedupeById(videos: StockVideo[]): StockVideo[] {
 }
 
 /**
+ * Buckets read per statement.
+ *
+ * MEASURED 2026-08-12 against production rows: a full 40-bucket corpus is
+ * ~490 kB stored but ~3.9 MB on the wire, because jsonb is stored TOAST-
+ * compressed and PostgREST serialises it back out as JSON text — an ~8x
+ * expansion. Nearly all of that is CPU rather than I/O: an index scan over the
+ * same rows measures 1.8 ms, detoasting and serialising them ~105 ms on an idle
+ * box. (EXPLAIN ANALYZE hides this — it never materialises the output.)
+ *
+ * PostgREST reaches Postgres as `authenticator`, whose statement_timeout is 8s.
+ * service_role has none set, and role settings apply at LOGIN only, so
+ * PostgREST's SET ROLE never picks up a service_role setting. One statement
+ * carrying the whole corpus therefore has to fit its entire serialisation
+ * inside those 8s — and under CPU contention it did not, which is the observed
+ * "canceling statement due to statement timeout" on corpus load.
+ *
+ * Ten buckets is ~1 MB per statement. This does not make the work smaller; it
+ * stops any single statement approaching the ceiling, giving the same total
+ * work roughly four times the headroom it had.
+ */
+const CORPUS_READ_BUCKETS_PER_STATEMENT = 10;
+
+/**
+ * Backstop on the paging loop. bucket_id is unique within a project — it is
+ * half the primary key — so `gt(bucket_id, last)` strictly advances and the
+ * loop terminates on its own. This bounds it anyway, and throws rather than
+ * returning what it has: a short corpus would let assignment run against a
+ * partial pool, which is the exact failure round 8 exists to prevent.
+ */
+const CORPUS_READ_MAX_STATEMENTS = 200;
+
+/**
  * Reads the whole corpus for a project.
  *
  * Deliberately unfiltered: assignment must see every bucket, because that is the
  * property whose absence caused late scenes to fail. The cost is bounded by
  * distillation and the per-bucket cap rather than by narrowing the query.
+ *
+ * The read is SPLIT across statements — see CORPUS_READ_BUCKETS_PER_STATEMENT —
+ * but the result is not. Callers still get every bucket, and the signature is
+ * unchanged.
  */
 export async function loadProjectCorpus(projectId: string): Promise<CorpusBucket[]> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data, error } = await supabaseAdmin
-    .from("project_stock_corpus")
-    .select("bucket_id, query, tokens, demand_ids, candidates, providers_done")
-    .eq("project_id", projectId);
-  if (error) throw new Error(`Corpus load failed: ${error.message}`);
+  const buckets: CorpusBucket[] = [];
+  let after: string | null = null;
 
-  return (data ?? []).map((row) => ({
-    id: row.bucket_id,
-    query: row.query,
-    tokens: Array.isArray(row.tokens) ? (row.tokens as string[]) : stockQueryTokens(row.query),
-    demandIds: Array.isArray(row.demand_ids) ? (row.demand_ids as string[]) : [],
-    candidates: Array.isArray(row.candidates) ? (row.candidates as unknown as StockVideo[]) : [],
-    providersDone: Array.isArray(row.providers_done) ? (row.providers_done as string[]) : [],
-  }));
+  for (let statement = 0; statement < CORPUS_READ_MAX_STATEMENTS; statement += 1) {
+    let filter = supabaseAdmin
+      .from("project_stock_corpus")
+      .select("bucket_id, query, tokens, demand_ids, candidates, providers_done")
+      .eq("project_id", projectId);
+    // Keyset, not offset: each statement re-enters the (project_id, bucket_id)
+    // primary key exactly where the last one stopped, so paging costs no more in
+    // total than the single read did, and a row updated mid-read cannot shift a
+    // bucket across a page boundary and be skipped or repeated.
+    if (after !== null) filter = filter.gt("bucket_id", after);
+
+    const { data, error } = await filter
+      .order("bucket_id", { ascending: true })
+      .limit(CORPUS_READ_BUCKETS_PER_STATEMENT);
+    if (error) throw new Error(`Corpus load failed: ${error.message}`);
+
+    const rows = data ?? [];
+    // Stops on an EMPTY page, not a short one. PostgREST can cap a response
+    // below the requested limit (db-max-rows), and reading "fewer than asked
+    // for" as "that was the last of them" would silently truncate the corpus.
+    // The cost of being sure is one extra statement that returns no rows, which
+    // detoasts nothing.
+    if (rows.length === 0) return buckets;
+
+    for (const row of rows) {
+      buckets.push({
+        id: row.bucket_id,
+        query: row.query,
+        tokens: Array.isArray(row.tokens) ? (row.tokens as string[]) : stockQueryTokens(row.query),
+        demandIds: Array.isArray(row.demand_ids) ? (row.demand_ids as string[]) : [],
+        candidates: Array.isArray(row.candidates)
+          ? (row.candidates as unknown as StockVideo[])
+          : [],
+        providersDone: Array.isArray(row.providers_done) ? (row.providers_done as string[]) : [],
+      });
+    }
+    after = rows[rows.length - 1].bucket_id;
+  }
+
+  throw new Error(
+    `Corpus load failed: paging did not finish after ${CORPUS_READ_MAX_STATEMENTS} statements ` +
+      `(${buckets.length} buckets read for project ${projectId})`,
+  );
 }
 
 /**
