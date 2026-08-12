@@ -7,11 +7,12 @@ import {
   HeadContent,
   Scripts,
 } from "@tanstack/react-router";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
 import { supabase } from "@/integrations/supabase/client";
+import { decideAuthInvalidation } from "@/lib/auth-invalidation";
 import { Toaster } from "@/components/ui/sonner";
 import { ThemeProvider, themeBootScript } from "@/components/theme-provider";
 
@@ -151,11 +152,28 @@ function RootComponent() {
   const { queryClient } = Route.useRouteContext();
   const router = useRouter();
 
+  // Identity this tab last reacted to, and whether it has reacted at all. The
+  // rule itself lives in auth-invalidation.ts, where it can be tested without a
+  // router or a browser; these refs are only its memory.
+  const lastUserId = useRef<string | null>(null);
+  const hasHandledAuthEvent = useRef(false);
+
   useEffect(() => {
-    const { data } = supabase.auth.onAuthStateChange((event) => {
-      if (event !== "SIGNED_IN" && event !== "SIGNED_OUT" && event !== "USER_UPDATED") return;
-      router.invalidate();
-      if (event !== "SIGNED_OUT") queryClient.invalidateQueries();
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      const decision = decideAuthInvalidation({
+        event,
+        userId: session?.user?.id ?? null,
+        lastUserId: lastUserId.current,
+        hasHandled: hasHandledAuthEvent.current,
+      });
+      lastUserId.current = decision.nextUserId;
+      hasHandledAuthEvent.current = decision.handled;
+
+      // Costly and therefore gated: this re-runs the _authenticated beforeLoad,
+      // which is two round trips — supabase.auth.getUser() and
+      // getAccessGateStatus().
+      if (decision.invalidateRouter) router.invalidate();
+      if (decision.invalidateQueries) queryClient.invalidateQueries();
     });
     return () => data.subscription.unsubscribe();
   }, [router, queryClient]);
