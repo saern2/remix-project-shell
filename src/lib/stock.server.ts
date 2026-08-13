@@ -325,6 +325,44 @@ async function loadActivePoolKeysCached(
   return value;
 }
 
+/** Requests left before a key is treated as spent for the current window. */
+const PEXELS_MIN_REMAINING = 5;
+
+/**
+ * Whether a key can serve a request right now.
+ *
+ * MEASURED 2026-08-13: the previous predicate began `if (reset_at > now)
+ * return false`, reading a future reset date as "this key is exhausted". It
+ * means the opposite — Pexels reports the END OF THE CURRENT QUOTA WINDOW, so
+ * for a monthly quota it is always about a month ahead. Every key that had ever
+ * served a successful request carried a future reset_at, because markKeyUsed
+ * writes the response headers back, so every working key disqualified itself
+ * the first time it worked. Against production rows: 34 active keys, minimum
+ * 14,933 requests remaining, and the pool loaded ZERO of them. Adding keys
+ * could not fix it; a new key worked until its first success and then vanished
+ * until its window rolled over a month later.
+ *
+ * Symptom: `pexelsProvider.search` returned [] with no HTTP attempted, which is
+ * indistinguishable from "Pexels had no results" — and in capture 47 Pexels
+ * contributed nothing to a 356-scene project while 56% of scenes fell to the
+ * alternate-window degradation tier on a quarter-full candidate pool.
+ *
+ * The window bound applies ONLY to a key that is actually spent.
+ */
+function usablePexelsKey(key: PoolKey, now: number): boolean {
+  // Unknown quota, or plenty left: usable regardless of where the window ends.
+  if (key.rate_limit_remaining == null || key.rate_limit_remaining >= PEXELS_MIN_REMAINING) {
+    return true;
+  }
+  const resetAt = key.rate_limit_reset_at ? new Date(key.rate_limit_reset_at).getTime() : Number.NaN;
+  // Spent, and the window has not rolled over yet.
+  if (Number.isFinite(resetAt) && resetAt > now) return false;
+  // Spent with no usable reset date: try it. One request either succeeds or
+  // returns 429, and markKeyRateLimited then writes a real reset. Excluding it
+  // forever is the same mistake this function exists to undo.
+  return true;
+}
+
 async function loadActivePoolKeys(): Promise<{ configured: boolean; keys: PoolKey[] }> {
   try {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -338,15 +376,7 @@ async function loadActivePoolKeys(): Promise<{ configured: boolean; keys: PoolKe
     }
     const allKeys = (data ?? []) as PoolKey[];
     const now = Date.now();
-    const keys = allKeys.filter((key) => {
-      const resetAt = key.rate_limit_reset_at
-        ? new Date(key.rate_limit_reset_at).getTime()
-        : Number.NaN;
-      const stillLimited = Number.isFinite(resetAt) && resetAt > now;
-      if (stillLimited) return false;
-      if (key.rate_limit_remaining == null || key.rate_limit_remaining >= 5) return true;
-      return Number.isFinite(resetAt) && resetAt <= now;
-    });
+    const keys = allKeys.filter((key) => usablePexelsKey(key, now));
     keys.sort((a, b) => a.id.localeCompare(b.id));
     return { configured: allKeys.length > 0, keys };
   } catch (error) {
@@ -489,7 +519,17 @@ async function pexelsFetch(
 ): Promise<Response | null> {
   const pool = session?.pexelsPool ?? (await loadPexelsStagePool());
   if (pool.keys.length === 0) {
-    console.warn("[pexels-pool] no usable key is available");
+    // AUDIBLE, because this was silent for eleven days. Returning null here
+    // makes search() return [], which is indistinguishable from "no results" —
+    // and PexelsPoolDegradedError cannot help: it counts keys rejected DURING
+    // requests, so the one case it was built for, total unavailability, is the
+    // one case it never sees. These two counters reach the pollPipeline payload.
+    session?.profile?.count(pool.configured ? "pexelsPoolEmpty" : "pexelsPoolUnconfigured");
+    console.warn("[pexels-pool] no usable key is available", {
+      configured: pool.configured,
+      keysLoaded: pool.keys.length,
+      keysSeenAtLoad: pool.initialCount,
+    });
     return null;
   }
   const response = await requestWithPexelsPool(pool, buildPexelsUrl(query, orientation, page), {
