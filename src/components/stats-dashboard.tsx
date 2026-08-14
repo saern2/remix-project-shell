@@ -214,9 +214,18 @@ export function StatsDashboard() {
     return { value: stats.today[key] - stats.previous_day[key] };
   };
 
-  const lifetimeLabel = stats?.range_start
-    ? `Lifetime · recorded since ${formatDate(stats.range_start)}`
-    : "Lifetime";
+  // A lifetime total that silently mixes 391 reconstructed generations with 216
+  // measured ones is exactly the kind of unlabelled number this project has
+  // been bitten by. The label is built from the data, so it cannot drift from
+  // what the RPC actually added.
+  const baseline = stats?.baseline ?? null;
+  const lifetimeLabel = baseline
+    ? `Lifetime · includes ${baseline.generations_completed} generations from ` +
+      `${formatDate(baseline.effective_from)}${stats?.range_start ? `–${formatDate(stats.range_start)}` : ""} ` +
+      `reconstructed from operator records; per-video figures are estimates.`
+    : stats?.range_start
+      ? `Lifetime · recorded since ${formatDate(stats.range_start)}`
+      : "Lifetime";
 
   if (statsQuery.isError) {
     return (
@@ -318,6 +327,17 @@ export function StatsDashboard() {
           sub="Rendering or matching now"
         />
       </div>
+
+      {/* The provenance in full, from the database rather than from this file,
+          so whoever edits the baseline edits its explanation with it. Shown
+          only where the baseline is actually in the numbers above: the Lifetime
+          window of the platform scope. */}
+      {baseline && timeWindow === "lifetime" && !loading ? (
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          <span className="font-medium">Lifetime totals include a reconstructed baseline.</span>{" "}
+          {baseline.note}
+        </p>
+      ) : null}
 
       {/* ── 30-day chart ────────────────────────────────────────────────── */}
       <Card>

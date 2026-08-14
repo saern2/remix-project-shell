@@ -37,9 +37,30 @@ export type GenerationStats = {
   timezone: string;
   today: { completed: number; total: number; seconds: number };
   previous_day: { completed: number; total: number; seconds: number };
+  /**
+   * Platform scope INCLUDES `baseline` here, and only here. User scope, the
+   * Today window, the daily series, the outcomes and the ranking are measured
+   * events only.
+   */
   lifetime: { completed: number; total: number; seconds: number };
   /** Start of RECORDED history — null when there is nothing yet. */
   range_start: string | null;
+  /**
+   * Generations that predate generation_events, added to platform lifetime as
+   * one labelled number rather than fabricated rows. Null for user scope, and
+   * null when no baseline is configured.
+   *
+   * `video_minutes` is an ESTIMATE, and `generations_total` is a floor —
+   * failures in the pre-capture window were deleted, so the true attempt count
+   * is unknown. `note` carries both caveats and is rendered verbatim.
+   */
+  baseline: {
+    generations_completed: number;
+    generations_total: number;
+    video_minutes: number;
+    effective_from: string;
+    note: string;
+  } | null;
   daily: Array<{ day: string; count: number }>;
   outcomes: Array<{ event_type: string; count: number }>;
   ranked: Array<{ label: string; count: number }>;

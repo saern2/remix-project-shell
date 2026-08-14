@@ -1361,28 +1361,98 @@ create trigger trg_projects_generation_event
   )
   execute function public.record_generation_event();
 
--- ── 20260813000001: /stats aggregation ─────────────────────────────────────
+-- ── 20260813000001 + 20260814000001: /stats aggregation and its baseline ──
 
--- ── get_generation_stats: every number the /stats page needs, in one call ───
+-- ── A labelled baseline for the generations that predate capture ───────────
 --
--- WHY A DATABASE FUNCTION. PostgREST cannot express the two things this page
--- depends on. The 30-day chart must render a day with no generations as a
--- zero-height bar rather than a gap, which needs generate_series left-joined
--- against the events — there is no PostgREST syntax for that. And the page
--- needs six aggregations in ONE round trip, not six requests or one bulk fetch
--- reduced in JavaScript.
+-- generation_events began capturing on 2026-08-12. The operator's own records
+-- count 607 completed videos since 2026-08-03; the table holds 216. The 391
+-- missing generations were deleted before capture existed and are UNRECOVERABLE
+-- — no user_id, no audio duration, no scene count.
 --
--- SECURITY. SECURITY DEFINER, so it bypasses RLS and can serve platform scope.
--- That makes the scope argument load-bearing: execute is revoked from anon and
--- authenticated and granted only to service_role, so the only caller is the
--- getGenerationStats server function, which checks isCallerAdmin before it ever
--- passes p_scope => 'platform'. Same shape as check_access_activation and the
--- other service_role-only functions in this schema.
+-- WHY NOT BACKFILL generation_events. Inventing 391 rows would need a user_id, a
+-- duration and a timestamp for each, and every one of those would be a guess.
+-- They would then flow into the per-user ranking, the outcomes donut, the daily
+-- chart and every future average, and nothing downstream could tell the guesses
+-- from the measurements. One labelled number that is added in exactly one place
+-- is honest; 391 fabricated rows are not.
 --
--- TIMEZONE. "Today" and the daily buckets are computed in the caller's
--- timezone, not UTC: a user in UTC-7 looking at the page at 6pm should not see
--- an empty "today" because the server has already rolled over. An unusable or
--- absent zone falls back to UTC rather than failing the page.
+-- SO: this table is a single row, added to the PLATFORM LIFETIME totals only.
+-- The Today toggle, the 30-day chart, the outcomes donut, the ranked panel and
+-- the recent-generations table all describe measured events and stay measured.
+--
+-- VIDEO MINUTES ARE AN ESTIMATE. 391 x 25 minutes is the operator's figure, not
+-- a measurement, and the note column says so where it cannot be separated from
+-- the number.
+
+create table if not exists public.analytics_baseline (
+  -- One row, enforced. This is a constant, not a log.
+  id smallint primary key default 1 check (id = 1),
+  generations_completed integer not null check (generations_completed >= 0),
+  -- Stored rather than assumed equal to completed. The success-rate denominator
+  -- needs it, and burying "all 391 succeeded" inside the RPC would hide the
+  -- weakest assumption on the page. Failures in this window were manually
+  -- deleted to free project slots, so the true total is unknown and this is a
+  -- FLOOR.
+  generations_total integer not null check (generations_total >= generations_completed),
+  -- ESTIMATE, not a measurement. See the note.
+  video_minutes integer not null check (video_minutes >= 0),
+  effective_from date not null,
+  note text not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.analytics_baseline enable row level security;
+
+revoke all on public.analytics_baseline from public, anon;
+grant all on public.analytics_baseline to service_role;
+-- Admins may read it directly; nobody may write it except service_role.
+grant select on public.analytics_baseline to authenticated;
+
+drop policy if exists "analytics_baseline_admin_select" on public.analytics_baseline;
+create policy "analytics_baseline_admin_select"
+  on public.analytics_baseline
+  for select
+  to authenticated
+  -- Inline rather than is_admin(): execute on that function is revoked from
+  -- authenticated, so a policy calling it would fail for the very users it is
+  -- meant to admit. Same shape as the admin policies in 20260726174707.
+  using (exists (select 1 from public.users u where u.id = auth.uid() and u.role = 'admin'));
+
+comment on table public.analytics_baseline is
+  'Single labelled row for generations completed before generation_events existed. Added to PLATFORM LIFETIME totals only, never to per-user, per-day or outcome breakdowns.';
+comment on column public.analytics_baseline.video_minutes is
+  'ESTIMATE (generations x an assumed average length), not measured output.';
+comment on column public.analytics_baseline.generations_total is
+  'Floor, not a measurement: failures in the pre-capture window were manually deleted, so the true attempt count is unknown.';
+
+-- The measured numbers behind this: 216 completed of 228 recorded events as of
+-- 2026-08-14. on conflict do nothing so a re-run cannot clobber an operator
+-- correction.
+insert into public.analytics_baseline (
+  id, generations_completed, generations_total, video_minutes, effective_from, note
+)
+values (
+  1,
+  391,
+  391,
+  9775,
+  date '2026-08-03',
+  'Reconstructed from operator records for 2026-08-03 to 2026-08-12, before generation_events existed. '
+  || 'The underlying projects were deleted and cannot be recovered: no user, duration or scene count survives, '
+  || 'which is why these are one labelled total rather than 391 rows. '
+  || 'Video minutes are an ESTIMATE at 25 minutes per video, not measured audio length. '
+  || 'Failures in this window were manually deleted to free project slots, so the attempt count is a FLOOR '
+  || 'and the true success rate for the period is unknown.'
+)
+on conflict (id) do nothing;
+
+-- ── get_generation_stats: add the baseline, in exactly one place ───────────
+--
+-- Everything below is byte-identical to 20260813000001 except the block marked
+-- BASELINE and the extra key in the returned object. v_lifetime is the only
+-- aggregate touched, and only for platform scope.
 
 create or replace function public.get_generation_stats(
   p_scope text,
@@ -1408,9 +1478,9 @@ declare
   v_recent jsonb;
   v_active integer;
   v_range_start timestamptz;
+  v_baseline public.analytics_baseline%rowtype;
+  v_baseline_json jsonb := null;
 begin
-  -- An invalid IANA name would otherwise raise and take the whole page down
-  -- for a cosmetic setting.
   begin
     perform now() at time zone coalesce(p_tz, 'UTC');
     v_tz := coalesce(p_tz, 'UTC');
@@ -1421,14 +1491,6 @@ begin
 
   v_today := (now() at time zone v_tz)::date;
 
-  -- Cards 1-3, for the two windows the toggle offers, plus the previous day so
-  -- the UI can show a delta for "Today". Lifetime has no previous period and
-  -- deliberately gets none.
-  --
-  -- Minutes and the headline count are COMPLETED only: a failed generation
-  -- produced no video, so counting its audio length as video minutes would
-  -- overstate output. The success-rate denominator is every event, which is
-  -- why it is counted separately here.
   select
     jsonb_build_object(
       'completed', count(*) filter (where event_type = 'completed'),
@@ -1461,18 +1523,40 @@ begin
   from public.generation_events
   where (v_platform or user_id = p_user_id);
 
-  -- The lifetime label is read from the data, never assumed. It is the start of
-  -- RECORDED history, which is later than the product's first generation:
-  -- capture did not exist before Phase 1 and the projects deleted before then
-  -- are not recoverable.
+  -- Deliberately still the first MEASURED event, not the baseline's start date.
+  -- The UI needs both: this is where measurement begins, and the baseline block
+  -- below says what precedes it.
   select min(created_at)
   into v_range_start
   from public.generation_events
   where (v_platform or user_id = p_user_id);
 
-  -- Fixed 30-day window, independent of the Today/Lifetime toggle. The
-  -- generate_series is the whole point: every day in the window appears,
-  -- including the ones with nothing in them.
+  -- ── BASELINE ────────────────────────────────────────────────────────────
+  -- Platform lifetime only. Not today, not the previous day, not the daily
+  -- series, not the outcomes, not the ranking, not the recent list — those
+  -- describe events that were measured, and a number with no event behind it
+  -- must not appear among them.
+  --
+  -- to_regclass so the function still installs and runs where the table has not
+  -- been created yet: /stats degrades to measured-only instead of failing.
+  if v_platform and to_regclass('public.analytics_baseline') is not null then
+    select * into v_baseline from public.analytics_baseline where id = 1;
+    if found then
+      v_lifetime := jsonb_build_object(
+        'completed', (v_lifetime ->> 'completed')::bigint + v_baseline.generations_completed,
+        'total', (v_lifetime ->> 'total')::bigint + v_baseline.generations_total,
+        'seconds', (v_lifetime ->> 'seconds')::numeric + (v_baseline.video_minutes::numeric * 60)
+      );
+      v_baseline_json := jsonb_build_object(
+        'generations_completed', v_baseline.generations_completed,
+        'generations_total', v_baseline.generations_total,
+        'video_minutes', v_baseline.video_minutes,
+        'effective_from', v_baseline.effective_from,
+        'note', v_baseline.note
+      );
+    end if;
+  end if;
+
   select coalesce(
     jsonb_agg(jsonb_build_object('day', d.day, 'count', d.count) order by d.day),
     '[]'::jsonb
@@ -1490,9 +1574,6 @@ begin
     group by series.day
   ) d;
 
-  -- Outcome mix over all recorded history, not the selected window: a donut of
-  -- one day is noise. Zero rows for a type is information (there have been no
-  -- failures), so the UI is expected to render the absence rather than hide it.
   select coalesce(
     jsonb_agg(jsonb_build_object('event_type', o.event_type, 'count', o.count) order by o.event_type),
     '[]'::jsonb
@@ -1506,8 +1587,6 @@ begin
   ) o;
 
   if v_platform then
-    -- Who is generating. Falls back to the user id when a profile row is gone,
-    -- so a deleted account still shows its output rather than disappearing.
     select coalesce(
       jsonb_agg(jsonb_build_object('label', r.label, 'count', r.count) order by r.count desc, r.label),
       '[]'::jsonb
@@ -1525,8 +1604,6 @@ begin
       limit 10
     ) r;
   else
-    -- A single user's own output, banded by project size. Bands are fixed so
-    -- the axis does not move between visits.
     select coalesce(
       jsonb_agg(jsonb_build_object('label', b.label, 'count', b.count) order by b.sort),
       '[]'::jsonb
@@ -1548,9 +1625,6 @@ begin
     ) b;
   end if;
 
-  -- Ten most recent, newest first. render_duration_ms is render job start to
-  -- finish, which includes clip downloading — the UI labels it "render time"
-  -- and must not present it as encode speed.
   select coalesce(jsonb_agg(row_to_json(t)::jsonb order by t.created_at desc), '[]'::jsonb)
   into v_recent
   from (
@@ -1570,8 +1644,6 @@ begin
     limit 10
   ) t;
 
-  -- Card 4 is CURRENT STATE, not history: it comes from projects, not from
-  -- generation_events, and is never filtered by the time toggle.
   select count(*)
   into v_active
   from public.projects
@@ -1585,6 +1657,7 @@ begin
     'previous_day', v_prev_stats,
     'lifetime', v_lifetime,
     'range_start', v_range_start,
+    'baseline', v_baseline_json,
     'daily', v_daily,
     'outcomes', v_outcomes,
     'ranked', v_ranked,
@@ -1598,7 +1671,7 @@ revoke all on function public.get_generation_stats(text, uuid, text) from public
 grant execute on function public.get_generation_stats(text, uuid, text) to service_role;
 
 comment on function public.get_generation_stats(text, uuid, text) is
-  'All /stats panels in one call, aggregated in SQL. SECURITY DEFINER and service_role-only: the scope argument is enforced by getGenerationStats, which requires admin before passing platform scope.';
+  'All /stats panels in one call, aggregated in SQL. SECURITY DEFINER and service_role-only: the scope argument is enforced by getGenerationStats, which requires admin before passing platform scope. Platform LIFETIME totals include analytics_baseline; every other panel is measured events only.';
 
 -- ── Verification: what you asked to confirm ─────────────────────────────────
 -- Run this last. Every row should say 'present'.
@@ -1626,5 +1699,7 @@ from (
     ('render_jobs.stitch_state',         exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='stitch_state')),
     ('generation_events (table)',        to_regclass('public.generation_events') is not null),
     ('generation_events trigger',        exists (select 1 from pg_trigger where tgname='trg_projects_generation_event')),
-    ('get_generation_stats (fn)',        exists (select 1 from pg_proc where proname='get_generation_stats'))
+    ('get_generation_stats (fn)',        exists (select 1 from pg_proc where proname='get_generation_stats')),
+    ('analytics_baseline (table)',       to_regclass('public.analytics_baseline') is not null),
+    ('analytics_baseline seeded',        to_regclass('public.analytics_baseline') is not null and exists (select 1 from public.analytics_baseline where id = 1))
 ) as checks(check_name, present);
