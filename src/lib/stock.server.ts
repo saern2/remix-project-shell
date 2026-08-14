@@ -714,6 +714,50 @@ export async function createStockSearchSession(
   };
 }
 
+/**
+ * Concurrent NASA searches allowed in this PROCESS, across every batch and
+ * every project.
+ *
+ * NASA_CELL_CONCURRENCY caps a single invocation's batch, which is the wrong
+ * scope for a rate limit: two concurrent projects at 2 cells x 3 parallel
+ * search pages put 12 simultaneous requests on images-api.nasa.gov — unkeyed,
+ * with no rate-limit handling anywhere in this codebase.
+ *
+ * MEASURED 2026-08-14, two concurrent batched projects: 69 and 36 NASA cells
+ * failed (86% and 82%), with the rate-limit signature exactly — the first
+ * invocation clean at 182ms/request, failures from the second invocation
+ * onward completing in ~35ms, the shape of fast rejection after a burst. The
+ * serial loop's 357 requests at <=3 concurrent pages never failed, so <=6
+ * pages (two cells) is the empirically safe envelope. The batch sub-cap stays
+ * as the scheduler; this is the enforcer.
+ *
+ * The cost of a queued cell is its batch slot while it waits — acceptable at
+ * NASA cell times of 0.1-0.5s, and recorded as nasaSearchQueueMs so a capture
+ * shows when the cap actually bound.
+ */
+const NASA_SEARCH_CONCURRENCY = 2;
+let nasaSearchesActive = 0;
+const nasaSearchWaiters: Array<() => void> = [];
+
+async function acquireNasaSearchSlot(profile?: MatchingProfile): Promise<void> {
+  if (nasaSearchesActive < NASA_SEARCH_CONCURRENCY) {
+    nasaSearchesActive += 1;
+    return;
+  }
+  const queuedAt = Date.now();
+  // The releaser hands the slot over directly — the count is NOT decremented
+  // and re-incremented across the wake-up, because in that gap a fresh caller
+  // could see a free slot and enter, putting three searches in flight.
+  await new Promise<void>((resolve) => nasaSearchWaiters.push(resolve));
+  profile?.add("nasaSearchQueue", Date.now() - queuedAt);
+}
+
+function releaseNasaSearchSlot(): void {
+  const next = nasaSearchWaiters.shift();
+  if (next) next();
+  else nasaSearchesActive -= 1;
+}
+
 function emptyNasaMetrics(): NasaRequestMetrics {
   return {
     searchRequests: 0,
@@ -748,9 +792,15 @@ async function searchNasaMetered(
   session: StockSearchSession | undefined,
 ): Promise<StockVideo[]> {
   const metrics = emptyNasaMetrics();
+  // Acquired here rather than at a call site so EVERY NASA search in the
+  // process passes through the cap — both the corpus path and the legacy one —
+  // and only searches that actually execute pay for a slot: a cache hit or an
+  // inflight join never reaches this function.
+  await acquireNasaSearchSlot(session?.profile);
   try {
     return await search(metrics);
   } finally {
+    releaseNasaSearchSlot();
     const shared = session?.nasaMetrics;
     if (shared) {
       shared.searchRequests += metrics.searchRequests;
