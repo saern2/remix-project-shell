@@ -87,7 +87,19 @@ describe("the pipeline poll cannot overlap itself", () => {
 
   it("keeps the error backoff that stops fixed-interval retries stacking", () => {
     // Round 6, Issue 6. The guard complements this rather than replacing it.
-    expect(effect).toMatch(/nextPollDelayMs\(hadError \? consecutiveErrors : 0\)/);
+    // The cadence decision moved into nextPipelinePollDelayMs, but the error
+    // streak still reaches it and still wins — see pipeline-poll-cadence.test.ts
+    // for the behaviour; this only pins that the effect still passes it on.
+    expect(effect).toMatch(/consecutiveErrors: hadError \? consecutiveErrors : 0/);
+  });
+
+  it("re-arms from what the last invocation actually returned", () => {
+    // Both inputs to the decision come from this call, not from cached state:
+    // the response itself and how long it took.
+    expect(effect).toMatch(/lastResult = result as PipelinePollResult/);
+    expect(effect).toMatch(/elapsedMs: Date\.now\(\) - startedAt/);
+    // Still a rescheduled timer, never a recursive call.
+    expect(effect).toMatch(/timer = setTimeout\(\s*tick,/);
   });
 });
 

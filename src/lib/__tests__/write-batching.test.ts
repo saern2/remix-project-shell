@@ -152,6 +152,36 @@ describe("empty slices write nothing", () => {
   });
 });
 
+/**
+ * MATCHING_SLICE_SIZE goes 5 -> 25 (round A, Q2). Nothing in the write path
+ * changes; the slice simply carries five times the rows.
+ *
+ * MEASURED 2026-08-14: 356 scenes at slice 5 issued 216 statements and 67.3s of
+ * dbWriteMs — exactly three statements per slice, at ~311ms each, dominated by
+ * round-trip latency rather than payload. At 25 that is 15 slices and 45
+ * statements. The 8s authenticator timeout is nowhere near binding: 25 rows is
+ * ~25-50 kB, against a 3.9 MB read that measured ~30ms server-side.
+ */
+describe("a 25-scene slice is still three statements and still byte-identical", () => {
+  const assignments = Array.from({ length: 25 }, (_, i) => assignment(i));
+  const idMap = new Map(assignments.map((a, i) => [a.sceneId, `cand-${i}`]));
+
+  it("writes exactly what the per-scene reference would have written", () => {
+    const reference = referencePerSceneRows(assignments, (i) => `cand-${i}`);
+    expect(buildCandidateRows(assignments)).toEqual(reference.candidates);
+    expect(buildSelectionRows(assignments, idMap)).toEqual(reference.selections);
+  });
+
+  it("keeps the failed-scene update in a single .in() chunk", () => {
+    // This is what holds the three-statement pattern. Above IN_FILTER_CHUNK_SIZE
+    // the update splits and a slice costs more than three statements — so 100 is
+    // the ceiling on any future slice size, not 25.
+    const sceneIds = assignments.map((a) => a.sceneId);
+    expect(chunked(sceneIds)).toHaveLength(1);
+    expect(25).toBeLessThanOrEqual(IN_FILTER_CHUNK_SIZE);
+  });
+});
+
 describe("the .in() chunker", () => {
   it("keeps a 600-scene id list under the request-line limit", () => {
     const ids = Array.from({ length: 600 }, (_, i) => `${i}`.padStart(36, "0"));

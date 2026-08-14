@@ -6,7 +6,13 @@ import { supabase } from "@/integrations/supabase/client";
 import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
-import { isMissingPollResult, nextPollDelayMs, pollIntervalWhileActive } from "@/lib/polling-state";
+import {
+  isMissingPollResult,
+  nextPipelinePollDelayMs,
+  nextPollDelayMs,
+  pollIntervalWhileActive,
+  type PipelinePollResult,
+} from "@/lib/polling-state";
 import { describeChunkPhase, describeQueuePosition, describeStitchPhase } from "@/lib/render-queue";
 import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
 import { retryModeForProject } from "@/lib/render-retry";
@@ -507,8 +513,11 @@ function ProjectDetail() {
       const claim = startedAt;
       pollInFlight.current = claim;
       let hadError = false;
+      // What the last invocation returned decides when the next one goes out.
+      let lastResult: PipelinePollResult = null;
       try {
         const result = await pollWithAuthRetry(() => runPoll({ data: { projectId } }));
+        lastResult = result as PipelinePollResult;
         if (isMissingPollResult(result)) {
           cancelled = true;
           toast.info(
@@ -537,9 +546,22 @@ function ProjectDetail() {
         // React Query is refetching the project row on its own interval;
         // just invalidate to pick up the new status.
         queryClient.invalidateQueries({ queryKey: ["project", projectId] });
-        // Back off on consecutive errors so a struggling matching invocation is
-        // not piled on by fixed-interval retries (round 6, Issue 6).
-        timer = setTimeout(tick, nextPollDelayMs(hadError ? consecutiveErrors : 0));
+        // An invocation that just spent its whole 12s budget advancing matching
+        // is followed immediately: the work is server-side and a fixed client
+        // cadence is unrelated to it. MEASURED 2026-08-14: the 4s wait after
+        // each one cost 118.0s of a 474.5s run and 209.6s of an 833.5s run.
+        //
+        // Everything else — errors, maintenance, a peer holding the lock, or
+        // any response that came back too fast to have done work — keeps the
+        // 4s beat and its error backoff (round 6, Issue 6).
+        timer = setTimeout(
+          tick,
+          nextPipelinePollDelayMs({
+            result: lastResult,
+            elapsedMs: Date.now() - startedAt,
+            consecutiveErrors: hadError ? consecutiveErrors : 0,
+          }),
+        );
       }
     };
     tick();
