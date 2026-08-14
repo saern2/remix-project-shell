@@ -60,19 +60,25 @@ describe("a batch never holds two cells of one bucket", () => {
 
 describe("a bucket contributes its first pending cell or nothing", () => {
   it("skips a NASA-capped bucket entirely rather than taking its Pexels cell", () => {
-    // 40 buckets, all with NASA pending: the batch is two NASA cells and
-    // NOTHING else. b2's first pending cell is NASA; with NASA capped, taking
+    // 40 buckets, all with NASA pending: the batch is ONE NASA cell and
+    // NOTHING else. b1's first pending cell is NASA; with NASA capped, taking
     // its Pexels cell instead would break per-bucket order.
+    //
+    // The cap is 1 because this per-invocation number is the ONLY NASA
+    // limiter: the process-global semaphore that enforced a cross-project cap
+    // was a cross-request wait, which the Workers hang detector kills — a
+    // ~94s crash loop, 2026-08-14. N concurrent projects now put at most
+    // N x 3 pages on NASA by scheduling arithmetic alone.
     const batch = nextCorpusBatch(pendingCorpusWork(buckets(40), SPACE));
     expect(batch.map((cell) => `${cell.bucket.id}:${cell.provider}#${cell.queryIndex}`)).toEqual([
       "bucket-0:nasa#0",
-      "bucket-1:nasa#0",
     ]);
   });
 
   it("widens once buckets finish their NASA cells", () => {
     // b0 and b1 are past NASA; their first pending cell is Pexels. The batch
-    // fills to four: two Pexels, two NASA — per-bucket order intact everywhere.
+    // grows to three: two Pexels plus the one NASA cell the cap allows —
+    // per-bucket order intact everywhere.
     const done = ["nasa#0", "nasa#1", "nasa#2"];
     const pending = pendingCorpusWork(
       [bucket("bucket-0", done), bucket("bucket-1", done), ...buckets(38).slice(2)],
@@ -83,7 +89,6 @@ describe("a bucket contributes its first pending cell or nothing", () => {
       "bucket-0:pexels",
       "bucket-1:pexels",
       "bucket-2:nasa",
-      "bucket-3:nasa",
     ]);
   });
 

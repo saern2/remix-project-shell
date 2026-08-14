@@ -28,28 +28,16 @@ const { nasa, pixabay } = vi.hoisted(() => ({
     results: [] as unknown[],
     /** Holds the search open, so a second caller is guaranteed to join it. */
     delayMs: 0,
-    /** Live concurrency of the mock search, and the highest it ever reached. */
-    active: 0,
-    maxActive: 0,
-    /** Queries whose search should throw after the delay. */
-    failQueries: [] as string[],
   },
   pixabay: { pages: [] as number[], results: [] as unknown[] },
 }));
 
 vi.mock("@/lib/nasaStock.server", () => ({
   searchNasaFootage: async (
-    query: string,
+    _query: string,
     opts: { metrics?: Record<string, number> },
   ): Promise<unknown[]> => {
-    nasa.active += 1;
-    nasa.maxActive = Math.max(nasa.maxActive, nasa.active);
-    try {
-      if (nasa.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, nasa.delayMs));
-      if (nasa.failQueries.includes(query)) throw new Error(`NASA 429 for ${query}`);
-    } finally {
-      nasa.active -= 1;
-    }
+    if (nasa.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, nasa.delayMs));
     const m = opts.metrics;
     if (m) {
       m.searchRequests += nasa.calls.search;
@@ -120,9 +108,6 @@ beforeEach(() => {
   };
   nasa.results = [];
   nasa.delayMs = 0;
-  nasa.active = 0;
-  nasa.maxActive = 0;
-  nasa.failQueries = [];
   pixabay.pages = [];
   pixabay.results = [];
 });
@@ -258,68 +243,6 @@ describe("Pexels stops asking for a second page that cannot exist", () => {
 
     expect(pixabay.pages).toEqual([1, 2]);
     expect(profile.summary().pexelsSecondPageSkipped).toBeUndefined();
-  });
-});
-
-/**
- * NASA searches are capped process-wide, not per invocation.
- *
- * MEASURED 2026-08-14, two concurrent batched projects: the per-batch cap of 2
- * still allowed 2 projects x 2 cells x 3 pages = 12 simultaneous requests on
- * an unkeyed API, and 86% / 82% of NASA cells failed with the rate-limit
- * signature — first invocation clean at 182ms/request, fast ~35ms rejections
- * from the second invocation on. The semaphore in stock.server.ts is the
- * enforcer; the batch sub-cap remains only a scheduler.
- *
- * All starts are STAGGERED, never Promise.all from cold: concurrent dynamic
- * imports of a vi.mock'd module race inside vitest's mocker and one caller
- * can receive the real module (see the overlap test above).
- */
-describe("NASA searches are capped process-wide", () => {
-  const stagger = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  const searchAs = async (query: string) => {
-    const { searchProviderCandidatePool } = await import("../stock.server");
-    // Each search gets its OWN session — the cross-project shape the
-    // per-invocation cap could not cover.
-    return searchProviderCandidatePool({
-      provider: "nasa",
-      query,
-      orientation: "landscape",
-      targetWidth: 1920,
-      session: (await makeSession(createMatchingProfile())) as never,
-    });
-  };
-
-  it("never runs more than two searches at once, even across sessions", async () => {
-    nasa.delayMs = 60;
-    const runs: Array<Promise<unknown>> = [];
-    for (const query of ["cap query one", "cap query two", "cap query three", "cap query four"]) {
-      runs.push(searchAs(query));
-      await stagger(10);
-    }
-    await Promise.all(runs);
-    // Four searches wanted to run; the third and fourth had to wait.
-    expect(nasa.maxActive).toBe(2);
-  });
-
-  it("releases the slot when a search throws, so a failure cannot shrink the cap", async () => {
-    // Two failing searches occupy and release both slots; if either leaked,
-    // the pool would be down to 1 and the pair after them could not overlap.
-    nasa.delayMs = 30;
-    nasa.failQueries = ["leak probe one", "leak probe two"];
-    const failures = [searchAs("leak probe one")];
-    await stagger(10);
-    failures.push(searchAs("leak probe two"));
-    const settled = await Promise.allSettled(failures);
-    expect(settled.every((result) => result.status === "rejected")).toBe(true);
-
-    nasa.maxActive = 0;
-    const pair = [searchAs("after failure one")];
-    await stagger(10);
-    pair.push(searchAs("after failure two"));
-    await Promise.all(pair);
-    expect(nasa.maxActive).toBe(2);
   });
 });
 

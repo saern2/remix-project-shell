@@ -371,17 +371,26 @@ export function pendingCorpusWork(
 export const BUCKET_CONCURRENCY = 4;
 
 /**
- * Of a batch, at most this many NASA cells.
+ * Of a batch, at most this many NASA cells — and this per-invocation cap is
+ * the ONLY NASA limiter, deliberately.
  *
  * NASA is the one provider with no API key, no rate-limit handling anywhere in
  * this codebase, and a fan-out of its own: each cell issues three search pages
- * in parallel plus an asset-resolve pool of two. Four concurrent NASA cells
- * would put up to twelve simultaneous requests on images-api.nasa.gov; two
- * keeps it at six. If NASA starts refusing, buildCorpusCell swallows the error
- * and marks the cell done, so the failure mode is a silently thinner corpus —
- * which is why the cap is conservative and corpusCellSearchFailedNasa exists.
+ * in parallel. MEASURED 2026-08-14, two concurrent projects at the old cap of
+ * 2: twelve simultaneous pages, and 86% / 82% of NASA cells failed with the
+ * rate-limit signature. The process-global semaphore built to enforce a
+ * cross-project cap was itself the cause of a worse failure — a cross-request
+ * wait is invisible to the Workers hang detector and produced a ~94s crash
+ * loop (see searchNasaMetered in stock.server.ts for the full account).
+ *
+ * So the bound is achieved by scheduling arithmetic instead of shared state:
+ * at 1 cell per invocation, N concurrent projects put at most N x 3 pages on
+ * the API. Two projects = 6 pages, the envelope 357 serial requests proved
+ * safe. The cost is width-1 batches while a space bucket's next cell is NASA
+ * — roughly +30-45s on a solo space build — and corpusCellSearchFailedNasa
+ * remains the tripwire that says if even this is too much.
  */
-export const NASA_CELL_CONCURRENCY = 2;
+export const NASA_CELL_CONCURRENCY = 1;
 
 /**
  * The next batch of cells to build concurrently: the FIRST pending cell of up
