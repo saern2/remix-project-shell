@@ -361,6 +361,65 @@ export function pendingCorpusWork(
 }
 
 /**
+ * Buckets built concurrently within one batch.
+ *
+ * Across buckets ONLY, never within one: two cells of the same bucket race on
+ * the read-merge-write of its candidates row and on providers_done, and the
+ * loser's write silently discards the winner's candidates. Bucket rows are
+ * independent, so cross-bucket concurrency has no shared state at all.
+ */
+export const BUCKET_CONCURRENCY = 4;
+
+/**
+ * Of a batch, at most this many NASA cells.
+ *
+ * NASA is the one provider with no API key, no rate-limit handling anywhere in
+ * this codebase, and a fan-out of its own: each cell issues three search pages
+ * in parallel plus an asset-resolve pool of two. Four concurrent NASA cells
+ * would put up to twelve simultaneous requests on images-api.nasa.gov; two
+ * keeps it at six. If NASA starts refusing, buildCorpusCell swallows the error
+ * and marks the cell done, so the failure mode is a silently thinner corpus —
+ * which is why the cap is conservative and corpusCellSearchFailedNasa exists.
+ */
+export const NASA_CELL_CONCURRENCY = 2;
+
+/**
+ * The next batch of cells to build concurrently: the FIRST pending cell of up
+ * to BUCKET_CONCURRENCY distinct buckets, at most NASA_CELL_CONCURRENCY of
+ * them NASA.
+ *
+ * Strictly the first pending cell, never a later one. A bucket whose first
+ * cell is NASA-capped contributes NOTHING this batch, rather than its Pexels
+ * cell instead — because within a bucket the serial order is a priority order.
+ * NASA runs before Pexels on a space project so NASA's finds enter the pool
+ * before the 120 cap fills, and taking Pexels early would let it fill the cap
+ * and have B1 skip the NASA search entirely. Holding per-bucket order means
+ * every bucket executes its cells in exactly the serial sequence, so the
+ * stored corpus is identical to the serial build's, bucket by bucket — the
+ * strongest form of the "stored per bucket must not drop" guardrail. The cost
+ * is narrower batches while every bucket's next cell is NASA.
+ *
+ * `pending` is bucket-major (pendingCorpusWork), so the first cell seen for a
+ * bucket IS its first pending cell.
+ */
+export function nextCorpusBatch(pending: CorpusCell[]): CorpusCell[] {
+  const batch: CorpusCell[] = [];
+  const visited = new Set<string>();
+  let nasaCells = 0;
+  for (const cell of pending) {
+    if (batch.length >= BUCKET_CONCURRENCY) break;
+    // Once per bucket, and only its FIRST pending cell — a bucket skipped for
+    // the NASA cap stays skipped for the whole batch.
+    if (visited.has(cell.bucket.id)) continue;
+    visited.add(cell.bucket.id);
+    if (cell.provider === "nasa" && nasaCells >= NASA_CELL_CONCURRENCY) continue;
+    batch.push(cell);
+    if (cell.provider === "nasa") nasaCells += 1;
+  }
+  return batch;
+}
+
+/**
  * Searches one (bucket, provider) pair and merges the result into the bucket's
  * stored pool.
  *
@@ -456,6 +515,15 @@ export async function buildCorpusCell(opts: {
   } catch (error) {
     // A provider outage must not strand the corpus: mark the cell done so the
     // build can finish and assignment can work with whatever else was found.
+    //
+    // Counted as well as logged, per provider, because this swallow is the
+    // failure mode this project has been burned by most: search() returning []
+    // is indistinguishable from "no results", and the log line lives on a box
+    // the operator does not read. The counter reaches the pollPipeline payload.
+    // Bucket-parallel builds raise the request rate against NASA — an unkeyed
+    // API with no rate-limit handling — so a burst of these under concurrency
+    // is the early warning that NASA_CELL_CONCURRENCY is too high.
+    profile?.count(`corpusCellSearchFailed${capitalize(provider)}`);
     console.warn("[corpus] provider search failed; continuing without it", {
       projectId: opts.projectId,
       bucket: bucket.id,

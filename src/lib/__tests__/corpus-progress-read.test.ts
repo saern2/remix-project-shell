@@ -35,6 +35,8 @@ const { db } = vi.hoisted(() => ({
     selects: [] as string[],
     updates: [] as Array<Record<string, unknown>>,
     found: [] as unknown[],
+    /** When set, the provider search throws instead of returning `found`. */
+    searchError: null as Error | null,
   },
 }));
 
@@ -99,7 +101,10 @@ vi.mock("@/integrations/supabase/client.server", () => {
 
 vi.mock("@/lib/stock.server", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  searchProviderCandidatePool: async () => db.found,
+  searchProviderCandidatePool: async () => {
+    if (db.searchError) throw db.searchError;
+    return db.found;
+  },
 }));
 
 const PROJECT = "11111111-1111-4111-8111-111111111111";
@@ -129,6 +134,7 @@ beforeEach(() => {
   db.selects = [];
   db.updates = [];
   db.found = [];
+  db.searchError = null;
 });
 
 describe("loadCorpusProgress reads what the build needs and no more", () => {
@@ -334,8 +340,7 @@ describe("a cell whose bucket is at the cap skips the search entirely", () => {
     });
   };
 
-  const full = () =>
-    Array.from({ length: 120 }, (_, index) => candidate(`stored-${index}`));
+  const full = () => Array.from({ length: 120 }, (_, index) => candidate(`stored-${index}`));
 
   it("issues no provider request for a bucket already at the cap", async () => {
     db.rows[0].candidates = full();
@@ -375,6 +380,27 @@ describe("a cell whose bucket is at the cap skips the search entirely", () => {
     // Still marked done, so the cell is never revisited.
     expect(updated.providersDone).toContain("pexels");
     expect(db.rows[0].providers_done).toContain("pexels");
+  });
+
+  it("counts a swallowed search failure instead of hiding it", async () => {
+    // buildCorpusCell deliberately survives a provider outage: it marks the
+    // cell done and moves on, so search() throwing is indistinguishable from
+    // "no results" everywhere downstream. That silence is the failure mode
+    // this project has been burned by most — the Pexels pool ran empty for
+    // eleven days behind it — and B3's concurrency raises the request rate
+    // against NASA, an unkeyed API with no rate-limit handling. The counter
+    // reaches the pollPipeline payload; a burst of it under concurrency is
+    // the early warning that NASA_CELL_CONCURRENCY is too high.
+    db.rows[0].query = "aerial coastline sunrise drone footage";
+    db.searchError = new Error("NASA 503");
+    const profile = await profileFor();
+    const updated = await cellWith(profile, "nasa", 0);
+
+    expect(profile.summary().corpusCellSearchFailedNasa).toBe(1);
+    // Still marked done and the stored pool untouched — the swallow itself is
+    // unchanged, only its visibility.
+    expect(updated.providersDone).toContain("nasa#0");
+    expect(db.rows[0].candidates).toHaveLength(3);
   });
 
   it("still searches a bucket one candidate short of the cap", async () => {

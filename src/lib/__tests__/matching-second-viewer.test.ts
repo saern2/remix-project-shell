@@ -163,7 +163,9 @@ describe("the wiring that needs a database is pinned at the source", () => {
   it("a lock-not-held poll reads real progress before returning", () => {
     // A peer doing the work is not a reason to know nothing about it.
     expect(lockNotHeld).toMatch(/readProjectMatchingCounts\(supabaseAdmin, \{ id: projectId \}\)/);
-    expect(lockNotHeld).toMatch(/progress \}/);
+    // Format-insensitive: prettier may keep `lockHeld: 0, progress }` on one
+    // line or wrap each property onto its own.
+    expect(lockNotHeld).toMatch(/lockHeld: 0,\s+progress,?\s*\}/);
   });
 
   it("a failed progress read degrades to null, never breaks the guard", () => {

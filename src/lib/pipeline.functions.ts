@@ -996,7 +996,11 @@ async function advanceFromMatchingFootage(projectId: string) {
     return {
       status: "matching_footage",
       error_message: null,
-      matching: { ...matchingTelemetry({ scenesProcessed: 0, remaining: -1 }), lockHeld: 0, progress },
+      matching: {
+        ...matchingTelemetry({ scenesProcessed: 0, remaining: -1 }),
+        lockHeld: 0,
+        progress,
+      },
     };
   }
 
@@ -1212,6 +1216,7 @@ async function advanceFromMatchingFootage(projectId: string) {
       loadCorpusProgress,
       pendingCorpusWork,
       buildCorpusCell,
+      nextCorpusBatch,
     } = await import("@/lib/stock-corpus-store.server");
 
     const corpusProviders: Array<"pexels" | "pixabay" | "nasa"> =
@@ -1301,25 +1306,61 @@ async function advanceFromMatchingFootage(projectId: string) {
       }
 
       stockSession = stockSession ?? (await createStockSearchSession(profile));
+      // A const the batch closures can capture: `stockSession` is mutable, so
+      // TypeScript widens it back to nullable inside a callback even though the
+      // line above guarantees it.
+      const corpusSession = stockSession;
       const byId = new Map(progress.map((bucket) => [bucket.id, bucket]));
 
+      // Cells run in BATCHES across distinct buckets — nextCorpusBatch takes
+      // the first pending cell of up to BUCKET_CONCURRENCY buckets, at most
+      // NASA_CELL_CONCURRENCY of them NASA, and never two cells of one bucket
+      // (same-bucket cells race on the candidates row). Per bucket the cells
+      // still execute in the exact serial order, so the stored corpus is
+      // identical to the serial build's, bucket by bucket.
+      //
+      // The budget projection stays valid with matching-budget.ts untouched:
+      // recordSlice is given the BATCH's wall time, so `elapsed +
+      // averageSliceMs` now projects one more batch — the unit became a batch,
+      // and the projection never learned what a unit was.
+      //
+      // MEASURED (capture pre-B3, 356 scenes): 200 cells over 19 invocations
+      // at ~1 cell/s serial, provider search 82s NASA + 27s Pexels of a 288s
+      // matching run. The batch overlaps those provider waits.
       while (pending.length > 0 && budget.shouldStartAnotherSlice()) {
-        const cellStartedAt = Date.now();
-        const { bucket, provider, queryIndex } = pending[0];
-        const updated = await buildCorpusCell({
-          projectId,
-          bucket: byId.get(bucket.id) ?? bucket,
-          provider,
-          queryIndex,
-          orientation,
-          targetWidth,
-          niche: projectNiche,
-          session: stockSession ?? undefined,
-        });
-        byId.set(updated.id, updated);
-        cellsBuilt += 1;
-        profile.count("corpusCellsBuilt");
-        budget.recordSlice(Date.now() - cellStartedAt);
+        const batchStartedAt = Date.now();
+        const batch = nextCorpusBatch(pending);
+        const settled = await Promise.allSettled(
+          batch.map((cell) =>
+            buildCorpusCell({
+              projectId,
+              bucket: byId.get(cell.bucket.id) ?? cell.bucket,
+              provider: cell.provider,
+              queryIndex: cell.queryIndex,
+              orientation,
+              targetWidth,
+              niche: projectNiche,
+              session: corpusSession,
+            }),
+          ),
+        );
+        // allSettled, then keep every success BEFORE surfacing any failure: a
+        // sibling's DB-write error must not discard cells whose rows are
+        // already written, or the next invocation re-reads work already done.
+        let firstFailure: unknown = null;
+        for (const result of settled) {
+          if (result.status === "fulfilled") {
+            byId.set(result.value.id, result.value);
+            cellsBuilt += 1;
+            profile.count("corpusCellsBuilt");
+          } else if (firstFailure == null) {
+            firstFailure = result.reason;
+          }
+        }
+        budget.recordSlice(Date.now() - batchStartedAt);
+        // Rethrown, exactly as the serial loop let it propagate — a corpus
+        // write failure fails the invocation, not silently the cell.
+        if (firstFailure != null) throw firstFailure;
         pending = pendingCorpusWork([...byId.values()], corpusProviders);
       }
 
