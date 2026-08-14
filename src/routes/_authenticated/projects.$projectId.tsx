@@ -7,6 +7,11 @@ import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.funct
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import {
+  EMPTY_SCENE_CARD_HINT,
+  EMPTY_SCENE_CARD_NOTICE,
+  describeFootageCoverage,
+} from "@/lib/footage-coverage";
+import {
   isMissingPollResult,
   nextPipelinePollDelayMs,
   nextPollDelayMs,
@@ -274,6 +279,21 @@ function ProjectDetail() {
       new Set(sortedClipSlices.map((s) => `${s.scene_id}:${s.slice_index}`)).size >=
         expectedFixedSliceCount);
 
+  // Matching completes a project even when a few scenes found no footage — under
+  // the 10% failure threshold that is deliberate. What was NOT deliberate is that
+  // nothing said so: the timeline showed bare "No clip" cards and the panel below
+  // still read "Everything looks good". The holes are now counted here and stated
+  // wherever the user could otherwise act on a timeline that is not whole.
+  const footageCoverage = useMemo(
+    () =>
+      describeFootageCoverage({
+        sceneIds: scenesQuery.data?.map((scene) => scene.id) ?? null,
+        sceneIdsWithClips: clipsQuery.data ? clipsByScene.keys() : null,
+        fixedDurationSeconds: project?.clip_duration_seconds,
+      }),
+    [scenesQuery.data, clipsQuery.data, clipsByScene, project?.clip_duration_seconds],
+  );
+
   const runSwap = useServerFn(swapSceneClip);
   const [swappingId, setSwappingId] = useState<string | null>(null);
   const handleSwap = async (sceneId: string) => {
@@ -355,6 +375,10 @@ function ProjectDetail() {
   const canSubmitRender =
     project?.status === "ready" &&
     fixedSlicesComplete &&
+    // A timeline with holes cannot become a whole video. submitRenderJob already
+    // refuses one, but it refused AFTER the click and named a single scene; the
+    // button simply should not be offered.
+    footageCoverage.complete &&
     (!renderJob || !RENDER_ACTIVE.has(renderJob.status));
 
   const handleRender = async () => {
@@ -855,20 +879,41 @@ function ProjectDetail() {
                                       className="h-full w-full object-cover"
                                       loading="lazy"
                                     />
-                                  ) : (
+                                  ) : project.status === "matching_footage" ? (
                                     <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
-                                      {project.status === "matching_footage"
-                                        ? "Matching…"
-                                        : "No clip"}
+                                      Matching…
+                                    </div>
+                                  ) : (
+                                    // Matching has finished and this scene still has
+                                    // nothing. "No clip" left the user to guess whether
+                                    // that was a bug, a wait, or their own doing.
+                                    <div className="flex h-full w-full flex-col items-center justify-center gap-1 px-2 text-center">
+                                      <span className="text-xs font-medium text-foreground">
+                                        {EMPTY_SCENE_CARD_NOTICE}
+                                      </span>
+                                      <span className="text-[10px] leading-tight text-muted-foreground">
+                                        {EMPTY_SCENE_CARD_HINT}
+                                      </span>
                                     </div>
                                   )}
-                                  {clip && isReady ? (
+                                  {isReady ? (
+                                    // Also offered on an EMPTY card, which is where it
+                                    // matters most: swapSceneClip needs only the scene's
+                                    // visual query and runs a fresh provider search, so
+                                    // it is exactly the way out of a scene the stored
+                                    // corpus had nothing for. Kept visible without hover
+                                    // there, since a card with no image gives no hint
+                                    // that anything is hidden on it.
                                     <Button
                                       size="sm"
                                       variant="secondary"
                                       disabled={isSwapping}
                                       onClick={() => handleSwap(s.id)}
-                                      className="absolute right-1 top-1 h-7 px-2 opacity-0 shadow transition-opacity group-hover:opacity-100"
+                                      className={
+                                        clip
+                                          ? "absolute right-1 top-1 h-7 px-2 opacity-0 shadow transition-opacity group-hover:opacity-100"
+                                          : "absolute right-1 top-1 h-7 px-2 shadow"
+                                      }
                                     >
                                       <Shuffle className="mr-1 h-3 w-3" />
                                       {isSwapping ? "…" : "Swap"}
@@ -1032,6 +1077,22 @@ function ProjectDetail() {
                     <p className="text-sm text-destructive">
                       {renderJob.error ?? "Render failed."}
                     </p>
+                  ) : null}
+
+                  {/*
+                    Stated before anything else in this panel, because it is the
+                    reason the Render button is absent. Without it the panel simply
+                    showed nothing where the button had been.
+                  */}
+                  {footageCoverage.notice ? (
+                    <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
+                      <p className="text-sm font-medium text-foreground">
+                        {footageCoverage.missingScenes === 1
+                          ? "1 scene has no footage"
+                          : `${footageCoverage.missingScenes} scenes have no footage`}
+                      </p>
+                      <p className="mt-1 text-sm text-muted-foreground">{footageCoverage.notice}</p>
+                    </div>
                   ) : null}
 
                   {!renderJob && canSubmitRender ? (

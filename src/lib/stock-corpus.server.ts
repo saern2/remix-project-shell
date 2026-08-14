@@ -548,6 +548,11 @@ function assignFromProjectCorpus(
     "distant-reuse": 0,
     "last-resort": 0,
   };
+  // Seeded so a run with no exhausted scenes reports a zero rather than an
+  // absent field — the same convention the matching profile uses for its other
+  // counters, and what makes "no holes" readable in a capture.
+  opts.session?.profile?.count("assignmentLadderExhausted", 0);
+  let ladderExhausted = 0;
 
   for (const demand of opts.demands) {
     const candidates = candidateVideosForDemand(demand, demandToBucket, buckets, pools);
@@ -567,7 +572,42 @@ function assignFromProjectCorpus(
       sourceUsage,
       recentSources,
     });
-    if (!selected) continue;
+    if (!selected) {
+      /**
+       * Every tier declined — including last-resort, whose only requirement is
+       * that the clip can be turned into a render row at all. So this is not a
+       * quality problem the ladder failed to trade away: there is genuinely no
+       * renderable footage for this scene.
+       *
+       * It used to end here in silence. No assignment, no onFallback event, no
+       * counter of any kind; persistSlice then marked the scene `failed`, and
+       * because a handful of them stays under unmatchedSceneFailureThreshold the
+       * project completed `ready` with holes nothing ever mentioned — six of them
+       * on a 356-scene project on 2026-08-14, with all three fallback counters
+       * reading zero and the UI offering "Render video" over the gaps.
+       *
+       * Zero fallback counters were read then as "the ladder is fine". They mean
+       * no such thing: a scene that never reaches a tier increments nothing, so
+       * the absence of degradation and the absence of footage look identical.
+       * This counter is what tells them apart, and the warning carries the two
+       * numbers that say WHY — an empty pool (nothing stored for this bucket)
+       * versus a full pool of sources with no usable rendition.
+       */
+      opts.session?.profile?.count("assignmentLadderExhausted");
+      ladderExhausted += 1;
+      console.warn("[stock-corpus] no clip for scene — every tier declined", {
+        projectId: opts.projectId,
+        sceneId: demand.id,
+        sceneIndex: demand.sceneIndex ?? null,
+        query: demand.query,
+        ownBucketId: ownBucket?.id ?? null,
+        ownBucketCandidates: ownBucket ? (pools.get(ownBucket.id)?.length ?? 0) : 0,
+        candidatesConsidered: candidates.length,
+        renderableCandidates: candidates.filter((video) => video.files.length > 0).length,
+        requiredDurationSec: Number(demand.minDurationSec.toFixed(3)),
+      });
+      continue;
+    }
 
     const { result, tier, reason, sceneDistance } = selected;
     opts.usedIds.add(result.reservationKey);
@@ -606,6 +646,7 @@ function assignFromProjectCorpus(
     buckets: buckets.length,
     corpusCandidates: corpus.reduce((sum, b) => sum + b.candidates.length, 0),
     tiers: tierCounts,
+    ladderExhausted,
     providers: countProviders(assignments),
     sourceDuration: summarizeSelectedDurations(assignments),
   });
