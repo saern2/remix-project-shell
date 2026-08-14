@@ -178,6 +178,39 @@ export type Database = {
           },
         ]
       }
+      analytics_baseline: {
+        Row: {
+          created_at: string
+          effective_from: string
+          generations_completed: number
+          generations_total: number
+          id: number
+          note: string
+          updated_at: string
+          video_minutes: number
+        }
+        Insert: {
+          created_at?: string
+          effective_from: string
+          generations_completed: number
+          generations_total: number
+          id?: number
+          note: string
+          updated_at?: string
+          video_minutes: number
+        }
+        Update: {
+          created_at?: string
+          effective_from?: string
+          generations_completed?: number
+          generations_total?: number
+          id?: number
+          note?: string
+          updated_at?: string
+          video_minutes?: number
+        }
+        Relationships: []
+      }
       audio_assets: {
         Row: {
           created_at: string
