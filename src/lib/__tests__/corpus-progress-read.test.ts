@@ -294,15 +294,23 @@ describe("the merge base is read once per bucket, not once per cell", () => {
 });
 
 /**
- * The (b) discriminator: is the build searching for results it then discards?
+ * A cell whose bucket is already full does not search at all.
  *
- * A bucket is capped at CORPUS_CANDIDATES_PER_BUCKET * 3 = 120 candidates, but
- * one Pixabay cell can return up to 160 (two pages of 80) and Pexels the same.
- * Providers run nasa -> pexels -> pixabay on a space project, so NASA fills the
- * pool first and the two later cells can each make two sequential HTTP calls
- * for results the slice can only throw away. Counted rather than assumed.
+ * MEASURED across captures 50, 51 and 52: corpusCellAtCapPixabay was 40 of 40
+ * buckets every time. Providers run pexels -> pixabay (nasa first on a space
+ * project), so Pexels fills the bucket to the 120 cap and every Pixabay cell
+ * then made two sequential HTTP calls for results that could not be stored.
+ *
+ * Provably lossless: `stored` is already deduped and already at the cap, so
+ * dedupeById([...stored, ...found]).slice(0, cap) === stored for ANY `found`.
+ * The merge cannot change the row; only the providers_done marker can. So the
+ * search and the candidates rewrite are both skipped and only the marker is
+ * written.
+ *
+ * The win is INVOCATION COUNT rather than HTTP: a skipped cell costs
+ * milliseconds, so far more cells fit inside the 12s budget.
  */
-describe("cells that cannot use what they fetch are counted", () => {
+describe("a cell whose bucket is at the cap skips the search entirely", () => {
   const profileFor = async () => {
     const { createMatchingProfile } = await import("../matching-profile");
     return createMatchingProfile();
@@ -326,17 +334,61 @@ describe("cells that cannot use what they fetch are counted", () => {
     });
   };
 
-  it("counts a Pexels cell that searched a bucket already at the cap", async () => {
-    db.rows[0].candidates = Array.from({ length: 120 }, (_, index) => candidate(`stored-${index}`));
+  const full = () =>
+    Array.from({ length: 120 }, (_, index) => candidate(`stored-${index}`));
+
+  it("issues no provider request for a bucket already at the cap", async () => {
+    db.rows[0].candidates = full();
+    // Results are waiting to be returned; the point is that nothing asks.
     db.found = [candidate("fresh-1"), candidate("fresh-2")];
     const profile = await profileFor();
     await cellWith(profile, "pexels");
 
     const summary = profile.summary();
     expect(summary.corpusCellAtCapPexels).toBe(1);
-    // Two results fetched, two discarded — the whole cell was wasted work.
-    expect(summary.corpusCandidatesFound).toBe(2);
-    expect(summary.corpusCandidatesDiscarded).toBe(2);
+    // No search happened, so nothing was found and nothing was thrown away.
+    expect(summary.corpusCandidatesFound).toBe(0);
+    expect(summary.corpusCandidatesDiscarded).toBe(0);
+  });
+
+  it("leaves the stored pool byte-identical", async () => {
+    db.rows[0].candidates = full();
+    const before = JSON.stringify(db.rows[0].candidates);
+    db.found = [candidate("fresh-1")];
+    const updated = await cellWith(await profileFor(), "pexels");
+
+    // The guardrail: candidates STORED PER BUCKET must not drop.
+    expect(JSON.stringify(db.rows[0].candidates)).toBe(before);
+    expect(updated.candidates).toHaveLength(120);
+  });
+
+  it("writes only the marker, never the candidates column", async () => {
+    db.rows[0].candidates = full();
+    db.updates.length = 0;
+    const updated = await cellWith(await profileFor(), "pexels");
+
+    expect(db.updates).toHaveLength(1);
+    // Sending 120 candidates back to store what is already there is ~98 kB per
+    // skipped cell — and there are ~40 of them per project.
+    expect(db.updates[0]).not.toHaveProperty("candidates");
+    expect(db.updates[0]).toHaveProperty("providers_done");
+    // Still marked done, so the cell is never revisited.
+    expect(updated.providersDone).toContain("pexels");
+    expect(db.rows[0].providers_done).toContain("pexels");
+  });
+
+  it("still searches a bucket one candidate short of the cap", async () => {
+    // The boundary is >=, so 119 must behave exactly as before.
+    db.rows[0].candidates = Array.from({ length: 119 }, (_, i) => candidate(`stored-${i}`));
+    db.found = [candidate("fresh-1"), candidate("fresh-2")];
+    const profile = await profileFor();
+    const updated = await cellWith(profile, "pexels");
+
+    expect(profile.summary().corpusCellAtCapPexels).toBeUndefined();
+    expect(profile.summary().corpusCandidatesFound).toBe(2);
+    // 121 deduped, capped back to 120 — one genuinely discarded.
+    expect(profile.summary().corpusCandidatesDiscarded).toBe(1);
+    expect(updated.candidates).toHaveLength(120);
   });
 
   it("does not flag a cell whose results the bucket could still hold", async () => {

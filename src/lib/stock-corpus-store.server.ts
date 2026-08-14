@@ -383,10 +383,49 @@ export async function buildCorpusCell(opts: {
   const spaceBias = opts.niche === "space";
 
   const profile = opts.session?.profile;
+  const cap = CORPUS_CANDIDATES_PER_BUCKET * 3;
+
+  // Read the merge base BEFORE searching. Merged against what is STORED, not
+  // against the bucket handed in: the build phase loads progress only, so
+  // `bucket.candidates` is routinely empty while the row holds everything the
+  // earlier cells found, and merging against the argument would write those
+  // away. Unless the caller already has the real pool — loadProjectCorpus marks
+  // its buckets, and so does this function's own return value, which the build
+  // loop stores back, so the row is read once per bucket per invocation rather
+  // than once per cell.
+  const stored =
+    bucket.candidatesLoaded === true
+      ? bucket.candidates
+      : await loadBucketCandidates(opts.projectId, bucket.id);
+
+  // A FULL BUCKET MAKES THIS CELL'S SEARCH PROVABLY POINTLESS.
+  //
+  // `stored` is already deduped and already at the cap, so
+  // dedupeById([...stored, ...found]).slice(0, cap) === stored for any `found`
+  // whatsoever. The merge cannot change the row; only the providers_done marker
+  // can. So the search, its two sequential HTTP calls, and the rewrite of the
+  // candidates column are all skipped, and the cell completes in one small
+  // write.
+  //
+  // MEASURED across captures 50, 51 and 52: corpusCellAtCapPixabay was 40 of 40
+  // buckets every time. Providers run pexels -> pixabay (nasa first on a space
+  // project), so Pexels fills the bucket and every Pixabay cell then searched a
+  // bucket it could not add to. That is half the corpus cells on a general
+  // project doing two round trips for nothing, and the win is in INVOCATION
+  // COUNT: a skipped cell costs milliseconds, so far more cells fit inside the
+  // 12s budget.
+  //
+  // The marker is still written, so the cell is never revisited. If the cap is
+  // ever raised, buckets already marked will not be re-searched — the same
+  // property providers_done has always had.
+  const atCap = stored.length >= cap;
+  if (atCap) profile?.count(`corpusCellAtCap${capitalize(provider)}`);
 
   let found: StockVideo[] = [];
   try {
-    if (provider === "nasa") {
+    if (atCap) {
+      // Nothing to search for.
+    } else if (provider === "nasa") {
       // Exactly one query per cell — see CorpusCell for why this is not a loop.
       const query = expandNasaQueries(bucket.query).slice(0, NASA_QUERIES_PER_BUCKET)[queryIndex];
       // expandNasaQueries dedupes its four variants, so a short bucket query
@@ -425,31 +464,9 @@ export async function buildCorpusCell(opts: {
     });
   }
 
-  // Merged against what is STORED, not against the bucket handed in. The build
-  // phase loads progress only, so `bucket.candidates` is routinely empty while
-  // the row holds everything the earlier cells found — merging against the
-  // argument would write those away.
-  //
-  // Unless the caller already has the real pool: loadProjectCorpus marks its
-  // buckets, and so does this function's own return value, which the build loop
-  // stores back. So the row is read once per bucket per invocation, not once
-  // per cell.
-  const stored =
-    bucket.candidatesLoaded === true
-      ? bucket.candidates
-      : await loadBucketCandidates(opts.projectId, bucket.id);
-  const cap = CORPUS_CANDIDATES_PER_BUCKET * 3;
-  const deduped = dedupeById([...stored, ...found.map(distillCandidate)]);
-  const merged = deduped.slice(0, cap);
+  const deduped = atCap ? stored : dedupeById([...stored, ...found.map(distillCandidate)]);
+  const merged = atCap ? stored : deduped.slice(0, cap);
 
-  // The (b) discriminator, measured, not inferred. `stored` is the pool as it
-  // was BEFORE this cell searched — the search does not touch it — so a cell
-  // that finds the bucket already at the cap made two sequential HTTP calls
-  // (Pexels and Pixabay are page 1 then page 2) for results that the slice
-  // below can only discard. Providers run nasa -> pexels -> pixabay on a space
-  // project, so NASA fills the pool first and the later two are the exposed
-  // ones. Counted per provider because the answer differs by provider.
-  if (stored.length >= cap) profile?.count(`corpusCellAtCap${capitalize(provider)}`);
   profile?.count("corpusCandidatesFound", found.length);
   profile?.count("corpusCandidatesDiscarded", deduped.length - merged.length);
   const providersDone = [
@@ -457,13 +474,19 @@ export async function buildCorpusCell(opts: {
   ];
 
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  // A skipped cell writes only the marker. `merged` is `stored` by identity, so
+  // sending the candidates column back would ship ~98 kB to store what is
+  // already there.
+  const patch = atCap
+    ? { providers_done: providersDone as unknown as never, updated_at: new Date().toISOString() }
+    : {
+        candidates: merged as unknown as never,
+        providers_done: providersDone as unknown as never,
+        updated_at: new Date().toISOString(),
+      };
   const { error } = await supabaseAdmin
     .from("project_stock_corpus")
-    .update({
-      candidates: merged as unknown as never,
-      providers_done: providersDone as unknown as never,
-      updated_at: new Date().toISOString(),
-    })
+    .update(patch)
     .eq("project_id", opts.projectId)
     .eq("bucket_id", bucket.id);
   if (error) throw new Error(`Corpus cell write failed: ${error.message}`);

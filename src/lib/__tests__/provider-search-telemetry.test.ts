@@ -21,7 +21,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createMatchingProfile } from "../matching-profile";
 
-const { nasa } = vi.hoisted(() => ({
+const { nasa, pixabay } = vi.hoisted(() => ({
   nasa: {
     /** HTTP the fake NASA search claims to have made. */
     calls: { search: 0, asset: 0, metadata: 0, metadataJson: 0, caption: 0, hits: 0, misses: 0 },
@@ -29,6 +29,7 @@ const { nasa } = vi.hoisted(() => ({
     /** Holds the search open, so a second caller is guaranteed to join it. */
     delayMs: 0,
   },
+  pixabay: { pages: [] as number[], results: [] as unknown[] },
 }));
 
 vi.mock("@/lib/nasaStock.server", () => ({
@@ -48,6 +49,16 @@ vi.mock("@/lib/nasaStock.server", () => ({
       m.assetCacheMisses += nasa.calls.misses;
     }
     return nasa.results;
+  },
+}));
+
+vi.mock("@/lib/pixabayStock.server", () => ({
+  pixabayProvider: {
+    name: "pixabay",
+    search: async (_q: string, _o: string, page: number) => {
+      pixabay.pages.push(page);
+      return pixabay.results;
+    },
   },
 }));
 
@@ -97,6 +108,8 @@ beforeEach(() => {
   };
   nasa.results = [];
   nasa.delayMs = 0;
+  pixabay.pages = [];
+  pixabay.results = [];
 });
 
 describe("the 4,577 ms is attributed to a provider", () => {
@@ -141,6 +154,95 @@ describe("the 4,577 ms is attributed to a provider", () => {
     expect(profile.summary().pexelsRequests).toBe(1);
     expect(session.pexelsPool.requestCount).toBe(1);
     vi.unstubAllGlobals();
+  });
+});
+
+/**
+ * Page 2 is fetched only when page 1 could have a successor.
+ *
+ * MEASURED 2026-08-13 over 15,058 cached Pexels rows: 5,296 had a non-empty
+ * page 1 and therefore fetched page 2, but only 466 reached a full first page.
+ * 4,830 guaranteed-empty round trips — 91% of the page-2 fetches Pexels makes.
+ *
+ * The provider restriction is load-bearing, not caution. pexelsProvider.search
+ * maps the API's `videos` array one-to-one, so a short page IS the end of the
+ * results. pixabayProvider.search flatMaps and drops any hit whose renditions
+ * are unusable, so a FULL page of 80 hits can return fewer than 80 videos.
+ */
+describe("Pexels stops asking for a second page that cannot exist", () => {
+  const pexelsPage = (count: number, offset = 0) =>
+    new Response(
+      JSON.stringify({
+        videos: Array.from({ length: count }, (_, i) => ({
+          id: 1000 + offset + i,
+          width: 1920,
+          height: 1080,
+          duration: 12,
+          image: "https://example.test/t.jpg",
+          video_files: [{ link: `https://example.test/${i}.mp4`, width: 1920, height: 1080 }],
+        })),
+      }),
+      { status: 200 },
+    );
+
+  const searchPexels = async (pageSizes: number[]) => {
+    const { searchProviderCandidatePool } = await import("../stock.server");
+    const profile = createMatchingProfile();
+    const fetchMock = vi.fn();
+    pageSizes.forEach((size, page) =>
+      fetchMock.mockResolvedValueOnce(pexelsPage(size, page * 1000)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const results = await searchProviderCandidatePool({
+      provider: "pexels",
+      query: "aurora over the earth",
+      orientation: "landscape",
+      targetWidth: 1920,
+      session: (await makeSession(profile)) as never,
+    });
+    vi.unstubAllGlobals();
+    return { calls: fetchMock.mock.calls.length, results, summary: profile.summary() };
+  };
+
+  it("fetches one page when page 1 is short", async () => {
+    const { calls, results, summary } = await searchPexels([9]);
+    expect(calls).toBe(1);
+    expect(results).toHaveLength(9);
+    expect(summary.pexelsSecondPageSkipped).toBe(1);
+  });
+
+  it("still fetches page 2 when page 1 is full", async () => {
+    const { calls, results, summary } = await searchPexels([80, 12]);
+    expect(calls).toBe(2);
+    expect(results).toHaveLength(92);
+    expect(summary.pexelsSecondPageSkipped).toBeUndefined();
+  });
+
+  it("fetches nothing more when page 1 is empty", async () => {
+    const { calls, results } = await searchPexels([0]);
+    expect(calls).toBe(1);
+    expect(results).toEqual([]);
+  });
+
+  it("does NOT apply the rule to Pixabay, whose short page can still have a successor", async () => {
+    // pixabayProvider.search drops hits with no usable rendition, so a FULL page
+    // of 80 hits can return far fewer than 80 videos. Treating that as the end
+    // of the results would silently lose footage — and Pixabay's own numbers say
+    // it matters: 3,327 of its 3,340 page-2 fetches were justified.
+    const { searchProviderCandidatePool } = await import("../stock.server");
+    const profile = createMatchingProfile();
+    pixabay.results = [video("px-1")];
+
+    await searchProviderCandidatePool({
+      provider: "pixabay",
+      query: "aurora over the earth",
+      orientation: "landscape",
+      targetWidth: 1920,
+      session: (await makeSession(profile)) as never,
+    });
+
+    expect(pixabay.pages).toEqual([1, 2]);
+    expect(profile.summary().pexelsSecondPageSkipped).toBeUndefined();
   });
 });
 

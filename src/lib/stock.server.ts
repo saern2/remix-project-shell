@@ -284,14 +284,53 @@ function parsePexelsKeys(): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Results asked of Pexels per page. Exported because the page-2 skip in
+ * searchTwoPages is only sound while it matches what the request asks for.
+ */
+export const PEXELS_PAGE_SIZE = 80;
+
 function buildPexelsUrl(query: string, orientation: Orientation, page: number): string {
   const params = new URLSearchParams({
     query,
     orientation,
-    per_page: "80",
+    per_page: String(PEXELS_PAGE_SIZE),
     page: String(page),
   });
   return `${PEXELS_URL}?${params.toString()}`;
+}
+
+/**
+ * Page 1, and page 2 only when page 1 could have a successor.
+ *
+ * MEASURED 2026-08-13 over 15,058 cached Pexels rows: 5,296 had a non-empty
+ * page 1 and so fetched page 2, but only 466 reached a full first page. That is
+ * 4,830 guaranteed-empty round trips — 91% of the page-2 fetches Pexels makes,
+ * one wasted HTTP call for every three Pexels searches.
+ *
+ * PEXELS ONLY, and this is not conservatism. pexelsProvider.search maps the
+ * API's `videos` array one-to-one, so a page returning fewer than PEXELS_PAGE_SIZE
+ * results IS the end of the result set. pixabayProvider.search flatMaps and
+ * drops any hit whose renditions are unusable (pixabayStock.server.ts:61, :79),
+ * so a FULL page of 80 hits can yield fewer than 80 videos — a short page there
+ * does not mean the results ran out, and skipping page 2 would silently lose
+ * footage. Pixabay's own numbers say the same: 3,327 of its 3,340 page-2
+ * fetches were justified.
+ */
+async function searchTwoPages(
+  provider: StockProvider,
+  query: string,
+  orientation: Orientation,
+  session?: StockSearchSession,
+): Promise<StockVideo[]> {
+  const first = await provider.search(query, orientation, 1, session);
+  if (first.length === 0) return [];
+  if (provider.name === "pexels" && first.length < PEXELS_PAGE_SIZE) {
+    session?.profile?.count("pexelsSecondPageSkipped");
+    return dedupeVideos(first);
+  }
+  const second = await provider.search(query, orientation, 2, session);
+  return dedupeVideos([...first, ...second]);
 }
 
 // Round 6: the key pool was reloaded from the DB on every matching invocation.
@@ -775,12 +814,7 @@ export async function searchProviderCandidatePool(opts: {
     query: normQuery,
     orientation: opts.orientation,
     session: opts.session,
-    search: async () => {
-      const first = await provider.search(normQuery, opts.orientation, 1, opts.session);
-      if (first.length === 0) return [];
-      const second = await provider.search(normQuery, opts.orientation, 2, opts.session);
-      return dedupeVideos([...first, ...second]);
-    },
+    search: () => searchTwoPages(provider, normQuery, opts.orientation, opts.session),
   });
 }
 
@@ -792,12 +826,7 @@ async function searchPexelsWithCacheAndSelect(
     query: opts.normQuery,
     orientation: opts.orientation,
     session: opts.session,
-    search: async () => {
-      const first = await pexelsProvider.search(opts.normQuery, opts.orientation, 1, opts.session);
-      if (first.length === 0) return [];
-      const second = await pexelsProvider.search(opts.normQuery, opts.orientation, 2, opts.session);
-      return dedupeVideos([...first, ...second]);
-    },
+    search: () => searchTwoPages(pexelsProvider, opts.normQuery, opts.orientation, opts.session),
   });
   return selectStockCandidate({ ...opts, results, requireMinDuration: false });
 }
@@ -811,17 +840,7 @@ async function searchPixabayWithCacheAndSelect(
     query: opts.normQuery,
     orientation: opts.orientation,
     session: opts.session,
-    search: async () => {
-      const first = await pixabayProvider.search(opts.normQuery, opts.orientation, 1, opts.session);
-      if (first.length === 0) return [];
-      const second = await pixabayProvider.search(
-        opts.normQuery,
-        opts.orientation,
-        2,
-        opts.session,
-      );
-      return dedupeVideos([...first, ...second]);
-    },
+    search: () => searchTwoPages(pixabayProvider, opts.normQuery, opts.orientation, opts.session),
   });
   return selectStockCandidate({ ...opts, results, requireMinDuration: false });
 }
