@@ -306,6 +306,52 @@ describe("NASA's HTTP is counted per invocation, not left on the session", () =>
     vi.restoreAllMocks();
   });
 
+  it("does not let overlapping searches read each other's requests", async () => {
+    // The bucket-parallel corpus build (B3) makes overlap the normal case.
+    // The old accounting snapshotted the SHARED session object before and
+    // after each search, so two concurrent searches each saw the other's
+    // requests in their "after" and nasaSearchRequests roughly doubled —
+    // 9 or 12 reported for 6 real requests, depending on timing. Isolation
+    // means each search counts only its own metrics object.
+    const { searchProviderCandidatePool } = await import("../stock.server");
+    const profile = createMatchingProfile();
+    const session = await makeSession(profile);
+    nasa.calls.search = 3;
+    nasa.results = [video("n1")];
+    // Held open long enough that the second search starts while the first is
+    // still in flight. DIFFERENT queries, so the inflight map cannot collapse
+    // them into one search.
+    nasa.delayMs = 50;
+
+    const search = (query: string) =>
+      searchProviderCandidatePool({
+        provider: "nasa",
+        query,
+        orientation: "landscape",
+        targetWidth: 1920,
+        session: session as never,
+      });
+
+    // STAGGERED starts, overlapping searches — deliberately not Promise.all of
+    // both from cold. searchProviderCandidatePool begins with a dynamic
+    // import of nasaStock.server, and two of those imports resolving
+    // CONCURRENTLY race inside vitest's mocker: one receives the mock and the
+    // other the REAL module (verified by stack trace — index 1 reached the
+    // real fetchNasaSearchPage). That is a test-runner artifact, not a
+    // production hazard; Node's module registry has no such race. The 10ms
+    // stagger lets the second import resolve alone while the first SEARCH is
+    // still held open, which is the overlap this test is about.
+    const first = search("aurora over the earth");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = search("solar flare eruption timelapse");
+    await Promise.all([first, second]);
+
+    // Two searches, three requests each: exactly six, however they interleaved.
+    expect(profile.summary().nasaSearchRequests).toBe(6);
+    expect(session.nasaMetrics.searchRequests).toBe(6);
+    expect(profile.summary().searchCacheMisses).toBe(2);
+  });
+
   it("counts one executed search once, however many callers wanted it", async () => {
     // Only the caller that OWNS the search snapshots the metrics. A second
     // caller is served either from the inflight map or, if the first already

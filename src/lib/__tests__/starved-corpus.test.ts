@@ -56,6 +56,7 @@ function session(): StockSearchSession {
       unavailableIds: new Set(),
       deactivationPromises: new Map(),
       requestCount: 0,
+      cursor: 0,
       requestLimit: 1000,
     },
   };

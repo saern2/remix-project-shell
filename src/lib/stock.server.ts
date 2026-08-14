@@ -182,6 +182,15 @@ export type PexelsStagePool = {
   deactivationPromises: Map<string, Promise<void>>;
   requestCount: number;
   requestLimit: number;
+  /**
+   * Where the next request starts its key walk. Advanced once per call,
+   * synchronously at entry, so CONCURRENT calls fan out across the pool
+   * instead of all landing on keys[0], exhausting it together, and then
+   * moving to keys[1] together. That collision costs budget as well as time:
+   * every attempted key consumes a requestCount, so N calls colliding on one
+   * rate-limited key burn N counts to discover the same fact once.
+   */
+  cursor: number;
 };
 
 export async function rotatePexelsKeysForRequest(opts: {
@@ -443,6 +452,7 @@ export function createPexelsStagePool(
     deactivationPromises: new Map(),
     requestCount: 0,
     requestLimit,
+    cursor: 0,
   };
 }
 
@@ -517,7 +527,17 @@ export async function requestWithPexelsPool(
     onRequest?: () => void;
   } = {},
 ): Promise<Response | null> {
-  for (const key of pool.keys) {
+  const total = pool.keys.length;
+  if (total === 0) return null;
+  // Round-robin, taken SYNCHRONOUSLY before the first await: an async
+  // function body runs synchronously up to its first await, so a batch of
+  // concurrent calls each claims a distinct starting key before any of them
+  // fetches. Within one call the walk still visits every key, wrapping, so a
+  // call that starts on an unavailable key behaves exactly as before.
+  const start = pool.cursor % total;
+  pool.cursor = (start + 1) % total;
+  for (let offset = 0; offset < total; offset++) {
+    const key = pool.keys[(start + offset) % total];
     if (pool.unavailableIds.has(key.id)) continue;
     if (pool.requestCount >= pool.requestLimit) {
       throw new StockRequestBudgetExceededError(pool.requestLimit);
@@ -690,16 +710,68 @@ export async function createStockSearchSession(
     usage: new Map(),
     pexelsPool,
     profile,
-    nasaMetrics: {
-      searchRequests: 0,
-      assetCalls: 0,
-      metadataCalls: 0,
-      metadataJsonFetches: 0,
-      captionCalls: 0,
-      assetCacheHits: 0,
-      assetCacheMisses: 0,
-    },
+    nasaMetrics: emptyNasaMetrics(),
   };
+}
+
+function emptyNasaMetrics(): NasaRequestMetrics {
+  return {
+    searchRequests: 0,
+    assetCalls: 0,
+    metadataCalls: 0,
+    metadataJsonFetches: 0,
+    captionCalls: 0,
+    assetCacheHits: 0,
+    assetCacheMisses: 0,
+  };
+}
+
+/**
+ * Runs one NASA search against its OWN metrics object, merging into the
+ * session's afterwards.
+ *
+ * The session-wide object cannot be shared with a before/after snapshot once
+ * searches overlap: two concurrent searches each read "before" as zero, both
+ * finish, and each reads the other's requests in its "after" — nasaSearchRequests
+ * roughly doubles while the real HTTP is unchanged. Bucket-parallel corpus
+ * builds (B3) make overlap the normal case rather than a curiosity, and a
+ * capture that double-counts NASA would send the next optimisation round
+ * chasing a phantom.
+ *
+ * Counted in `finally` so a failed search still reports the calls it made —
+ * the invocation where NASA threw is exactly the one worth explaining. The
+ * per-search object also means a joiner (session.inflight) can never
+ * double-count: only the caller that owns the search runs this function.
+ */
+async function searchNasaMetered(
+  search: (metrics: NasaRequestMetrics) => Promise<StockVideo[]>,
+  session: StockSearchSession | undefined,
+): Promise<StockVideo[]> {
+  const metrics = emptyNasaMetrics();
+  try {
+    return await search(metrics);
+  } finally {
+    const shared = session?.nasaMetrics;
+    if (shared) {
+      shared.searchRequests += metrics.searchRequests;
+      shared.assetCalls += metrics.assetCalls;
+      shared.metadataCalls += metrics.metadataCalls;
+      shared.metadataJsonFetches += metrics.metadataJsonFetches;
+      shared.captionCalls += metrics.captionCalls;
+      shared.assetCacheHits += metrics.assetCacheHits;
+      shared.assetCacheMisses += metrics.assetCacheMisses;
+    }
+    const profile = session?.profile;
+    if (profile) {
+      profile.count("nasaSearchRequests", metrics.searchRequests);
+      profile.count("nasaAssetCalls", metrics.assetCalls);
+      profile.count("nasaMetadataCalls", metrics.metadataCalls);
+      profile.count("nasaMetadataJsonFetches", metrics.metadataJsonFetches);
+      profile.count("nasaCaptionCalls", metrics.captionCalls);
+      profile.count("nasaAssetCacheHits", metrics.assetCacheHits);
+      profile.count("nasaAssetCacheMisses", metrics.assetCacheMisses);
+    }
+  }
 }
 
 export async function flushStockSearchSession(session: StockSearchSession): Promise<void> {
@@ -797,11 +869,15 @@ export async function searchProviderCandidatePool(opts: {
       orientation: "any",
       session: opts.session,
       search: () =>
-        searchNasaFootage(normQuery, {
-          targetWidth: opts.targetWidth,
-          seed: opts.seed,
-          metrics: opts.session.nasaMetrics,
-        }),
+        searchNasaMetered(
+          (metrics) =>
+            searchNasaFootage(normQuery, {
+              targetWidth: opts.targetWidth,
+              seed: opts.seed,
+              metrics,
+            }),
+          opts.session,
+        ),
     });
   }
 
@@ -855,11 +931,15 @@ async function searchNasaWithCacheAndSelect(
     orientation: "any",
     session: opts.session,
     search: () =>
-      searchNasaFootage(opts.normQuery, {
-        targetWidth: opts.targetWidth,
-        seed: opts.seed,
-        metrics: opts.session?.nasaMetrics,
-      }),
+      searchNasaMetered(
+        (metrics) =>
+          searchNasaFootage(opts.normQuery, {
+            targetWidth: opts.targetWidth,
+            seed: opts.seed,
+            metrics,
+          }),
+        opts.session,
+      ),
   }).catch((error) => {
     console.warn("[nasa-stock] search failed", {
       query: opts.normQuery,
@@ -920,13 +1000,6 @@ async function getCachedOrSearch(opts: {
   }
   let searchPromise = opts.session?.inflight.get(key);
   const ownsSearch = !searchPromise;
-  // Snapshotted BEFORE the search starts so the delta below is this search's
-  // own HTTP, not the session's running total. Only for the caller that owns
-  // the search: a joiner would double-count the same requests.
-  const nasaBefore =
-    ownsSearch && opts.provider === "nasa" && profile && opts.session?.nasaMetrics
-      ? { ...opts.session.nasaMetrics }
-      : null;
   if (!searchPromise) {
     profile?.count("searchCacheMisses");
     // Single choke point for every provider (Pexels, Pixabay, NASA): all
@@ -949,27 +1022,13 @@ async function getCachedOrSearch(opts: {
 
   let results: StockVideo[];
   try {
+    // NASA per-search HTTP counters are attributed inside searchNasaMetered,
+    // which the owner's search closure wraps — a per-search metrics object, so
+    // overlapping searches cannot read each other's requests and a joiner
+    // (whose closure never runs) cannot double-count.
     results = await searchPromise;
   } finally {
     opts.session?.inflight.delete(key);
-    if (nasaBefore && opts.session?.nasaMetrics) {
-      // Counted here rather than read off the session at the end of the
-      // invocation: profile.summary() is snapshotted into the response payload
-      // before flushStockSearchSession runs, so anything emitted there never
-      // reaches the client. Emitted in `finally` so a failed NASA search still
-      // reports the calls it made.
-      const after = opts.session.nasaMetrics;
-      profile?.count("nasaSearchRequests", after.searchRequests - nasaBefore.searchRequests);
-      profile?.count("nasaAssetCalls", after.assetCalls - nasaBefore.assetCalls);
-      profile?.count("nasaMetadataCalls", after.metadataCalls - nasaBefore.metadataCalls);
-      profile?.count(
-        "nasaMetadataJsonFetches",
-        after.metadataJsonFetches - nasaBefore.metadataJsonFetches,
-      );
-      profile?.count("nasaCaptionCalls", after.captionCalls - nasaBefore.captionCalls);
-      profile?.count("nasaAssetCacheHits", after.assetCacheHits - nasaBefore.assetCacheHits);
-      profile?.count("nasaAssetCacheMisses", after.assetCacheMisses - nasaBefore.assetCacheMisses);
-    }
   }
   if (ownsSearch && opts.provider === "nasa") {
     await recordUsage(opts.provider, false, opts.session);

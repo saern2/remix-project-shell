@@ -138,6 +138,97 @@ describe("a spent key waits for its window, and only a spent key", () => {
   });
 });
 
+/**
+ * Requests rotate across keys instead of all starting at keys[0].
+ *
+ * A prerequisite for bucket-parallel corpus builds (B3), not a nicety: with a
+ * fixed starting key, N concurrent requests all take keys[0], 429 it together,
+ * then all advance to keys[1] together — and every attempted key consumes a
+ * requestCount, so the collision burns N budget counts to discover the same
+ * fact once. The cursor is claimed synchronously at call entry, so a batch of
+ * concurrent calls fans out before any of them fetches.
+ */
+describe("requests rotate across the key pool", () => {
+  const keys = (...ids: string[]) =>
+    ids.map((id) => ({
+      id,
+      api_key: `secret-${id}`,
+      rate_limit_remaining: null,
+      rate_limit_reset_at: null,
+    }));
+
+  const stubFetch = (holdMs = 0) => {
+    const used: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { headers?: { authorization?: string } }) => {
+        used.push(init?.headers?.authorization ?? "none");
+        if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
+        return new Response(JSON.stringify({ videos: [] }), { status: 200 });
+      }),
+    );
+    return used;
+  };
+
+  // The file-level beforeEach installs fake timers for the load-path tests;
+  // these tests hold real promises open, so they need real ones.
+  beforeEach(() => vi.useRealTimers());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("starts successive calls on successive keys, wrapping", async () => {
+    const { createPexelsStagePool, requestWithPexelsPool } = await import("../stock.server");
+    const pool = createPexelsStagePool(keys("k1", "k2", "k3"), false);
+    const used = stubFetch();
+    for (let call = 0; call < 4; call++) {
+      await requestWithPexelsPool(pool, "https://api.pexels.com/videos/search");
+    }
+    expect(used).toEqual(["secret-k1", "secret-k2", "secret-k3", "secret-k1"]);
+  });
+
+  it("fans concurrent calls across distinct keys", async () => {
+    // The collision this exists to prevent: all of them on k1.
+    const { createPexelsStagePool, requestWithPexelsPool } = await import("../stock.server");
+    const pool = createPexelsStagePool(keys("k1", "k2", "k3"), false);
+    const used = stubFetch(10);
+    await Promise.all(
+      Array.from({ length: 3 }, () =>
+        requestWithPexelsPool(pool, "https://api.pexels.com/videos/search"),
+      ),
+    );
+    expect([...used].sort()).toEqual(["secret-k1", "secret-k2", "secret-k3"]);
+  });
+
+  it("still walks past an unavailable key to the next", async () => {
+    const { createPexelsStagePool, requestWithPexelsPool } = await import("../stock.server");
+    const pool = createPexelsStagePool(keys("k1", "k2", "k3"), false);
+    pool.unavailableIds.add("k2");
+    const used = stubFetch();
+    await requestWithPexelsPool(pool, "https://api.pexels.com/videos/search"); // starts k1
+    await requestWithPexelsPool(pool, "https://api.pexels.com/videos/search"); // starts k2 -> k3
+    expect(used).toEqual(["secret-k1", "secret-k3"]);
+  });
+
+  it("visits every key once per call, whatever the starting point", async () => {
+    // All keys 429: the call must try each exactly once and return null, never
+    // loop and never skip — the wrap arithmetic is what this pins.
+    const { createPexelsStagePool, requestWithPexelsPool } = await import("../stock.server");
+    const pool = createPexelsStagePool(keys("k1", "k2", "k3"), false);
+    const used: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { headers?: { authorization?: string } }) => {
+        used.push(init?.headers?.authorization ?? "none");
+        return new Response("limited", { status: 429 });
+      }),
+    );
+    pool.cursor = 1; // deliberately not the first key
+    const response = await requestWithPexelsPool(pool, "https://api.pexels.com/videos/search");
+    expect(response).toBeNull();
+    expect([...used].sort()).toEqual(["secret-k1", "secret-k2", "secret-k3"]);
+    expect(used).toHaveLength(3);
+  });
+});
+
 describe("the pool says whether it is empty by configuration or by exhaustion", () => {
   it("is configured when rows exist, so the env fallback stays out of the way", async () => {
     db.rows = [key("spent", 0, A_MONTH_AHEAD)];

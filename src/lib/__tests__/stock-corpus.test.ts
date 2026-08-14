@@ -102,6 +102,7 @@ describe("stock corpus clustering and assignment", () => {
         unavailableIds: new Set<string>(),
         deactivationPromises: new Map(),
         requestCount: 0,
+        cursor: 0,
         requestLimit: 120,
       },
     };
@@ -139,6 +140,7 @@ describe("stock corpus clustering and assignment", () => {
         unavailableIds: new Set<string>(),
         deactivationPromises: new Map(),
         requestCount: 0,
+        cursor: 0,
         requestLimit: 120,
       },
     };
