@@ -170,10 +170,23 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
   // ── HTTP/HTTPS download ───────────────────────────────────────────────────
   logger.debug({ url, destPath }, 'Downloading file');
 
+  // Queue time, which is NOT transfer time. `startTime` below deliberately
+  // begins after the permit is held, so elapsedMs and mbps describe the
+  // transfer alone — that is the right denominator for a throughput figure and
+  // the wrong one for "why was this chunk slow". Without waitMs the two
+  // explanations for a slow download phase, CDN-side throttling and queueing
+  // behind GLOBAL_CDN_CONCURRENCY permits, are indistinguishable in the logs.
+  //
+  // MEASURED 2026-08-12 to 08-14: 191 of 2,895 chunks (6.6%) crossed the 90s
+  // stall notice and 3 were killed, all three in `downloading`, with the stall
+  // guard never firing — bytes were flowing the whole time. Which of the two
+  // causes that was is the question this number answers.
+  const queuedAt = Date.now();
   const requiresSemaphore = isCdnUrl(url);
   if (requiresSemaphore) {
     await cdnSemaphore.acquire();
   }
+  const waitMs = Date.now() - queuedAt;
 
   let abortHandler;
   const startTime = Date.now();
@@ -210,7 +223,8 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
         const mbps = elapsedMs > 0 ? (bytesWritten / (1024 * 1024)) / (elapsedMs / 1000) : 0;
         reject(new Error(
           `Download ${reason} for ${url}: received ${bytesWritten} of ` +
-          `${expectedBytes ?? 'unknown'} bytes in ${elapsedMs}ms (${mbps.toFixed(2)} MB/s)`
+          `${expectedBytes ?? 'unknown'} bytes in ${elapsedMs}ms (${mbps.toFixed(2)} MB/s` +
+          `, after ${waitMs}ms queued)`
         ));
       };
 
@@ -313,7 +327,18 @@ async function downloadFile(url, destPath, { maxBytes = config.maxDownloadBytes,
                   ? (bytesWritten / (1024 * 1024)) / (elapsedMs / 1000)
                   : 0;
                 logger.info(
-                  { url, destPath, bytes: bytesWritten, elapsedMs, mbps: Number(mbps.toFixed(2)) },
+                  {
+                    url,
+                    destPath,
+                    bytes: bytesWritten,
+                    elapsedMs,
+                    // Time spent queued for a CDN permit before the first byte
+                    // was requested. elapsedMs excludes it; totalMs is what the
+                    // chunk's deadline actually spent on this file.
+                    waitMs,
+                    totalMs: waitMs + elapsedMs,
+                    mbps: Number(mbps.toFixed(2)),
+                  },
                   'Download complete',
                 );
                 resolve(bytesWritten);
