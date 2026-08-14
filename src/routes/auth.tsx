@@ -2,6 +2,7 @@ import { createFileRoute, Link, useNavigate, useRouter } from "@tanstack/react-r
 import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import { describeUserFacingError } from "@/lib/user-errors";
 import { CheckCircle2, KeyRound, Loader2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -239,7 +240,7 @@ function AuthPage() {
       setIsPasswordRecovery(false);
       toast.success("Password saved securely.");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Password setup failed.");
+      toast.error(describeUserFacingError(error, { fallback: "Password setup failed." }));
     } finally {
       setLoading(false);
     }
@@ -272,7 +273,7 @@ function AuthPage() {
       await submitWaitlist({ data: { fullName, phone, email: waitlistEmail } });
       setWaitlistSent(true);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Request submission failed.");
+      toast.error(describeUserFacingError(error, { fallback: "Request submission failed." }));
     } finally {
       setLoading(false);
     }

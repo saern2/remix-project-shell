@@ -19,6 +19,7 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { AlertCircle, ArrowLeft, FolderKanban, Loader2, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
+import { describeUserFacingError } from "@/lib/user-errors";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { PROJECTS_QUERY_KEY, useProjects } from "@/components/project-overview";
@@ -89,7 +90,7 @@ function NewProject() {
       await queryClient.invalidateQueries({ queryKey: PROJECTS_QUERY_KEY });
       toast.success(`Deleted "${oldest.name}". You can create a project now.`);
     } catch (err) {
-      toast.error((err as Error).message ?? "Could not delete the project.");
+      toast.error(describeUserFacingError(err, { fallback: "Could not delete the project." }));
     } finally {
       setDeletingOldest(false);
       setConfirmDeleteOldest(false);
@@ -181,7 +182,7 @@ function NewProject() {
         .update({ status: "failed", error_message: "Upload failed." })
         .eq("id", project.id);
       setBusy(false);
-      toast.error((err as Error).message);
+      toast.error(describeUserFacingError(err));
       return;
     }
 

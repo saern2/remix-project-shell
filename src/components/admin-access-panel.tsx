@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { Copy, KeyRound, Loader2, RotateCcw, ShieldX } from "lucide-react";
 import { toast } from "sonner";
+import { describeUserFacingError } from "@/lib/user-errors";
 import {
   issueUserAccessSecret,
   listAccessAdministration,
@@ -56,7 +57,7 @@ export function AdminAccessPanel() {
       await refresh();
       toast.success(message);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Action failed.");
+      toast.error(describeUserFacingError(error, { fallback: "Action failed." }));
     } finally {
       setBusy(null);
     }

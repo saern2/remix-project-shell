@@ -3,6 +3,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { useState } from "react";
 import { AlertTriangle, Loader2, Wrench } from "lucide-react";
 import { toast } from "sonner";
+import { describeUserFacingError } from "@/lib/user-errors";
 
 import {
   AlertDialog,
@@ -82,7 +83,7 @@ export function MaintenancePanel() {
         toast.success(enabled ? "Maintenance mode is on." : "Maintenance mode is off.");
       }
     } catch (err) {
-      toast.error((err as Error).message);
+      toast.error(describeUserFacingError(err));
     } finally {
       setSaving(false);
       setConfirming(false);

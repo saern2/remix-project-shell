@@ -102,10 +102,46 @@ function plural(n: number, word: string): string {
  * advances the work. The notice exists to say the project is fine, not to ask
  * for anything.
  */
-function pausedFields(counts: MatchingCounts): { paused: boolean; pausedNotice: string | null } {
+export type MatchingProgressOptions = {
+  /**
+   * Server errors THIS CLIENT saw in the last few minutes, from the poll
+   * loop's own failures. The paused notice is computed from database
+   * timestamps, which know that nothing progressed but cannot know WHY —
+   * and on 2026-08-14 that gap put "Paused — resuming now. Nothing was
+   * lost." on screen for five straight minutes of a server crash-loop, over
+   * a counter reading 228s since progress. The client is the one party that
+   * watched its own requests fail, so it supplies the discriminator.
+   */
+  recentServerErrors?: number;
+};
+
+/**
+ * Two errors, not one: a single failed poll happens on healthy days and
+ * recovers on the next beat 4s later. Two inside the window means failing is
+ * a pattern, and a pattern must not be narrated as "resuming now".
+ */
+const SERVER_ERRORS_ARE_A_PATTERN = 2;
+
+function pausedFields(
+  counts: MatchingCounts,
+  options: MatchingProgressOptions = {},
+): { paused: boolean; pausedNotice: string | null } {
   const idle = counts.msSinceProgress;
   if (idle == null || !Number.isFinite(idle) || idle < PAUSED_AFTER_MS) {
     return { paused: false, pausedNotice: null };
+  }
+  if ((options.recentServerErrors ?? 0) >= SERVER_ERRORS_ARE_A_PATTERN) {
+    return {
+      paused: true,
+      // Says what is true and only that: completed work IS saved (every
+      // search persists its own row), the server IS having repeated trouble,
+      // and resumption is automatic but NOT happening right now. Neither
+      // "resuming now" nor "nothing was lost" survives a crash-loop.
+      pausedNotice:
+        "Matching is interrupted — the server is having repeated problems. " +
+        "Everything completed so far is saved, and matching picks up " +
+        "automatically once the server recovers.",
+    };
   }
   return {
     paused: true,
@@ -136,7 +172,10 @@ export function describeRemainingTime(seconds: number): string | null {
  * the phase with no other visible signal. Once it is done the view switches to
  * scenes, which is what the timeline will fill with.
  */
-export function describeMatchingProgress(counts: MatchingCounts): MatchingProgressView {
+export function describeMatchingProgress(
+  counts: MatchingCounts,
+  options: MatchingProgressOptions = {},
+): MatchingProgressView {
   const cellsPending = counts.corpusCellsPending ?? null;
   const cellsTotal = counts.corpusCellsTotal ?? null;
 
@@ -145,7 +184,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     const done = Math.max(0, total - cellsPending);
     const invocations = Math.ceil(cellsPending / OBSERVED_CELLS_PER_INVOCATION);
     return {
-      ...pausedFields(counts),
+      ...pausedFields(counts, options),
       phase: "preparing",
       headline: `Preparing footage library — ${plural(cellsPending, "search")} remaining of ${total}`,
       // Says the quiet part: an empty timeline right now is expected, not broken.
@@ -166,7 +205,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     const left = slicesExpected - filled;
     if (left === 0) {
       return {
-        ...pausedFields(counts),
+        ...pausedFields(counts, options),
         phase: "finishing",
         headline: `Matching footage — ${slicesExpected} of ${slicesExpected} clips`,
         detail: "Finishing up.",
@@ -176,7 +215,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     }
     const invocations = Math.ceil(left / OBSERVED_SCENES_PER_INVOCATION);
     return {
-      ...pausedFields(counts),
+      ...pausedFields(counts, options),
       phase: "matching",
       headline: `Matching footage — ${filled} of ${slicesExpected} clips`,
       detail: "Each moment of the video is being paired with a clip.",
@@ -197,7 +236,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     const done = Math.max(0, totalScenes - remaining);
     if (remaining === 0) {
       return {
-        ...pausedFields(counts),
+        ...pausedFields(counts, options),
         phase: "finishing",
         headline: `Matching footage — ${totalScenes} of ${totalScenes} scenes`,
         detail: "Finishing up.",
@@ -207,7 +246,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
     }
     const invocations = Math.ceil(remaining / OBSERVED_SCENES_PER_INVOCATION);
     return {
-      ...pausedFields(counts),
+      ...pausedFields(counts, options),
       phase: "matching",
       headline: `Matching footage — ${done} of ${totalScenes} scenes`,
       detail: "Each scene is being paired with a clip.",
@@ -219,7 +258,7 @@ export function describeMatchingProgress(counts: MatchingCounts): MatchingProgre
   // Known-unknown rather than a fake zero: a bar sitting at 0% reads as stuck,
   // which is the exact impression this whole module exists to prevent.
   return {
-    ...pausedFields(counts),
+    ...pausedFields(counts, options),
     phase: "preparing",
     headline: "Preparing footage library",
     detail: "Clips are chosen in the next step, so the timeline stays empty until then.",
@@ -308,7 +347,7 @@ export function assembleMatchingCounts(input: {
         ? null
         : Math.max(0, input.totalScenes - input.matchedScenes),
     slicesFilled: sliceMode ? Math.max(0, input.slicesFilled ?? 0) : null,
-    slicesExpected: sliceMode ? input.slicesExpected ?? null : null,
+    slicesExpected: sliceMode ? (input.slicesExpected ?? null) : null,
   };
 }
 

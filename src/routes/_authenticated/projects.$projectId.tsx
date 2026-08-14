@@ -16,6 +16,7 @@ import {
 import { describeChunkPhase, describeQueuePosition, describeStitchPhase } from "@/lib/render-queue";
 import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
 import { retryModeForProject } from "@/lib/render-retry";
+import { describeUserFacingError, TRANSIENT_RETRYING } from "@/lib/user-errors";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -109,6 +110,12 @@ const STATUS_LABELS: Record<string, string> = {
  * job; well below the point where a person would give up and reload.
  */
 const STALE_POLL_CLAIM_MS = 90_000;
+
+/**
+ * How long a server-function failure stays relevant to the paused banner.
+ * Five minutes spans several ~90s crash cycles while forgetting a lone blip.
+ */
+const SERVER_ERROR_WINDOW_MS = 5 * 60_000;
 
 const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_footage"]);
 const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching", "uploading"]);
@@ -275,7 +282,7 @@ function ProjectDetail() {
       await runSwap({ data: { sceneId } });
       await queryClient.invalidateQueries({ queryKey: ["selected-clips", projectId] });
     } catch (err) {
-      toast.error((err as Error).message);
+      toast.error(describeUserFacingError(err));
     } finally {
       setSwappingId(null);
     }
@@ -292,7 +299,7 @@ function ProjectDetail() {
       await runDeleteProject({ data: { projectId } });
       navigate({ to: "/dashboard", replace: true });
     } catch (err) {
-      toast.error((err as Error).message);
+      toast.error(describeUserFacingError(err));
     } finally {
       setDeletingProject(false);
       setShowDeleteConfirm(false);
@@ -317,7 +324,7 @@ function ProjectDetail() {
         queryClient.invalidateQueries({ queryKey: ["project", projectId] }),
       ]);
     } catch (err) {
-      toast.error((err as Error).message);
+      toast.error(describeUserFacingError(err));
     } finally {
       setCancellingRender(false);
     }
@@ -359,7 +366,7 @@ function ProjectDetail() {
         queryClient.invalidateQueries({ queryKey: ["render-job", projectId] }),
       ]);
     } catch (err) {
-      toast.error((err as Error).message);
+      toast.error(describeUserFacingError(err));
     } finally {
       setSubmittingRender(false);
     }
@@ -388,7 +395,8 @@ function ProjectDetail() {
         // is one more 404 (round 8, Problem 1).
         reachedTerminalState = RENDER_TERMINAL.has(result?.status ?? "");
       } catch (err) {
-        if (!cancelled) toast.error((err as Error).message);
+        if (!cancelled)
+          toast.error(describeUserFacingError(err, { transient: TRANSIENT_RETRYING }));
       }
       if (!cancelled) {
         queryClient.invalidateQueries({ queryKey: ["render-job", projectId] });
@@ -471,6 +479,21 @@ function ProjectDetail() {
   // replaced deliberately.
   const pollInFlight = useRef<number | null>(null);
 
+  // Server-function failures THIS CLIENT saw recently, for the paused banner.
+  // The banner is computed from database timestamps, which know that nothing
+  // progressed but cannot know why. On 2026-08-14 a crash-looping runtime sat
+  // under "Paused — resuming now. Nothing was lost." for five minutes; the
+  // client had watched four of its own polls die in that window and said
+  // nothing. This is the saying of it.
+  const serverFnErrorTimes = useRef<number[]>([]);
+  const noteServerFnError = () => {
+    const now = Date.now();
+    serverFnErrorTimes.current = [
+      ...serverFnErrorTimes.current.filter((at) => now - at < SERVER_ERROR_WINDOW_MS),
+      now,
+    ];
+  };
+
   // Poll the pipeline server function whenever the project is mid-flight.
   //
   // Depends on the STATUS STRING, never on the project object. `project` is a
@@ -532,7 +555,10 @@ function ProjectDetail() {
         consecutiveErrors += 1;
         // Surface the error only on the first failure of a streak; the query
         // refetch will show the failed state and repeated toasts would be noise.
-        if (!cancelled && consecutiveErrors === 1) toast.error((err as Error).message);
+        if (!cancelled && consecutiveErrors === 1) {
+          toast.error(describeUserFacingError(err, { transient: TRANSIENT_RETRYING }));
+        }
+        noteServerFnError();
       } finally {
         // Released on every path, including the early return above — a claim
         // left set would stop this project polling for the rest of the session.
@@ -581,8 +607,11 @@ function ProjectDetail() {
     enabled: project?.status === "matching_footage",
     refetchInterval: () => (project?.status === "matching_footage" ? 3000 : false),
   });
+  const recentServerErrors = serverFnErrorTimes.current.filter(
+    (at) => Date.now() - at < SERVER_ERROR_WINDOW_MS,
+  ).length;
   const matchingView = matchingCounts?.[projectId]
-    ? describeMatchingProgress(matchingCounts[projectId])
+    ? describeMatchingProgress(matchingCounts[projectId], { recentServerErrors })
     : null;
 
   const progressPct = useMemo(() => {
@@ -624,7 +653,7 @@ function ProjectDetail() {
       queryClient.invalidateQueries({ queryKey: ["project", projectId] });
       queryClient.invalidateQueries({ queryKey: ["scenes", projectId] });
     } catch (err) {
-      toast.error((err as Error).message);
+      toast.error(describeUserFacingError(err));
     }
   };
 

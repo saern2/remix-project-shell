@@ -221,6 +221,47 @@ describe("the paused notice", () => {
     expect(resumed.pausedNotice).toBeNull();
   });
 
+  /**
+   * OBSERVED 2026-08-14: the runtime crash-looped every ~94s for five minutes
+   * while this banner said "Paused — resuming now. Nothing was lost." over a
+   * counter reading 228s since progress. The notice is computed from database
+   * timestamps, which know that nothing moved but not why; the client is the
+   * one party that watched its own requests fail, so it supplies the count.
+   */
+  describe("repeated server errors change what the banner is allowed to claim", () => {
+    const stuck = { corpusCellsPending: 24, corpusCellsTotal: 40, msSinceProgress: 228_000 };
+
+    it("stops claiming 'resuming now' when failure is a pattern", () => {
+      const view = describeMatchingProgress(stuck, { recentServerErrors: 2 });
+      expect(view.paused).toBe(true);
+      expect(view.pausedNotice).toMatch(/server is having repeated problems/i);
+      // The two claims that were false for five straight minutes.
+      expect(view.pausedNotice).not.toMatch(/resuming now/i);
+      expect(view.pausedNotice).not.toMatch(/nothing was lost/i);
+      // What IS true: completed cells persist their own rows, and resumption
+      // needs no action from the viewer.
+      expect(view.pausedNotice).toMatch(/saved/i);
+      expect(view.pausedNotice).toMatch(/automatically/i);
+    });
+
+    it("treats one failed poll as a blip, not a pattern", () => {
+      // A lone 502 recovers on the next 4s beat; the ordinary notice stands.
+      const view = describeMatchingProgress(stuck, { recentServerErrors: 1 });
+      expect(view.pausedNotice).toMatch(/resuming now/i);
+    });
+
+    it("never surfaces errors while progress is actually advancing", () => {
+      // Errors alongside progress mean the retries are working; the banner
+      // only exists once nothing has moved for the threshold.
+      const view = describeMatchingProgress(
+        { corpusCellsPending: 24, corpusCellsTotal: 40, msSinceProgress: 3_000 },
+        { recentServerErrors: 4 },
+      );
+      expect(view.paused).toBe(false);
+      expect(view.pausedNotice).toBeNull();
+    });
+  });
+
   it("keeps the counts and the bar visible while paused", () => {
     // The notice sits beside the progress; it never replaces it, so it stays
     // obvious how far the work actually got.
