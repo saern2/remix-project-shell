@@ -52,8 +52,34 @@ const CONFIRMATIONS_BEFORE_ACTION = 2;
  */
 const MAX_RECONCILES_PER_PROJECT = 3;
 
+/**
+ * How long a declared-dead stitch parent stays in the queue before it is
+ * removed outright.
+ *
+ * CHOSEN, not measured: the client learns of the failure by polling the job's
+ * data, so removing the job the moment it is declared would race the poll into
+ * "not_found" instead of the real message. The verdict is also persisted into
+ * render_jobs by the app within one poll cycle (seconds), so any window longer
+ * than minutes is safe; a day is comfortable and costs one Redis entry.
+ *
+ * WHY REMOVAL AT ALL. Declaring failure writes `_status: 'failed'` into the
+ * job's DATA — its BullMQ state stays waiting-children, which has no legitimate
+ * transition to failed. Left there, getWaitingChildren() returns it on every
+ * sweep forever: measured 2026-08-15, one abandoned project was re-declared
+ * every ~5 minutes for ~17 hours (repairsSoFar 205), each time re-firing the
+ * level-50 log that is supposed to be the once-per-project alarm. An alarm
+ * that fires 200 times for one event is not an alarm.
+ */
+const DECLARED_CLEANUP_GRACE_MS = 24 * 60 * 60 * 1000;
+
 /** projectId -> consecutive sweeps seen unhealthy, and repairs attempted. */
 const seen = new Map();
+
+/**
+ * Lifetime totals for this process, so a sweep summary can say "1 project
+ * declared unrecoverable" the day it happens — once, as a signal.
+ */
+const counters = { declared: 0, cleaned: 0 };
 
 /** The chunk ids a parent is still waiting on, with their current state. */
 async function inspectDependencies(stitchJob, chunkQueue) {
@@ -89,16 +115,58 @@ async function inspectDependencies(stitchJob, chunkQueue) {
  * client through the path it already polls, without surgery on a job whose
  * BullMQ state (waiting-children) has no legitimate transition to failed.
  */
-async function declareUnrecoverable(stitchJob, detail) {
+async function declareUnrecoverable(stitchJob, detail, now) {
   const message =
     `Rendering could not finish: ${detail}. ` +
     'Nothing was lost from your project — please start the render again.';
+  // _declaredAt is what makes declared MEAN declared: later sweeps skip the
+  // project instead of re-confirming and re-declaring it, and the cleanup
+  // clock starts here. In job data rather than the in-memory map so a worker
+  // restart re-declares at most once instead of starting the loop over.
   await stitchJob
-    .updateData({ ...stitchJob.data, _status: 'failed', _error: message })
+    .updateData({
+      ...stitchJob.data,
+      _status: 'failed',
+      _error: message,
+      _declaredAt: new Date(now).toISOString(),
+    })
     .catch((err) => {
       logger.error({ jobId: stitchJob.id, err: err.message }, 'Could not mark stitch as failed');
     });
   return message;
+}
+
+/**
+ * Removes a declared-dead parent and its leftover children after the grace
+ * window, so it finally leaves getWaitingChildren().
+ *
+ * Guarded on runnable === 0: removeChildren cascades, and a child that could
+ * still run must never be deleted by a janitor. A declared project with
+ * runnable work is contradictory enough to leave alone and keep skipping.
+ */
+async function cleanupDeclared({ stitchJob, stitchQueue, chunkQueue, projectId }) {
+  let inspection;
+  try {
+    inspection = await inspectDependencies(stitchJob, chunkQueue);
+  } catch (err) {
+    logger.warn({ jobId: stitchJob.id, err: err.message }, 'Reconciler: cleanup inspect failed');
+    return false;
+  }
+  if (inspection.runnable > 0) return false;
+
+  try {
+    await stitchQueue.remove(stitchJob.id, { removeChildren: true });
+  } catch (err) {
+    // Next sweep tries again; the skip path keeps it silent meanwhile.
+    logger.warn({ jobId: stitchJob.id, err: err.message }, 'Reconciler: cleanup remove failed');
+    return false;
+  }
+  counters.cleaned += 1;
+  logger.info(
+    { projectId, declaredAt: stitchJob.data?._declaredAt ?? null },
+    'Reconciler: removed a declared-unrecoverable stitch after its grace window',
+  );
+  return true;
 }
 
 /**
@@ -124,6 +192,30 @@ async function reconcileOnce({ stitchQueue, chunkQueue, redis, now = Date.now() 
     if (!stitchJob?.id) continue;
     const projectId = String(stitchJob.id).replace(/-stitch$/, '');
     liveProjectIds.add(projectId);
+
+    // ── Already declared: skip, then clean up ────────────────────────────────
+    // Declared means declared. Without this branch the parent — whose BullMQ
+    // state stays waiting-children forever — was re-confirmed and re-declared
+    // every two sweeps: 205 times over ~17 hours for one abandoned project
+    // (2026-08-15). The declare log must fire once per project, so every later
+    // sweep lands here in silence until the grace window elapses and the job
+    // is removed for good.
+    if (stitchJob.data?._status === 'failed') {
+      const declaredAtRaw = Date.parse(stitchJob.data?._declaredAt ?? '');
+      if (!Number.isFinite(declaredAtRaw)) {
+        // Declared by a build that predates _declaredAt. Stamp it now so the
+        // grace clock starts, and keep skipping.
+        await stitchJob
+          .updateData({ ...stitchJob.data, _declaredAt: new Date(now).toISOString() })
+          .catch(() => {});
+        continue;
+      }
+      if (now - declaredAtRaw >= DECLARED_CLEANUP_GRACE_MS) {
+        const cleaned = await cleanupDeclared({ stitchJob, stitchQueue, chunkQueue, projectId });
+        if (cleaned) findings.push({ projectId, action: 'cleaned-up' });
+      }
+      continue;
+    }
 
     let inspection;
     try {
@@ -180,7 +272,12 @@ async function reconcileOnce({ stitchQueue, chunkQueue, redis, now = Date.now() 
       const message = await declareUnrecoverable(
         stitchJob,
         `${inspection.failed.length + inspection.missing.length} segment(s) could not be rendered after repeated attempts`,
+        now,
       );
+      counters.declared += 1;
+      // Fires ONCE per project — the declared-skip branch above guarantees it.
+      // That is what makes this line an alarm rather than the noise it was
+      // when it repeated every five minutes.
       logger.error({ projectId, message }, 'Reconciler: giving up and failing the render visibly');
       findings.push({ projectId, action: 'declared-unrecoverable' });
       seen.set(projectId, { strikes: 0, repairs: record.repairs + 1 });
@@ -225,6 +322,15 @@ async function reconcileOnce({ stitchQueue, chunkQueue, redis, now = Date.now() 
     if (!liveProjectIds.has(projectId)) seen.delete(projectId);
   }
 
+  // One line per sweep THAT DID SOMETHING; quiet sweeps say nothing. With
+  // declares now firing once, this is the day's summary rather than a stream.
+  if (findings.length > 0) {
+    logger.info(
+      { findings, declaredTotal: counters.declared, cleanedTotal: counters.cleaned },
+      'Reconciler sweep acted',
+    );
+  }
+
   return findings;
 }
 
@@ -253,15 +359,24 @@ function stopReconciler() {
 /** Test seam: forget what previous sweeps saw. */
 function resetReconcilerState() {
   seen.clear();
+  counters.declared = 0;
+  counters.cleaned = 0;
+}
+
+/** Read-only view of the lifetime totals, for tests and diagnostics. */
+function reconcilerCounters() {
+  return { ...counters };
 }
 
 module.exports = {
   RECONCILE_INTERVAL_MS,
   CONFIRMATIONS_BEFORE_ACTION,
   MAX_RECONCILES_PER_PROJECT,
+  DECLARED_CLEANUP_GRACE_MS,
   reconcileOnce,
   startReconciler,
   stopReconciler,
   resetReconcilerState,
+  reconcilerCounters,
   inspectDependencies,
 };

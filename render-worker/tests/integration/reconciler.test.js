@@ -27,8 +27,10 @@ const { Queue, Worker, FlowProducer, Job } = require('bullmq');
 const {
   reconcileOnce,
   resetReconcilerState,
+  reconcilerCounters,
   CONFIRMATIONS_BEFORE_ACTION,
   MAX_RECONCILES_PER_PROJECT,
+  DECLARED_CLEANUP_GRACE_MS,
 } = require('../../src/reconciler');
 
 const CHUNK_QUEUE = 'test-recon-chunk';
@@ -207,6 +209,110 @@ describe('the reconciler cannot become its own silent loop', () => {
     // A person reads this, so it says what to do and that nothing was lost.
     expect(parent.data._error).toMatch(/start the render again/i);
     expect(parent.data._error).not.toMatch(/dependency|unprocessed|bullmq/i);
+  }, 60000);
+});
+
+describe('declared means declared', () => {
+  // 2026-08-15: one abandoned project reached repairsSoFar 205 — re-confirmed
+  // and re-declared every two sweeps for ~17 hours, because declaring failure
+  // writes job DATA while the BullMQ state stays waiting-children and so the
+  // parent kept coming back from getWaitingChildren(). The level-50 declare
+  // log fired ~200 times for one event. These tests pin the whole lifecycle:
+  // declare once, skip in silence, remove after the grace window.
+  async function driveToDeclared(projectId, chunkCount = 2) {
+    await buildFlow(projectId, chunkCount);
+    // Deleting the job HASH (not job.remove()) leaves the parent's dependency
+    // dangling — the unrecoverable shape. With chunkCount 1 the project also
+    // has runnable 0, which is what the cleanup guard requires.
+    await redis.del(`bull:${CHUNK_QUEUE}:${projectId}-chunk-${chunkCount - 1}`);
+    for (let round = 0; round < (MAX_RECONCILES_PER_PROJECT + 2) * 2; round += 1) {
+      const findings = await sweep();
+      if (findings.some((finding) => finding.action === 'declared-unrecoverable')) return;
+    }
+    throw new Error('project never reached declared-unrecoverable');
+  }
+
+  it('declares exactly once and skips the project on every later sweep', async () => {
+    await driveToDeclared('once');
+    expect(reconcilerCounters().declared).toBe(1);
+
+    // The sweeps that used to re-declare. Silence is the assertion: no repair,
+    // no re-declare, no findings of any kind for this project.
+    for (let round = 0; round < 6; round += 1) {
+      expect(await sweep()).toEqual([]);
+    }
+    expect(reconcilerCounters().declared).toBe(1);
+
+    const parent = await Job.fromId(stitchQueue, 'once-stitch');
+    expect(parent.data._status).toBe('failed');
+    expect(Date.parse(parent.data._declaredAt)).not.toBeNaN();
+  }, 60000);
+
+  it('survives a worker restart with at most one extra declare, not a new loop', async () => {
+    await driveToDeclared('restarted');
+
+    // A restart clears the in-memory map — the exact state loss that could
+    // restart the loop. _declaredAt lives in job data, so the skip must hold.
+    resetReconcilerState();
+    for (let round = 0; round < 4; round += 1) {
+      expect(await sweep()).toEqual([]);
+    }
+    expect(reconcilerCounters().declared).toBe(0); // nothing re-declared after restart
+  }, 60000);
+
+  it('removes the parent and its children once the grace window elapses', async () => {
+    // One chunk, hash deleted: unhealthy 1, runnable 0 — removable. A project
+    // with runnable children must never be cleaned up (guard tested below by
+    // the refusal path staying silent for 2-chunk projects, which keep one
+    // waiting child).
+    await driveToDeclared('expired', 1);
+
+    // Not a moment before the window: the client reads the failure out of the
+    // job's data by polling, and an immediate removal races that read into
+    // "not_found" instead of the real message.
+    expect(await sweep()).toEqual([]);
+    expect(await Job.fromId(stitchQueue, 'expired-stitch')).toBeTruthy();
+
+    const afterGrace = Date.now() + DECLARED_CLEANUP_GRACE_MS + 1000;
+    const findings = await reconcileOnce({ stitchQueue, chunkQueue, redis, now: afterGrace });
+    expect(findings).toEqual([{ projectId: 'expired', action: 'cleaned-up' }]);
+    expect(reconcilerCounters().cleaned).toBe(1);
+
+    // Gone for good: the parent no longer haunts getWaitingChildren, and its
+    // failed child went with it.
+    expect(await Job.fromId(stitchQueue, 'expired-stitch')).toBeFalsy();
+    expect(await Job.fromId(chunkQueue, 'expired-chunk-0')).toBeFalsy();
+    expect(await stitchQueue.getWaitingChildren()).toEqual([]);
+
+    // And the sweep after the cleanup has nothing left to say.
+    expect(await reconcileOnce({ stitchQueue, chunkQueue, redis, now: afterGrace + 1 })).toEqual(
+      [],
+    );
+  }, 60000);
+
+  it('never removes a declared project that still has runnable children', async () => {
+    // Contradictory state — declared dead, yet holding work that could run.
+    // Deleting runnable work is worse than a leaked Redis entry, so the
+    // cleanup refuses and the skip keeps the project silent instead.
+    await driveToDeclared('guarded', 2);
+    const afterGrace = Date.now() + DECLARED_CLEANUP_GRACE_MS + 1000;
+    expect(await reconcileOnce({ stitchQueue, chunkQueue, redis, now: afterGrace })).toEqual([]);
+    expect(await Job.fromId(stitchQueue, 'guarded-stitch')).toBeTruthy();
+  }, 60000);
+
+  it('stamps _declaredAt onto a declare that predates it, instead of looping', async () => {
+    // A parent declared by the previous build has _status failed but no
+    // _declaredAt. The first sweep must start its grace clock, not re-enter
+    // the confirm/declare cycle.
+    await buildFlow('legacy', 2);
+    await redis.del(`bull:${CHUNK_QUEUE}:legacy-chunk-1`);
+    const parent = await Job.fromId(stitchQueue, 'legacy-stitch');
+    await parent.updateData({ ...parent.data, _status: 'failed', _error: 'declared by old build' });
+
+    expect(await sweep()).toEqual([]);
+    const restamped = await Job.fromId(stitchQueue, 'legacy-stitch');
+    expect(Date.parse(restamped.data._declaredAt)).not.toBeNaN();
+    expect(reconcilerCounters().declared).toBe(0);
   }, 60000);
 });
 
