@@ -12,6 +12,7 @@ import {
   matchingTimeBudgetMs,
 } from "@/lib/matching-budget";
 import { createMatchingProfile } from "@/lib/matching-profile";
+import { MAX_AUDIO_DURATION_SECONDS } from "@/lib/audio-limits";
 import type { StockSearchSession } from "@/lib/stock.server";
 import type { AssignmentTier } from "@/lib/stock-corpus.server";
 
@@ -314,6 +315,131 @@ async function persistTranscriptAndScenes(
     throwPipelineWriteError(sErr, "Failed to save scenes.");
   }
 }
+
+// ── Script-to-video: the TTS transcript entry point ──────────────────────────
+
+const ScriptSentence = z.object({
+  text: z.string().min(1).max(2_000),
+  start_ms: z.number().int().nonnegative(),
+  end_ms: z.number().int().positive(),
+});
+
+const ScriptTranscriptInput = z.object({
+  projectId: z.string().uuid(),
+  fullText: z.string().min(1).max(200_000),
+  voice: z.string().min(1).max(64),
+  durationSec: z.number().positive(),
+  sentences: z.array(ScriptSentence).min(1).max(1_000),
+});
+
+/**
+ * The server half of the duration gate.
+ *
+ * The client already asserted sample-exact integer equality before uploading;
+ * this re-checks the invariants a hostile or buggy client could violate,
+ * BEFORE persistTranscriptAndScenes writes anything: contiguous monotonic
+ * sentences starting at zero, and a final boundary that matches the claimed
+ * audio duration to within the 1 ms that boundary rounding can legitimately
+ * introduce. Everything downstream (scene timing, render slots, the stitch)
+ * trusts these numbers, so they are earned here or not at all.
+ */
+export function validateScriptSentences(
+  sentences: Array<{ text: string; start_ms: number; end_ms: number }>,
+  durationSec: number,
+): string | null {
+  if (durationSec > MAX_AUDIO_DURATION_SECONDS) {
+    return "This narration is longer than the 45-minute limit.";
+  }
+  if (sentences[0]?.start_ms !== 0) return "The narration timeline must start at zero.";
+  for (let i = 0; i < sentences.length; i += 1) {
+    const prevEnd = i === 0 ? 0 : sentences[i - 1].end_ms;
+    if (sentences[i].start_ms !== prevEnd || sentences[i].end_ms <= sentences[i].start_ms) {
+      return "The narration timeline has a gap or overlap between sentences.";
+    }
+  }
+  const lastEndMs = sentences[sentences.length - 1].end_ms;
+  if (Math.abs(lastEndMs - durationSec * 1000) > 1) {
+    return "The narration timeline does not match the audio length.";
+  }
+  return null;
+}
+
+/**
+ * Persists a browser-TTS result and advances to generating_scenes — the
+ * script path's mirror of startPipeline's sync-ASR block, sharing the same
+ * persistTranscriptAndScenes so the handoff state is identical field for
+ * field. By the time this runs, the WAV is already in Storage and the
+ * audio_assets row exists (the client wrote both, exactly as the upload path
+ * does); from the status update onward the pipeline cannot tell the two
+ * kinds of project apart.
+ */
+export const persistScriptTranscript = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => ScriptTranscriptInput.parse(input))
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const { projectId } = data;
+
+    // Same gate as startPipeline: a disabled button is decoration.
+    await assertMaintenanceAllows("start_pipeline", userId);
+
+    const { data: project, error: projectErr } = await supabase
+      .from("projects")
+      .select("id, status, user_id")
+      .eq("id", projectId)
+      .maybeSingle();
+    if (projectErr) throw new Error(projectErr.message);
+    if (!project) throw new Error("Project not found.");
+    if (project.user_id !== userId) throw new Error("Forbidden.");
+    if (!["uploading", "draft", "failed"].includes(project.status)) {
+      return { ok: true, status: project.status };
+    }
+
+    // The audio must already exist — this function persists a transcript FOR
+    // an upload, it never creates one.
+    const { data: asset, error: assetErr } = await supabase
+      .from("audio_assets")
+      .select("id")
+      .eq("project_id", projectId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (assetErr) throw new Error(assetErr.message);
+    if (!asset) throw new Error("No audio uploaded for this project.");
+
+    const invalid = validateScriptSentences(data.sentences, data.durationSec);
+    if (invalid) throw new Error(invalid);
+
+    try {
+      await persistTranscriptAndScenes(projectId, {
+        provider: "kokoro_browser",
+        full_text: data.fullText,
+        language: "en",
+        words: [],
+        sentences: data.sentences,
+        duration_sec: data.durationSec,
+      });
+
+      await assertPipelineWritable(projectId);
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { error: updErr } = await supabaseAdmin
+        .from("projects")
+        .update({ status: "generating_scenes", provider_job_id: null, error_message: null })
+        .eq("id", projectId);
+      if (updErr) throw new Error(updErr.message);
+      return { ok: true, status: "generating_scenes" };
+    } catch (err) {
+      if (isPipelineStopped(err)) {
+        console.info("[pipeline] project deleted while persisting script transcript", {
+          projectId,
+        });
+        throw new Error("Project processing stopped because the project was deleted.");
+      }
+      const message = err instanceof Error ? err.message : "Failed to save the narration.";
+      await markProjectFailed(projectId, message);
+      throw new Error(message);
+    }
+  });
 
 /**
  * Drive the pipeline forward one step. Safe to call repeatedly:
