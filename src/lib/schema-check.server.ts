@@ -43,9 +43,11 @@ export const REQUIRED_SCHEMA: Array<{
       "stitches_ahead",
       "chunk_state",
       "chunks_ahead",
+      "upload_total_bytes",
+      "upload_sent_bytes",
     ],
     migration:
-      "20260805120000_render_job_stall_notice / 20260725101708_add_chunks_to_render_jobs / 20260809000001_render_job_queue_position / 20260809000002_render_job_stitch_state / 20260811000001_render_job_chunk_state",
+      "20260805120000_render_job_stall_notice / 20260725101708_add_chunks_to_render_jobs / 20260809000001_render_job_queue_position / 20260809000002_render_job_stitch_state / 20260811000001_render_job_chunk_state / 20260815000001_render_job_stitch_detail",
   },
   {
     table: "render_clip_slices",
@@ -131,7 +133,9 @@ export type SchemaProblem = {
 function isUnavailablePrivilegedClient(error: unknown): boolean {
   return (
     error instanceof Error &&
-    /Missing Supabase environment variable\(s\):.*(?:SERVICE_ROLE_KEY|SUPABASE_URL)/i.test(error.message)
+    /Missing Supabase environment variable\(s\):.*(?:SERVICE_ROLE_KEY|SUPABASE_URL)/i.test(
+      error.message,
+    )
   );
 }
 
@@ -154,7 +158,7 @@ export function isMissingSchemaCode(code: string | undefined | null): boolean {
  * class of failure and should not become a general health gate.
  */
 export async function findSchemaProblems(): Promise<SchemaProblem[]> {
-  let supabaseAdmin: typeof import("@/integrations/supabase/client.server")["supabaseAdmin"];
+  let supabaseAdmin: (typeof import("@/integrations/supabase/client.server"))["supabaseAdmin"];
   try {
     ({ supabaseAdmin } = await import("@/integrations/supabase/client.server"));
   } catch (error) {

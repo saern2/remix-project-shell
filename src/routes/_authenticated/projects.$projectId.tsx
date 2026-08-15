@@ -411,7 +411,7 @@ function ProjectDetail() {
       const { data, error } = await supabase
         .from("render_jobs")
         .select(
-          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, queue_position, queue_estimate_seconds, stitch_state, stitches_ahead, chunk_state, chunks_ahead, created_at",
+          "id, status, progress_pct, output_url, error, stall_notice, chunks_total, chunks_completed, queue_position, queue_estimate_seconds, stitch_state, stitches_ahead, chunk_state, chunks_ahead, upload_total_bytes, upload_sent_bytes, created_at",
         )
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
@@ -1024,7 +1024,11 @@ function ProjectDetail() {
                         {/* Most specific first. "Rendering video…" is the
                             fallback and was, for 36 minutes, the only thing a
                             waiting project ever said. */}
-                        {describeStitchPhase(renderJob.stitch_state, renderJob.stitches_ahead) ??
+                        {describeStitchPhase(renderJob.stitch_state, renderJob.stitches_ahead, {
+                          chunksTotal: renderJob.chunks_total,
+                          uploadSentBytes: renderJob.upload_sent_bytes,
+                          uploadTotalBytes: renderJob.upload_total_bytes,
+                        }) ??
                           describeChunkPhase(
                             renderJob.chunk_state,
                             renderJob.chunks_ahead,

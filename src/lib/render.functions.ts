@@ -802,6 +802,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       stitches_ahead?: number | null;
       chunk_state?: string | null;
       chunks_ahead?: number | null;
+      upload_total_bytes?: number | null;
+      upload_sent_bytes?: number | null;
       stalled?: boolean;
       health?: {
         state?: string;
@@ -843,8 +845,18 @@ export const pollRenderJob = createServerFn({ method: "POST" })
     const stitchState =
       payload.stitch_state === "waiting" ||
       payload.stitch_state === "combining" ||
+      payload.stitch_state === "finalizing" ||
       payload.stitch_state === "uploading"
         ? payload.stitch_state
+        : null;
+    // Bytes only mean something mid-upload; anywhere else they are stale.
+    const uploadTotalBytes =
+      stitchState === "uploading" && typeof payload.upload_total_bytes === "number"
+        ? payload.upload_total_bytes
+        : null;
+    const uploadSentBytes =
+      stitchState === "uploading" && typeof payload.upload_sent_bytes === "number"
+        ? payload.upload_sent_bytes
         : null;
     const stitchesAhead =
       stitchState === "waiting" && typeof payload.stitches_ahead === "number"
@@ -886,6 +898,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       stitches_ahead?: number | null;
       chunk_state?: string | null;
       chunks_ahead?: number | null;
+      upload_total_bytes?: number | null;
+      upload_sent_bytes?: number | null;
     } = {
       status,
       progress_pct: progress,
@@ -899,6 +913,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       stitches_ahead: stitchesAhead,
       chunk_state: chunkState,
       chunks_ahead: chunksAhead,
+      upload_total_bytes: uploadTotalBytes,
+      upload_sent_bytes: uploadSentBytes,
     };
     if (status === "completed") {
       jobUpdate.completed_at = new Date().toISOString();
@@ -910,6 +926,8 @@ export const pollRenderJob = createServerFn({ method: "POST" })
       jobUpdate.chunks_ahead = null;
       jobUpdate.stitch_state = null;
       jobUpdate.stitches_ahead = null;
+      jobUpdate.upload_total_bytes = null;
+      jobUpdate.upload_sent_bytes = null;
       if (chunksTotal != null) jobUpdate.chunks_completed = chunksTotal;
     }
     if (status === "failed") {

@@ -80,9 +80,10 @@ describe("describeQueuePosition", () => {
 describe("describeStitchPhase", () => {
   // The window this covers used to show "51 of 51 segments rendered" and
   // nothing else for up to 15 minutes.
-  it("distinguishes waiting from combining from uploading", () => {
+  it("distinguishes waiting from combining from finalizing from uploading", () => {
     expect(describeStitchPhase("waiting", 2)).toBe("Waiting to combine — 2 ahead in queue.");
     expect(describeStitchPhase("combining", null)).toBe("Combining segments…");
+    expect(describeStitchPhase("finalizing", null)).toBe("Finalizing for playback…");
     expect(describeStitchPhase("uploading", null)).toBe("Uploading the finished video…");
   });
 
@@ -97,7 +98,41 @@ describe("describeStitchPhase", () => {
     expect(describeStitchPhase(null, null)).toBeNull();
     expect(describeStitchPhase(undefined, undefined)).toBeNull();
     // An unknown state from a mismatched worker version degrades to no notice,
-    // never to a wrong one.
-    expect(describeStitchPhase("finalizing", 1)).toBeNull();
+    // never to a wrong one. ("finalizing" was this test's example of an unknown
+    // state until 2026-08-15, when it became a real one — the +faststart pass.)
+    expect(describeStitchPhase("polishing", 1)).toBeNull();
+  });
+
+  it("names the segment count while combining", () => {
+    // "Combining 30 segments…" explains a minute of work; "Combining…" invites
+    // the user to wonder if it hung.
+    expect(describeStitchPhase("combining", null, { chunksTotal: 30 })).toBe(
+      "Combining 30 segments…",
+    );
+    expect(describeStitchPhase("combining", null, { chunksTotal: 1 })).toBe("Combining 1 segment…");
+    expect(describeStitchPhase("combining", null, { chunksTotal: 0 })).toBe("Combining segments…");
+  });
+
+  it("counts bytes through the upload of a 1.2 GB file", () => {
+    // MEASURED 2026-08-15: 1,207,708,054 bytes at ~15 MB/s per connection is
+    // ~80 seconds of what used to be a frozen bar at 90%. Decimal units, so
+    // this file reads "1.2 GB" here exactly as it does in the worker logs.
+    const total = 1_207_708_054;
+    expect(
+      describeStitchPhase("uploading", null, {
+        uploadSentBytes: 640_000_000,
+        uploadTotalBytes: total,
+      }),
+    ).toBe("Uploading the finished video — 640 MB of 1.2 GB…");
+    // Bytes can run slightly ahead of total on the last callback; never show
+    // more than 100%.
+    expect(
+      describeStitchPhase("uploading", null, {
+        uploadSentBytes: total + 5000,
+        uploadTotalBytes: total,
+      }),
+    ).toBe("Uploading the finished video — 1.2 GB of 1.2 GB…");
+    // Without counts (older worker mid-deploy), the old wording stands.
+    expect(describeStitchPhase("uploading", null, {})).toBe("Uploading the finished video…");
   });
 });

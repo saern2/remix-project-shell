@@ -791,6 +791,8 @@ export type Database = {
           stitch_state: string | null
           stitches_ahead: number | null
           updated_at: string
+          upload_sent_bytes: number | null
+          upload_total_bytes: number | null
         }
         Insert: {
           chunk_state?: string | null
@@ -813,6 +815,8 @@ export type Database = {
           stitch_state?: string | null
           stitches_ahead?: number | null
           updated_at?: string
+          upload_sent_bytes?: number | null
+          upload_total_bytes?: number | null
         }
         Update: {
           chunk_state?: string | null
@@ -835,6 +839,8 @@ export type Database = {
           stitch_state?: string | null
           stitches_ahead?: number | null
           updated_at?: string
+          upload_sent_bytes?: number | null
+          upload_total_bytes?: number | null
         }
         Relationships: [
           {

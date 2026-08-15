@@ -1673,6 +1673,32 @@ grant execute on function public.get_generation_stats(text, uuid, text) to servi
 comment on function public.get_generation_stats(text, uuid, text) is
   'All /stats panels in one call, aggregated in SQL. SECURITY DEFINER and service_role-only: the scope argument is enforced by getGenerationStats, which requires admin before passing platform scope. Platform LIFETIME totals include analytics_baseline; every other panel is measured events only.';
 
+-- ── 20260815000001_render_job_stitch_detail ──────────────────────────────────
+-- The last 14% of a render is three phases, not two freezes: 'finalizing'
+-- names the +faststart full-file rewrite (~89s on 1.2 GB, ffmpeg's own
+-- progress stops during it), and the upload byte columns feed
+-- "Uploading — 640 MB of 1.2 GB" instead of a bar frozen at the old 90%.
+
+alter table public.render_jobs
+  drop constraint if exists render_jobs_stitch_state_check;
+
+alter table public.render_jobs
+  add constraint render_jobs_stitch_state_check
+  check (stitch_state is null or stitch_state in ('waiting', 'combining', 'finalizing', 'uploading'));
+
+alter table public.render_jobs
+  add column if not exists upload_total_bytes bigint,
+  add column if not exists upload_sent_bytes bigint;
+
+comment on column public.render_jobs.stitch_state is
+  'Phase of the final combine once all chunks are rendered: waiting (no stitch slot free), combining, finalizing (+faststart rewrite), or uploading. Null while chunks are still rendering and after completion.';
+
+comment on column public.render_jobs.upload_total_bytes is
+  'Size of the finished video being uploaded, while stitch_state = uploading. Null otherwise.';
+
+comment on column public.render_jobs.upload_sent_bytes is
+  'Bytes of the finished video already handed to the storage connection, while stitch_state = uploading. Null otherwise.';
+
 -- ── Verification: what you asked to confirm ─────────────────────────────────
 -- Run this last. Every row should say 'present'.
 
@@ -1701,5 +1727,7 @@ from (
     ('generation_events trigger',        exists (select 1 from pg_trigger where tgname='trg_projects_generation_event')),
     ('get_generation_stats (fn)',        exists (select 1 from pg_proc where proname='get_generation_stats')),
     ('analytics_baseline (table)',       to_regclass('public.analytics_baseline') is not null),
-    ('analytics_baseline seeded',        to_regclass('public.analytics_baseline') is not null and exists (select 1 from public.analytics_baseline where id = 1))
+    ('analytics_baseline seeded',        to_regclass('public.analytics_baseline') is not null and exists (select 1 from public.analytics_baseline where id = 1)),
+    ('render_jobs.upload_sent_bytes',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='upload_sent_bytes')),
+    ('stitch_state allows finalizing',   exists (select 1 from pg_constraint where conname='render_jobs_stitch_state_check' and pg_get_constraintdef(oid) like '%finalizing%'))
 ) as checks(check_name, present);

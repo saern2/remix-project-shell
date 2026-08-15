@@ -14,6 +14,7 @@ const {
   readChunkFailureDetails,
 } = require('./chunkRecovery');
 const { startReconciler, stopReconciler } = require('./reconciler');
+const { CHUNK_BAND_END } = require('./progressBands');
 const admission = require('./admissionControl');
 const { parentProjectId, shouldPromoteTail, tailPriority } = require('./fairScheduling');
 
@@ -381,11 +382,14 @@ async function getJobStatus(job) {
     // Progress for a chunked render used to sit at 0 until the stitch itself
     // started — the deployed run showed 0% for four and a half minutes while 12
     // of 13 chunks completed. Derive it from the children instead; the stitch
-    // phase keeps the 50-100 band it already sets for itself.
-    if (result.chunks_total > 0 && (result.progress_pct ?? 0) < 50) {
+    // writes into its own band (CHUNK_BAND_END and up) once it starts, so any
+    // value below that means the chunks are still the story. Band widths match
+    // measured wall-time shares — see progressBands.js for the measurement and
+    // for how far off they can drift when the load shape differs.
+    if (result.chunks_total > 0 && (result.progress_pct ?? 0) < CHUNK_BAND_END) {
       result.progress_pct = Math.min(
-        45,
-        Math.round((result.chunks_completed / result.chunks_total) * 45),
+        CHUNK_BAND_END,
+        Math.round((result.chunks_completed / result.chunks_total) * CHUNK_BAND_END),
       );
     }
 
@@ -471,14 +475,23 @@ async function getJobStatus(job) {
     // ── Stitch visibility (round 18, item 4a) ─────────────────────────────
     // Once every chunk is done this job's BullMQ state stops describing chunk
     // progress and starts describing the stitch, and the client showed "51 of
-    // 51 segments rendered" for the whole 15m10s worst case. Three states the
+    // 51 segments rendered" for the whole 15m10s worst case. Four states the
     // user can actually distinguish:
-    //   waiting  — chunks done, no stitch slot free yet; say how many are ahead
-    //   combining — the concat/mux is running
-    //   uploading — the finished file is leaving the machine
+    //   waiting    — chunks done, no stitch slot free yet; say how many ahead
+    //   combining  — the concat/mux is running
+    //   finalizing — ffmpeg's +faststart second pass is rewriting the file so
+    //                it can start playing before it fully downloads; out_time
+    //                stops moving during it, so it needs its own name
+    //   uploading  — the finished file is leaving the machine
     if (result.chunks_total > 0 && result.chunks_completed >= result.chunks_total) {
       if (data._status === 'uploading') {
         result.stitch_state = 'uploading';
+        // Bytes for the label ("640 MB of 1.2 GB") and for judging a stall by
+        // eye. Written by the upload's progress callback every ~2s.
+        result.upload_total_bytes = data._uploadTotalBytes ?? null;
+        result.upload_sent_bytes = data._uploadSentBytes ?? null;
+      } else if (data._status === 'finalizing') {
+        result.stitch_state = 'finalizing';
       } else if (state === 'active' || data._status === 'stitching') {
         result.stitch_state = 'combining';
       } else if (state === 'waiting' || state === 'delayed' || state === 'prioritized') {

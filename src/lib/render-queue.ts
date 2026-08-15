@@ -66,30 +66,68 @@ export function describeQueuePosition(
  *
  * The window between the last chunk and the delivered file used to show
  * "51 of 51 segments rendered" and nothing else — 15m10s in the worst observed
- * case. Three different things happen in that window and the worker now reports
+ * case. Four different things happen in that window and the worker now reports
  * which one:
  *
- *   waiting   — every chunk is done but both stitch slots are busy with other
- *               projects. The one thing worth knowing is how many are ahead.
- *   combining — the concat/mux is actually running.
- *   uploading — the finished video is leaving the machine.
+ *   waiting    — every chunk is done but both stitch slots are busy with other
+ *                projects. The one thing worth knowing is how many are ahead.
+ *   combining  — the concat/mux is actually running. Says how many segments,
+ *                because "Combining 30 segments" explains a minute of work the
+ *                way "Combining…" does not.
+ *   finalizing — ffmpeg's +faststart pass rewrites the whole file so playback
+ *                can start before it finishes downloading (~89s on 1.2 GB).
+ *                Progress genuinely holds still here; named so it reads as a
+ *                step, not a hang.
+ *   uploading  — the finished video is leaving the machine. With byte counts
+ *                when known: a frozen "Uploading…" over 1.2 GB reads as stuck,
+ *                "640 MB of 1.2 GB" reads as what it is.
  */
 export function describeStitchPhase(
   state: string | null | undefined,
   stitchesAhead: number | null | undefined,
+  detail?: {
+    chunksTotal?: number | null;
+    uploadSentBytes?: number | null;
+    uploadTotalBytes?: number | null;
+  },
 ): string | null {
   switch (state) {
     case "waiting":
       return stitchesAhead != null && stitchesAhead > 0
         ? `Waiting to combine — ${stitchesAhead} ahead in queue.`
         : "Waiting to combine segments…";
-    case "combining":
-      return "Combining segments…";
-    case "uploading":
+    case "combining": {
+      const segments = detail?.chunksTotal;
+      return segments != null && segments > 0
+        ? `Combining ${segments} segment${segments === 1 ? "" : "s"}…`
+        : "Combining segments…";
+    }
+    case "finalizing":
+      return "Finalizing for playback…";
+    case "uploading": {
+      const total = detail?.uploadTotalBytes;
+      const sent = detail?.uploadSentBytes;
+      if (total != null && total > 0 && sent != null && sent >= 0) {
+        return `Uploading the finished video — ${describeBytes(Math.min(sent, total))} of ${describeBytes(total)}…`;
+      }
       return "Uploading the finished video…";
+    }
     default:
       return null;
   }
+}
+
+/**
+ * "640 MB", "1.2 GB". Whole megabytes below a gigabyte, one decimal above —
+ * the same coarseness rule as describeWait: more precision would invite the
+ * user to time it. Decimal units (1 GB = 10⁹ bytes), because that is how the
+ * same file is described everywhere else — the 1,207,708,054-byte output that
+ * prompted this is "1.2 GB" in every log line and conversation about it.
+ */
+export function describeBytes(bytes: number): string {
+  const GB = 1_000_000_000;
+  if (bytes >= GB) return `${(Math.round((bytes / GB) * 10) / 10).toString()} GB`;
+  return `${Math.max(1, Math.round(bytes / 1_000_000))} MB`;
 }
 
 /**

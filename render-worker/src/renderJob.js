@@ -51,6 +51,12 @@ const { DelayedError } = require('bullmq');
 const { parentProjectId } = require('./fairScheduling');
 const admission = require('./admissionControl');
 const maintenance = require('./maintenance');
+const {
+  CHUNK_BAND_END,
+  COMBINE_BAND_END,
+  UPLOAD_BAND_START,
+  parseFfmpegOutTimeSeconds,
+} = require('./progressBands');
 
 // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Redis client (cancel polling only) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
 // Separate connection from queue.js to avoid circular dependency.
@@ -563,8 +569,13 @@ async function runFfmpeg({ jobId, clipInputs, audioPath, scriptPath, finalVideoL
  * @param {string} filePath      - Local file path to upload
  * @param {string} uploadUrl     - Pre-signed PUT URL (e.g. Supabase Storage)
  * @param {AbortSignal} signal
+ * @param {(progress: {sentBytes: number, totalBytes: number}) => void} [onProgress]
+ *   Called at most every ~2s (and once at the end) with bytes handed to the
+ *   request so far. Counts what left the read stream, which runs slightly
+ *   ahead of the wire by the socket buffer — the right fidelity for a
+ *   progress bar and free of any extra buffering (see below).
  */
-async function uploadOutput(filePath, uploadUrl, signal) {
+async function uploadOutput(filePath, uploadUrl, signal, onProgress) {
   const stat = await fsp.stat(filePath);
   const rssMb = () => Math.round(process.memoryUsage().rss / 1048576);
 
@@ -632,7 +643,33 @@ async function uploadOutput(filePath, uploadUrl, signal) {
 
     // pipeline destroys both ends on failure, so a broken socket cannot leave
     // the read stream open holding a descriptor.
-    pipelineAsync(createReadStream(filePath, { highWaterMark: 1 << 20 }), req).catch(reject);
+    const source = createReadStream(filePath, { highWaterMark: 1 << 20 });
+
+    // ── Byte counting WITHOUT buffering ─────────────────────────────────────
+    // The memory discipline above (http.request, not fetch; peak RSS 90 MB on
+    // a 1.3 GB file) must survive this observer, so it only observes: pipeline
+    // drives the stream exactly as before, and this listener sees each chunk
+    // as it passes and keeps a NUMBER — it never retains, copies or re-emits a
+    // buffer, never pauses or resumes, and backpressure stays pipeline's.
+    // Throttled so a 1.2 GB upload costs ~40 callbacks, not ~1200.
+    if (onProgress) {
+      let sentBytes = 0;
+      let lastReportAt = 0;
+      source.on('data', (chunk) => {
+        sentBytes += chunk.length;
+        const nowMs = Date.now();
+        if (nowMs - lastReportAt >= 2000 || sentBytes >= stat.size) {
+          lastReportAt = nowMs;
+          try {
+            onProgress({ sentBytes, totalBytes: stat.size });
+          } catch {
+            // Progress display must never break an upload.
+          }
+        }
+      });
+    }
+
+    pipelineAsync(source, req).catch(reject);
   });
 
   if (response.status < 200 || response.status >= 300) {
@@ -768,7 +805,10 @@ async function processStitchJob(job, token) {
 
   try {
     await job.updateData({ ...payload, _status: 'stitching' });
-    await job.updateProgress(50);
+    // The bottom of the stitch's band. Bands are sized to measured wall-time
+    // shares (progressBands.js): the old 50 meant "30 of 30 chunks" displayed
+    // as 44% and the final 14% of work owned 56% of the bar.
+    await job.updateProgress(CHUNK_BAND_END);
 
     // Write concat file
     const concatFilePath = path.join(tempDir, 'chunks.txt');
@@ -830,9 +870,43 @@ async function processStitchJob(job, token) {
         ])
         .output(outputPath);
 
+      // ── Live progress through the two freezes ──────────────────────────
+      // The bar used to jump 50 → 90 with nothing in between: the whole
+      // concat (1m35s-2m12s measured) was one freeze. ffmpeg already tells us
+      // where it is — the same stderr stats lines this handler stores — so
+      // the combine animates through its band, and the +faststart second
+      // pass (out_time stops during it) is named instead of frozen.
+      //
+      // Fire-and-forget writes, deliberately: progress is cosmetic and a
+      // Redis hiccup must never fail a stitch that is otherwise fine.
+      const totalOutputSeconds = (payload.clips ?? []).reduce(
+        (sum, clip) => sum + (clip.end - clip.start),
+        0,
+      );
+      let lastCombinePct = CHUNK_BAND_END;
+      let finalizing = false;
+
       cmd.on('stderr', (line) => {
         stderrLines.push(line);
         if (stderrLines.length > 1000) stderrLines = stderrLines.slice(-500);
+
+        if (finalizing) return;
+        if (String(line).includes('Starting second pass')) {
+          finalizing = true;
+          job.updateData({ ...payload, _status: 'finalizing' }).catch(() => {});
+          job.updateProgress(COMBINE_BAND_END).catch(() => {});
+          return;
+        }
+        const outSeconds = parseFfmpegOutTimeSeconds(line);
+        if (outSeconds == null || !(totalOutputSeconds > 0)) return;
+        const pct =
+          CHUNK_BAND_END +
+          Math.min(1, outSeconds / totalOutputSeconds) * (COMBINE_BAND_END - CHUNK_BAND_END);
+        // Whole points only: one Redis write per visible movement, not per line.
+        if (Math.floor(pct) > lastCombinePct) {
+          lastCombinePct = Math.floor(pct);
+          job.updateProgress(lastCombinePct).catch(() => {});
+        }
       });
 
       cmd.on('error', (err) => {
@@ -857,12 +931,33 @@ async function processStitchJob(job, token) {
     } finally {
       releaseFfmpeg();
     }
-    await job.updateProgress(90);
+    await job.updateProgress(COMBINE_BAND_END);
 
-    // Upload
+    // Upload — the second former freeze (90 → 100 with nothing between, over
+    // a 1.2 GB file at ~15 MB/s). Bytes drive the band now, and the same
+    // counts feed the "640 MB of 1.2 GB" label through job data.
     if (payload.output_upload_url) {
-      await job.updateData({ ...payload, _status: 'uploading' });
-      await uploadOutput(outputPath, payload.output_upload_url, ffController.signal);
+      const uploadingData = { ...payload, _status: 'uploading' };
+      await job.updateData(uploadingData);
+      await job.updateProgress(UPLOAD_BAND_START);
+      await uploadOutput(
+        outputPath,
+        payload.output_upload_url,
+        ffController.signal,
+        ({ sentBytes, totalBytes }) => {
+          const pct =
+            UPLOAD_BAND_START +
+            Math.min(1, totalBytes > 0 ? sentBytes / totalBytes : 0) * (100 - UPLOAD_BAND_START);
+          job.updateProgress(Math.min(99, Math.floor(pct))).catch(() => {});
+          job
+            .updateData({
+              ...uploadingData,
+              _uploadSentBytes: sentBytes,
+              _uploadTotalBytes: totalBytes,
+            })
+            .catch(() => {});
+        },
+      );
     } else {
       logger.info({ jobId: parentJobId }, 'No output_upload_url provided, skipping upload');
     }
@@ -1714,4 +1809,5 @@ module.exports = {
   chunkDeadlineMs,
   createChunkWatchdog,
   stitchDeadlineMs,
+  uploadOutput,
 };
