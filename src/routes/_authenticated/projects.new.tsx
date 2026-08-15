@@ -43,7 +43,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { checkWebGpu } from "@/lib/tts/webgpu";
 import { checkScript, extractScriptText, splitScriptIntoSentences } from "@/lib/tts/script-input";
-import { TTS_VOICES, type TtsProgress } from "@/lib/tts/generate";
+import { TTS_VOICES, parseDtypeParam, type TtsProgress } from "@/lib/tts/generate";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -248,6 +248,67 @@ function NewProject() {
   };
 
   const runPersistScript = useServerFn(persistScriptTranscript);
+
+  // ── The dtype comparison harness ──────────────────────────────────────────
+  // Speaks PREVIEW_TEXT in the selected voice and plays it. Creates NOTHING —
+  // no project, no upload, no rows. `?dtype=fp16|q8` on this page selects the
+  // model variant (default fp32), so the operator can hear the dtypes on
+  // identical input and read seconds-of-speech-per-second-of-compute for each
+  // before one is chosen. Doubles as a voice-preview affordance for users.
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewNote, setPreviewNote] = useState<string | null>(null);
+  const handlePreviewVoice = async () => {
+    if (webGpu && !webGpu.ok) {
+      toast.error(webGpu.message);
+      return;
+    }
+    setPreviewBusy(true);
+    setPreviewNote(null);
+    try {
+      const dtype = parseDtypeParam(window.location.search);
+      const { loadEngine, generateSpeech, PREVIEW_TEXT } = await import("@/lib/tts/generate");
+      const engine = await loadEngine(
+        (event) => {
+          if (event.stage === "model") {
+            const pct =
+              event.totalBytes > 0 ? Math.round((event.loadedBytes / event.totalBytes) * 100) : 0;
+            setPreviewNote(`Downloading the ${dtype} voice model — ${pct}%…`);
+          }
+        },
+        { dtype },
+      );
+      setPreviewNote("Generating the preview…");
+      const startedAt = performance.now();
+      const speech = await generateSpeech({
+        sentences: splitScriptIntoSentences(PREVIEW_TEXT),
+        voice,
+        engine,
+        onProgress: () => {},
+      });
+      const computeSec = (performance.now() - startedAt) / 1000;
+      const ratio = speech.durationSec / computeSec;
+      const note =
+        `${speech.durationSec.toFixed(1)}s of speech in ${computeSec.toFixed(1)}s — ` +
+        `${ratio.toFixed(1)}× realtime (${dtype})`;
+      setPreviewNote(note);
+      console.info("[tts-harness]", {
+        dtype,
+        voice,
+        speechSec: Number(speech.durationSec.toFixed(2)),
+        computeSec: Number(computeSec.toFixed(2)),
+        speedRatio: Number(ratio.toFixed(2)),
+      });
+      const url = URL.createObjectURL(speech.wavBlob);
+      const player = new Audio(url);
+      player.addEventListener("ended", () => URL.revokeObjectURL(url), { once: true });
+      await player.play();
+    } catch (err) {
+      setPreviewNote(null);
+      toast.error(describeUserFacingError(err));
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
 
   /**
    * The script path. Generation runs FIRST, entirely in this tab, with no
@@ -586,9 +647,24 @@ function NewProject() {
                     </SelectContent>
                   </Select>
                   <p className="text-xs text-muted-foreground">
-                    Speech is generated on your computer — the first use downloads a ~330 MB voice
-                    model that your browser keeps for next time.
+                    Speech is generated on your computer — the first use downloads a voice model
+                    that your browser keeps for next time.
                   </p>
+                  <div className="flex items-center gap-3 pt-1">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={previewBusy || busy || (webGpu != null && !webGpu.ok)}
+                      onClick={() => void handlePreviewVoice()}
+                    >
+                      {previewBusy ? <Loader2 className="mr-2 h-3 w-3 animate-spin" /> : null}
+                      Preview voice
+                    </Button>
+                    {previewNote ? (
+                      <p className="text-xs text-muted-foreground">{previewNote}</p>
+                    ) : null}
+                  </div>
                 </div>
               </TabsContent>
             </Tabs>

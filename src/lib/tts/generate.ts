@@ -43,6 +43,37 @@ export type TtsProgress =
   | { stage: "generating"; sentence: number; totalSentences: number; secondsGenerated: number }
   | { stage: "assembling" };
 
+/**
+ * The dtypes under evaluation. fp32 is the shipped default; fp16 and q8 exist
+ * so the operator can HEAR them before one is chosen — fp16 on WebGPU has a
+ * history of correctness bugs with this model (garbled output, not subtle
+ * quality loss), which makes listening a requirement, not a preference.
+ */
+export type TtsDtype = "fp32" | "fp16" | "q8";
+
+const DTYPE_VALUES: TtsDtype[] = ["fp32", "fp16", "q8"];
+
+/**
+ * The dtype comparison harness's only entry point: `?dtype=fp16` on the
+ * new-project page. Anything unrecognised is fp32 — the shipped decision —
+ * so a mistyped param can never silently ship a quantised model.
+ */
+export function parseDtypeParam(search: string): TtsDtype {
+  const value = new URLSearchParams(search).get("dtype");
+  return DTYPE_VALUES.includes(value as TtsDtype) ? (value as TtsDtype) : "fp32";
+}
+
+/**
+ * What the Preview voice button speaks: fixed, so every dtype and voice is
+ * compared on identical input. Written to exercise what narration actually
+ * contains — numbers, a proper noun, a question, sibilants and plosives —
+ * in ~15 seconds of speech.
+ */
+export const PREVIEW_TEXT =
+  "In 1969, three astronauts crossed two hundred and forty thousand miles of empty space. " +
+  "What were they thinking, strapped above six million pounds of fuel? " +
+  "Stephanie says the answer is simple: they trusted the process, checked the systems twice, and kept talking.";
+
 export type GeneratedSpeech = {
   wavBlob: Blob;
   sentences: Array<{ text: string; start_ms: number; end_ms: number }>;
@@ -83,11 +114,14 @@ export type TtsEngine = {
  * known quality risk, and the reported ~10s-of-speech-per-1s-of-compute
  * figure is the fp32 WebGPU number.
  */
-export async function loadEngine(onProgress: (progress: TtsProgress) => void): Promise<TtsEngine> {
+export async function loadEngine(
+  onProgress: (progress: TtsProgress) => void,
+  opts: { dtype?: TtsDtype } = {},
+): Promise<TtsEngine> {
   const { KokoroTTS } = await import("kokoro-js");
   const tts = await KokoroTTS.from_pretrained(TTS_MODEL_ID, {
     device: "webgpu",
-    dtype: "fp32",
+    dtype: opts.dtype ?? "fp32",
     progress_callback: (event: {
       status?: string;
       file?: string;

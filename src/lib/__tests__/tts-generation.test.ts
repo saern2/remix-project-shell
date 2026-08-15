@@ -14,9 +14,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  PREVIEW_TEXT,
   ScriptTooLongError,
   TTS_VOICES,
   generateSpeech,
+  parseDtypeParam,
   type TtsEngine,
   type TtsProgress,
 } from "../tts/generate";
@@ -306,6 +308,28 @@ describe("the server-side gate", () => {
     const rows = contiguous([5000]);
     expect(validateScriptSentences(rows, 5.001)).toBeNull();
     expect(validateScriptSentences(rows, 5.003)).toMatch(/does not match/i);
+  });
+});
+
+describe("the dtype comparison harness", () => {
+  it("defaults to fp32 for anything it does not recognise", () => {
+    // fp32 is the shipped decision; a mistyped param must never silently
+    // select a quantised model.
+    expect(parseDtypeParam("")).toBe("fp32");
+    expect(parseDtypeParam("?dtype=fp16")).toBe("fp16");
+    expect(parseDtypeParam("?dtype=q8")).toBe("q8");
+    expect(parseDtypeParam("?dtype=q4")).toBe("fp32");
+    expect(parseDtypeParam("?dtype=FP16")).toBe("fp32");
+    expect(parseDtypeParam("?other=1")).toBe("fp32");
+  });
+
+  it("previews a fixed paragraph that splits into full sentences", () => {
+    // Fixed input is the point: every dtype and voice is judged on identical
+    // material, and the material exercises numbers, a name and a question.
+    const sentences = splitScriptIntoSentences(PREVIEW_TEXT);
+    expect(sentences.length).toBeGreaterThanOrEqual(3);
+    expect(PREVIEW_TEXT).toMatch(/\d/);
+    expect(PREVIEW_TEXT).toMatch(/\?/);
   });
 });
 
