@@ -1,8 +1,8 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { supabase } from "@/integrations/supabase/client";
-import { startPipeline } from "@/lib/pipeline.functions";
+import { persistScriptTranscript, startPipeline } from "@/lib/pipeline.functions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -39,6 +39,11 @@ import {
   readAudioDuration,
 } from "@/lib/audio-limits";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { checkWebGpu } from "@/lib/tts/webgpu";
+import { checkScript, extractScriptText, splitScriptIntoSentences } from "@/lib/tts/script-input";
+import { TTS_VOICES, type TtsProgress } from "@/lib/tts/generate";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -72,6 +77,19 @@ function NewProject() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState<string>("");
+  const [mode, setMode] = useState<"audio" | "script">("audio");
+  const [script, setScript] = useState("");
+  const [voice, setVoice] = useState<string>(TTS_VOICES[0].id);
+  const [scriptWarning, setScriptWarning] = useState<string | null>(null);
+  // null = not yet probed; the probe runs when the script tab is opened, so
+  // the refusal appears BEFORE a script is written, not after.
+  const [webGpu, setWebGpu] = useState<{ ok: boolean; message?: string } | null>(null);
+  useEffect(() => {
+    if (mode !== "script" || webGpu !== null) return;
+    void checkWebGpu().then((verdict) =>
+      setWebGpu(verdict.ok ? { ok: true } : { ok: false, message: verdict.message }),
+    );
+  }, [mode, webGpu]);
   const { data: existingProjects = [], isLoading: projectsLoading } = useProjects();
   const { isAdmin } = useIsAdmin();
   const usage = projectUsage(existingProjects.length, { isAdmin });
@@ -229,6 +247,131 @@ function NewProject() {
     navigate({ to: "/projects/$projectId", params: { projectId: project.id } });
   };
 
+  const runPersistScript = useServerFn(persistScriptTranscript);
+
+  /**
+   * The script path. Generation runs FIRST, entirely in this tab, with no
+   * project row anywhere — an interrupted tab leaves nothing at all, not even
+   * an orphaned 'uploading' project. Persistence begins only after the
+   * sample-exact gate has passed, and from there this is the upload path's
+   * own sequence: project row, signed PUT, audio_assets, then one server
+   * call that writes transcript + scenes and hands over to the pipeline.
+   */
+  const handleScriptSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (webGpu && !webGpu.ok) {
+      toast.error(webGpu.message);
+      return;
+    }
+    const verdict = checkScript(script);
+    if (!verdict.ok) {
+      toast.error(verdict.message);
+      return;
+    }
+
+    setBusy(true);
+    setProgress(0);
+    let projectId: string | null = null;
+    try {
+      // ── Generate: browser only, nothing persisted anywhere ──────────────
+      setStage("Loading the voice engine…");
+      const { loadEngine, generateSpeech } = await import("@/lib/tts/generate");
+      const onProgress = (event: TtsProgress) => {
+        if (event.stage === "model") {
+          const pct = event.totalBytes > 0 ? (event.loadedBytes / event.totalBytes) * 100 : 0;
+          setStage("Downloading the voice model — one-time, kept by your browser…");
+          setProgress(Math.round(pct));
+        } else if (event.stage === "generating") {
+          setStage(
+            `Generating speech — sentence ${event.sentence} of ${event.totalSentences} ` +
+              `(${formatDuration(Math.round(event.secondsGenerated))} of narration so far)`,
+          );
+          setProgress(Math.round((event.sentence / event.totalSentences) * 100));
+        } else {
+          setStage("Assembling the audio…");
+          setProgress(100);
+        }
+      };
+      const engine = await loadEngine(onProgress);
+      const sentences = splitScriptIntoSentences(script);
+      const speech = await generateSpeech({ sentences, voice, engine, onProgress });
+
+      // ── Persist: the upload path's own sequence, verbatim ───────────────
+      setStage("Creating project…");
+      setProgress(0);
+      const { data: userData } = await supabase.auth.getUser();
+      if (!userData.user) throw new Error("Not signed in.");
+      const { data: project, error: projectError } = await supabase
+        .from("projects")
+        .insert({
+          name: name.trim() || "Untitled project",
+          status: "uploading",
+          user_id: userData.user.id,
+          niche: category === "space" ? "space" : "general",
+          category: category === "none" ? null : category,
+          clip_duration_seconds: fixedClips ? clipDuration : null,
+        })
+        .select("id")
+        .single();
+      if (projectError || !project) {
+        throw new Error(
+          isProjectLimitError(projectError)
+            ? PROJECT_LIMIT_MESSAGE
+            : (projectError?.message ?? "Failed to create project."),
+        );
+      }
+      projectId = project.id;
+
+      const path = `${project.id}/${crypto.randomUUID()}.wav`;
+      const { data: signed, error: signedError } = await supabase.storage
+        .from("audio")
+        .createSignedUploadUrl(path);
+      if (signedError || !signed) {
+        throw new Error(signedError?.message ?? "Could not get upload URL.");
+      }
+
+      setStage("Uploading narration…");
+      const wavFile = new File([speech.wavBlob], "narration.wav", { type: "audio/wav" });
+      await uploadWithProgress(signed.signedUrl, wavFile, setProgress);
+
+      const { error: assetError } = await supabase.from("audio_assets").insert({
+        project_id: project.id,
+        storage_path: path,
+        filename: "narration.wav",
+        file_size_bytes: wavFile.size,
+        mime_type: "audio/wav",
+      });
+      if (assetError) throw new Error(assetError.message);
+
+      setStage("Setting up scenes…");
+      await runPersistScript({
+        data: {
+          projectId: project.id,
+          fullText: script.trim(),
+          voice,
+          durationSec: speech.durationSec,
+          sentences: speech.sentences,
+        },
+      });
+
+      setBusy(false);
+      toast.success("Project created.");
+      navigate({ to: "/projects/$projectId", params: { projectId: project.id } });
+    } catch (err) {
+      setBusy(false);
+      // Before the project row exists, failure leaves nothing to clean up.
+      // After it, surface the failure on the project the user will find.
+      if (projectId) {
+        await supabase
+          .from("projects")
+          .update({ status: "failed", error_message: describeUserFacingError(err) })
+          .eq("id", projectId)
+          .in("status", ["uploading", "draft"]);
+      }
+      toast.error(describeUserFacingError(err));
+    }
+  };
+
   if (projectsLoading) {
     return (
       <main className="mx-auto max-w-2xl px-5 py-10 sm:px-8">
@@ -318,7 +461,10 @@ function NewProject() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={handleSubmit} className="space-y-6">
+          <form
+            onSubmit={mode === "audio" ? handleSubmit : handleScriptSubmit}
+            className="space-y-6"
+          >
             <div className="space-y-2">
               <Label htmlFor="name">Project name</Label>
               <Input
@@ -330,33 +476,122 @@ function NewProject() {
               />
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="audio">Audio file</Label>
-              <div className="rounded-md border border-dashed p-6 text-center">
-                <Upload className="mx-auto mb-2 h-6 w-6 text-muted-foreground" />
-                <input
-                  id="audio"
-                  type="file"
-                  accept={ACCEPTED}
-                  disabled={busy}
-                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                  className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-medium file:text-secondary-foreground hover:file:bg-secondary/80"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Up to 500 MB and {formatDuration(MAX_AUDIO_DURATION_SECONDS)} of narration. Longer
-                  scripts should be split into separate projects.
-                </p>
-                {file ? (
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    {file.name} — {(file.size / 1024 / 1024).toFixed(1)} MB
+            <Tabs value={mode} onValueChange={(value) => setMode(value as "audio" | "script")}>
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="audio" disabled={busy}>
+                  Upload narration
+                </TabsTrigger>
+                <TabsTrigger value="script" disabled={busy}>
+                  Write a script
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="audio" className="space-y-2 pt-2">
+                <Label htmlFor="audio">Audio file</Label>
+                <div className="rounded-md border border-dashed p-6 text-center">
+                  <Upload className="mx-auto mb-2 h-6 w-6 text-muted-foreground" />
+                  <input
+                    id="audio"
+                    type="file"
+                    accept={ACCEPTED}
+                    disabled={busy}
+                    onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                    className="block w-full text-sm text-muted-foreground file:mr-4 file:rounded-md file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-medium file:text-secondary-foreground hover:file:bg-secondary/80"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Up to 500 MB and {formatDuration(MAX_AUDIO_DURATION_SECONDS)} of narration.
+                    Longer scripts should be split into separate projects.
                   </p>
-                ) : (
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    MP3, WAV, M4A, FLAC, OGG — up to 500 MB
+                  {file ? (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      {file.name} — {(file.size / 1024 / 1024).toFixed(1)} MB
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      MP3, WAV, M4A, FLAC, OGG — up to 500 MB
+                    </p>
+                  )}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="script" className="space-y-4 pt-2">
+                {webGpu && !webGpu.ok ? (
+                  <Alert>
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertTitle>This browser can't generate speech</AlertTitle>
+                    <AlertDescription>{webGpu.message}</AlertDescription>
+                  </Alert>
+                ) : null}
+
+                <div className="space-y-2">
+                  <Label htmlFor="script">Script</Label>
+                  <Textarea
+                    id="script"
+                    value={script}
+                    onChange={(e) => {
+                      setScript(e.target.value);
+                      const verdict = checkScript(e.target.value);
+                      setScriptWarning(verdict.ok ? (verdict.warning ?? null) : null);
+                    }}
+                    placeholder="Paste your narration script here…"
+                    rows={10}
+                    disabled={busy || (webGpu != null && !webGpu.ok)}
+                  />
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">
+                      {script.trim()
+                        ? `${script.trim().split(/\s+/).length} words, ~${splitScriptIntoSentences(script).length} scenes`
+                        : `Spoken in the voice you pick below — up to ${formatDuration(MAX_AUDIO_DURATION_SECONDS)} of narration.`}
+                    </p>
+                    <label className="shrink-0 cursor-pointer text-xs font-medium text-primary hover:underline">
+                      Load from .txt or .docx
+                      <input
+                        type="file"
+                        accept=".txt,.docx,text/plain"
+                        className="hidden"
+                        disabled={busy}
+                        onChange={async (e) => {
+                          const chosen = e.target.files?.[0];
+                          e.target.value = "";
+                          if (!chosen) return;
+                          try {
+                            const text = await extractScriptText(chosen);
+                            setScript(text);
+                            const verdict = checkScript(text);
+                            setScriptWarning(verdict.ok ? (verdict.warning ?? null) : null);
+                          } catch (err) {
+                            toast.error(describeUserFacingError(err));
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+                  {scriptWarning ? (
+                    <p className="text-xs text-amber-600 dark:text-amber-500">{scriptWarning}</p>
+                  ) : null}
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="voice">Voice</Label>
+                  <Select value={voice} onValueChange={setVoice} disabled={busy}>
+                    <SelectTrigger id="voice">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {TTS_VOICES.map((preset) => (
+                        <SelectItem key={preset.id} value={preset.id}>
+                          {preset.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Speech is generated on your computer — the first use downloads a ~330 MB voice
+                    model that your browser keeps for next time.
                   </p>
-                )}
-              </div>
-            </div>
+                </div>
+              </TabsContent>
+            </Tabs>
 
             <div className="space-y-2">
               <Label htmlFor="category">Visual theme</Label>
@@ -429,8 +664,14 @@ function NewProject() {
               <Button type="button" variant="ghost" asChild disabled={busy}>
                 <Link to="/dashboard">Cancel</Link>
               </Button>
-              <Button type="submit" disabled={busy || !file}>
-                {busy ? "Uploading..." : "Create project"}
+              <Button
+                type="submit"
+                disabled={
+                  busy ||
+                  (mode === "audio" ? !file : !script.trim() || (webGpu != null && !webGpu.ok))
+                }
+              >
+                {busy ? "Working…" : "Create project"}
               </Button>
             </div>
           </form>
