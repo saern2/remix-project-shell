@@ -7,12 +7,33 @@
  * because failing 356 scenes over 6 is the wrong trade. That decision is right,
  * and it was also completely invisible — the project went to `ready`, the
  * timeline showed a bare "No clip" card, and the Final video panel said
- * "Everything looks good. Click Render video" over six holes. Clicking it then
+ * "Everything looks good. Click Render video" over the holes. Clicking it then
  * failed server-side with the name of ONE scene, which is the worst possible
- * order to learn it in.
+ * order to learn it in. So the tolerance stays and the silence goes: a hole is
+ * stated on the card in plain language, and the render gate names the count.
  *
- * So the tolerance stays and the silence goes. A hole is stated on the card in
- * plain language, and the render gate names the count up front.
+ * WHY COUNTS, NOT ROWS. The first version of this gate judged coverage from
+ * the timeline's own selected_clips rows, and that input can lie in two ways:
+ *
+ *   MID-FLIGHT. The row query polls on a 3-second interval WHILE matching and
+ *   stops the instant the status leaves matching_footage — so the final
+ *   assignment slice, which lands moments before that transition, is
+ *   systematically absent from the page the query is left holding. On
+ *   2026-08-15 a complete 356-scene project read as 6 holes because the last
+ *   snapshot predated the last slice: the gate blocked Render and told the
+ *   user 6 scenes had no footage, on data that was whole in the database.
+ *
+ *   AT SCALE. The row query has no .range() and no .order(), so past
+ *   PostgREST's max-rows cap (1000 by default — a limit the scene skeleton
+ *   read already guards against server-side) it returns a partial,
+ *   NON-DETERMINISTIC page on every fetch. Rows can never prove completeness;
+ *   a bigger fetch only moves the tripwire.
+ *
+ * Two head-only exact counts have neither failure mode: they transfer zero
+ * rows, are aggregated server-side, and cannot be truncated. The caller
+ * fetches them under a queryKey that includes project.status, so the ready
+ * transition itself forces fresh numbers and a mid-matching snapshot cannot
+ * be carried across the boundary.
  *
  * SCOPE. Selections (`selected_clips`) are the timeline's source of truth only
  * on the PLAIN path. A fixed-duration project renders from `render_clip_slices`
@@ -20,10 +41,18 @@
  * reports "complete" there rather than second-guessing a different model with
  * the wrong table.
  *
- * NOT LOADED IS NOT MISSING. Before the clips query resolves, every scene looks
- * clipless. Blocking on that would hide the button on every fresh page load, so
- * an unloaded state is never a hole: the gate only closes on evidence.
+ * NOT LOADED IS NOT MISSING. Before the counts resolve, nothing is known.
+ * Blocking on that would hide the button on every fresh page load, so an
+ * unloaded state is never a hole: the gate only closes on evidence.
  */
+
+/** The two aggregates the gate is allowed to judge from. */
+export type FootageCoverageCounts = {
+  /** Exact server-side count of the project's scenes. */
+  totalScenes: number;
+  /** Exact server-side count of its selected_clips rows (one per scene). */
+  scenesWithClips: number;
+};
 
 export type FootageCoverage = {
   /** Scenes with no usable clip. 0 when unknown — absence of evidence only. */
@@ -43,10 +72,8 @@ const COMPLETE: FootageCoverage = {
 };
 
 export function describeFootageCoverage(opts: {
-  /** Every scene id in the project, or null while the scene list is loading. */
-  sceneIds: string[] | null | undefined;
-  /** Scene ids that have a usable clip, or null while the clip list is loading. */
-  sceneIdsWithClips: Iterable<string> | null | undefined;
+  /** Server-side aggregates, or null/undefined while they are loading. */
+  counts: FootageCoverageCounts | null | undefined;
   /**
    * Set for fixed-duration projects, whose timeline comes from
    * render_clip_slices rather than selected_clips.
@@ -54,12 +81,14 @@ export function describeFootageCoverage(opts: {
   fixedDurationSeconds?: number | null;
 }): FootageCoverage {
   if (opts.fixedDurationSeconds) return COMPLETE;
-  if (!opts.sceneIds || !opts.sceneIdsWithClips) return COMPLETE;
-  const totalScenes = opts.sceneIds.length;
+  if (!opts.counts) return COMPLETE;
+  const { totalScenes, scenesWithClips } = opts.counts;
   if (totalScenes === 0) return COMPLETE;
 
-  const withClips = new Set(opts.sceneIdsWithClips);
-  const missingScenes = opts.sceneIds.filter((id) => !withClips.has(id)).length;
+  // scenes is the authoritative side; selected_clips is unique per scene_id, so
+  // the difference is exactly the clipless scenes. Clamped because a scene
+  // deleted between the two counts must not read as negative holes.
+  const missingScenes = Math.max(0, totalScenes - scenesWithClips);
   if (missingScenes === 0) return { missingScenes: 0, totalScenes, complete: true, notice: null };
 
   return {

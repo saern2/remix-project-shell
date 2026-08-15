@@ -163,6 +163,25 @@ function ProjectDetail() {
 
   const isReady = project?.status === "ready" || project?.status === "completed";
 
+  // The timeline's row queries poll on a 3s interval WHILE matching and stop the
+  // instant the status leaves matching_footage — so the final assignment slice,
+  // which lands moments before that transition, was systematically absent from
+  // the page they were left holding. On 2026-08-15 a complete 356-scene project
+  // drew six "No clip" cards that way. The transition itself is the refetch
+  // trigger that was missing (clipSlicesQuery never had this bug because its
+  // queryKey includes project.status; these two are invalidated instead so the
+  // stale rows stay on screen until the fresh ones arrive, rather than
+  // flashing an empty state through a key change).
+  const prevStatusRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = project?.status;
+    if (prev === "matching_footage" && project?.status === "ready") {
+      void queryClient.invalidateQueries({ queryKey: ["selected-clips", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["scenes", projectId] });
+    }
+  }, [project?.status, projectId, queryClient]);
+
   const scenesQuery = useQuery({
     enabled:
       !!project &&
@@ -282,16 +301,45 @@ function ProjectDetail() {
   // Matching completes a project even when a few scenes found no footage — under
   // the 10% failure threshold that is deliberate. What was NOT deliberate is that
   // nothing said so: the timeline showed bare "No clip" cards and the panel below
-  // still read "Everything looks good". The holes are now counted here and stated
+  // still read "Everything looks good". The holes are counted here and stated
   // wherever the user could otherwise act on a timeline that is not whole.
+  //
+  // Counted from two exact head-only aggregates, never from the timeline's rows
+  // — rows lied twice (a mid-flight page outliving the ready transition, and
+  // PostgREST's max-rows cap past ~1000 scenes; see footage-coverage.ts). The
+  // status in the queryKey is the clipSlicesQuery precedent: the transition to
+  // ready changes the key, so the counts are re-read at exactly the moment they
+  // are about to be trusted.
+  const coverageQuery = useQuery({
+    enabled: !!project && isReady && !project.clip_duration_seconds,
+    queryKey: ["footage-coverage", projectId, project?.status],
+    queryFn: async () => {
+      const [sceneCount, selectionCount] = await Promise.all([
+        supabase
+          .from("scenes")
+          .select("id", { count: "exact", head: true })
+          .eq("project_id", projectId),
+        supabase
+          .from("selected_clips")
+          .select("scene_id, scenes!inner(project_id)", { count: "exact", head: true })
+          .eq("scenes.project_id", projectId),
+      ]);
+      if (sceneCount.error) throw sceneCount.error;
+      if (selectionCount.error) throw selectionCount.error;
+      return {
+        totalScenes: sceneCount.count ?? 0,
+        scenesWithClips: selectionCount.count ?? 0,
+      };
+    },
+  });
+
   const footageCoverage = useMemo(
     () =>
       describeFootageCoverage({
-        sceneIds: scenesQuery.data?.map((scene) => scene.id) ?? null,
-        sceneIdsWithClips: clipsQuery.data ? clipsByScene.keys() : null,
+        counts: coverageQuery.data,
         fixedDurationSeconds: project?.clip_duration_seconds,
       }),
-    [scenesQuery.data, clipsQuery.data, clipsByScene, project?.clip_duration_seconds],
+    [coverageQuery.data, project?.clip_duration_seconds],
   );
 
   const runSwap = useServerFn(swapSceneClip);
@@ -300,7 +348,13 @@ function ProjectDetail() {
     setSwappingId(sceneId);
     try {
       await runSwap({ data: { sceneId } });
-      await queryClient.invalidateQueries({ queryKey: ["selected-clips", projectId] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["selected-clips", projectId] }),
+        // A swap that fills an empty scene changes the coverage verdict; without
+        // this the gate would stay closed after the user did the one thing the
+        // notice asked of them.
+        queryClient.invalidateQueries({ queryKey: ["footage-coverage", projectId] }),
+      ]);
     } catch (err) {
       toast.error(describeUserFacingError(err));
     } finally {
