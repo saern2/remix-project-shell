@@ -76,9 +76,26 @@ const config = {
   // Total concurrent CDN downloads across the whole worker process. This is the
   // shared authority: as more chunks download at once, each gets a smaller fair
   // share via the semaphore queue rather than every stream contending for the pipe.
-  // Lowered from 15 → 4 because a saturated pipe split 15 ways made large clips
-  // time out deterministically (round 6, Issue 2).
-  globalCdnConcurrency: intEnv('GLOBAL_CDN_CONCURRENCY', 4),
+  //
+  // 15, BY MEASUREMENT — and 4 was a considered value this supersedes, not a
+  // forgotten one. Round 6 (Issue 2) lowered 15 → 4 because a saturated pipe
+  // split 15 ways made large clips time out deterministically. That change
+  // landed in this file and .env.example but NEVER reached the production box:
+  // its .env carried an explicit GLOBAL_CDN_CONCURRENCY=15 throughout
+  // (confirmed 2026-08-15 via printenv on the box). Production has therefore
+  // run at 15 the entire time — which means the WHOLE measured record belongs
+  // to 15: kill rate 0.10% (2026-08-12→14), waitMs median 0, 9-10 MB/s per
+  // stream, downloadSharePct 2-5%. Four has never been field-tested here.
+  //
+  // Round 6's failure mode is now covered by guards that attack it directly:
+  // DOWNLOAD_MAX_SECONDS=120 per transfer, the 30s no-bytes stall guard,
+  // CHUNK_TIMEOUT_SECONDS=300 and MAX_CLIP_BYTES=150MB.
+  //
+  // CORRECTED PREMISE for anyone re-reading the chunk-timeout investigation
+  // (2026-08-12→14): that analysis was reasoned as if concurrency were 4. It
+  // was 15. The conclusions survive — waitMs median 0 means download permits
+  // were not the constraint even at 15 — but do not re-derive the old premise.
+  globalCdnConcurrency: intEnv('GLOBAL_CDN_CONCURRENCY', 15),
   ffmpegThreads: intEnv('FFMPEG_THREADS', 0),
   /**
    * x264 preset for CHUNK encodes. Stitch never re-encodes video, so this only
