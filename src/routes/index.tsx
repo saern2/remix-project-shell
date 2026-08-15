@@ -89,7 +89,7 @@ const FAQ = [
   },
   {
     q: "How long can my video be?",
-    a: "Short-form works best today — narration up to a few minutes renders reliably. Longer pieces are still being stabilised, so we'd rather not promise them yet.",
+    a: "Narration up to 45 minutes renders reliably — roughly a 6,500-word script. Longer pieces should be split into parts, one project each.",
   },
 ];
 
