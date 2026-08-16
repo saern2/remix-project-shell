@@ -648,7 +648,7 @@ function NewProject() {
                   </Select>
                   <p className="text-xs text-muted-foreground">
                     Speech is generated on your computer — the first use downloads a voice model
-                    that your browser keeps for next time.
+                    (about 330 MB) that your browser keeps for next time.
                   </p>
                   <div className="flex items-center gap-3 pt-1">
                     <Button

@@ -14,6 +14,7 @@
  */
 
 import { MAX_AUDIO_DURATION_SECONDS } from "@/lib/audio-limits";
+import { configureModelHost, seedVoiceCache } from "@/lib/tts/model-host";
 import {
   TTS_SAMPLE_RATE,
   assertSampleExact,
@@ -118,7 +119,14 @@ export async function loadEngine(
   onProgress: (progress: TtsProgress) => void,
   opts: { dtype?: TtsDtype } = {},
 ): Promise<TtsEngine> {
-  const { KokoroTTS } = await import("kokoro-js");
+  const [{ KokoroTTS }, { env }] = await Promise.all([
+    import("kokoro-js"),
+    import("@huggingface/transformers"),
+  ]);
+  // BEFORE from_pretrained: every file the loader resolves — config,
+  // tokenizer, the model itself — must come from our bucket, never the
+  // Hugging Face bridge (measured at 0.96 MB/s, capture 69).
+  configureModelHost(env);
   const tts = await KokoroTTS.from_pretrained(TTS_MODEL_ID, {
     device: "webgpu",
     dtype: opts.dtype ?? "fp32",
@@ -140,6 +148,12 @@ export async function loadEngine(
   });
   return {
     async generate(text: string, voice: string) {
+      // Seeding comes FIRST, and it throws. kokoro-js hardcodes a Hugging
+      // Face URL for voices with a silent fetch fallback on cache miss;
+      // awaiting the seed here — inside the only path that reaches
+      // tts.generate — is what makes that fallback structurally unreachable.
+      // A seeding failure is a worded failure before any speech exists.
+      await seedVoiceCache(voice);
       const audio = await tts.generate(text, { voice: voice as never });
       return { samples: audio.audio as Float32Array, sampleRate: audio.sampling_rate };
     },

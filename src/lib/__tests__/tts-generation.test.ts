@@ -376,7 +376,7 @@ describe("voices and guardrails", () => {
     // anywhere in src/ would pull transformers.js into the main chunk.
     const { execSync } = require("node:child_process") as typeof import("node:child_process");
     const hits = execSync(
-      `grep -rn 'from "kokoro-js"\\|from "mammoth' src/ --include='*.ts' --include='*.tsx' ` +
+      `grep -rn 'from "kokoro-js"\\|from "mammoth\\|from "@huggingface' src/ --include='*.ts' --include='*.tsx' ` +
         `--exclude-dir=__tests__ || true`,
       { encoding: "utf8" },
     );
