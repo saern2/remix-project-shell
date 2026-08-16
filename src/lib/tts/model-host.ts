@@ -43,6 +43,53 @@ export const TTS_MODEL_BASE_URL = "https://pub-42a1fa5fb300434c9a06eaf5b7966394.
 export const VOICE_BIN_BYTES = 522_240;
 
 /**
+ * Where onnxruntime's WebGPU runtime files come from — the same bucket, so
+ * jsDelivr leaves the critical path too. The two files are transformers.js's
+ * OWN dist files, so the path is keyed to the transformers version that names
+ * those bytes (a test pins the installed version to this string, and the
+ * trailing slash: ORT concatenates filenames directly onto this, and a
+ * missing slash produces a malformed URL that presents as a 404/CORS
+ * mystery). Assigned to env.backends.onnx.wasm.wasmPaths in loadEngine —
+ * the ONLY place ORT looks, so a failed fetch is a worded failure, never a
+ * silent fall-back to jsDelivr.
+ *
+ * The .wasm MUST be stored pre-compressed with Content-Encoding metadata on
+ * the R2 object (R2 serves bytes as stored): raw it is 21,596,019 bytes where
+ * jsDelivr shipped ~4.1 MB brotli — a 5× regression on the critical path if
+ * uploaded naively.
+ */
+export const ORT_WASM_BASE_URL = `${TTS_MODEL_BASE_URL}ort/transformers-3.8.1/`;
+
+/** transformers.js dtype → model file suffix (mirrors DEFAULT_DTYPE_SUFFIX_MAPPING). */
+const DTYPE_FILE_SUFFIX: Record<string, string> = { fp32: "", fp16: "_fp16", q8: "_quantized" };
+
+/**
+ * Whether the model for this dtype is already in the browser's cache — the
+ * fact the progress events cannot supply. VERIFIED (hub.js:417-654): every
+ * progress event fires identically while READING A CACHE HIT as while
+ * downloading, which is how a session with zero model.onnx network requests
+ * displayed "Downloading — 62%" (capture, 2026-08-16). transformers.js keys
+ * its cache on the resolved remote URL (hub.js:488), which we know exactly,
+ * so one cache.match answers the question the label needs.
+ */
+export async function isModelCached(
+  dtype: string = "fp32",
+  cacheStorage: CacheStorage | undefined = typeof caches !== "undefined" ? caches : undefined,
+): Promise<boolean> {
+  if (!cacheStorage) return false;
+  try {
+    const cache = await cacheStorage.open("transformers-cache");
+    const suffix = DTYPE_FILE_SUFFIX[dtype] ?? "";
+    const url = `${TTS_MODEL_BASE_URL}onnx-community/Kokoro-82M-v1.0-ONNX/main/onnx/model${suffix}.onnx`;
+    return (await cache.match(url)) !== undefined;
+  } catch {
+    // Unknown is not cached: the download label is the safe wrong answer —
+    // it can only overstate the wait, never hide a real download.
+    return false;
+  }
+}
+
+/**
  * The exact URL prefix kokoro-js hardcodes for voice fetches. Used ONLY as
  * the cache key its loader matches against — see seedVoiceCache.
  */

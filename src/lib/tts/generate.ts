@@ -14,7 +14,7 @@
  */
 
 import { MAX_AUDIO_DURATION_SECONDS } from "@/lib/audio-limits";
-import { configureModelHost, seedVoiceCache } from "@/lib/tts/model-host";
+import { ORT_WASM_BASE_URL, configureModelHost, seedVoiceCache } from "@/lib/tts/model-host";
 import {
   TTS_SAMPLE_RATE,
   assertSampleExact,
@@ -41,8 +41,80 @@ export const TTS_VOICES: Array<{ id: string; label: string }> = [
 
 export type TtsProgress =
   | { stage: "model"; file: string; loadedBytes: number; totalBytes: number }
-  | { stage: "generating"; sentence: number; totalSentences: number; secondsGenerated: number }
+  | {
+      stage: "generating";
+      sentence: number;
+      totalSentences: number;
+      secondsGenerated: number;
+      /**
+       * Live per-machine estimate, revised at every sentence boundary once
+       * calibration has happened; null before that. A frozen two-sentence
+       * sample would mislead wherever early sentences are atypical.
+       */
+      estimatedRemainingComputeSec: number | null;
+    }
   | { stage: "assembling" };
+
+/**
+ * NAMING IS LOAD-BEARING HERE. Every measurement this project holds — 3.38
+ * and ~10 (browsers, 2026-08-16), 0.766 and 0.265 (VPS) — is COMPUTE seconds
+ * per AUDIO second: bigger is slower. The Preview line displays the inverse
+ * (bigger is faster). One codebase using one name for both meanings is the
+ * error class that has cost this project days, so the bare "realtime factor"
+ * abbreviation is banned by test; both directions are spelled out everywhere.
+ */
+export type SpeechEstimate = {
+  /** The held-measurement direction: 3.38 means an hour of audio costs 3.38 hours. */
+  computeSecPerAudioSec: number;
+  /** The display direction (the Preview ratio): 0.3 means 0.3× realtime. */
+  audioSecPerComputeSec: number;
+  estimatedTotalAudioSec: number;
+  estimatedTotalComputeSec: number;
+  estimatedRemainingComputeSec: number;
+  calibratedOnSentences: number;
+};
+
+/**
+ * When the estimate is presented for a decision. Sentence boundaries only —
+ * an in-flight engine.generate() cannot be interrupted, so on a very slow
+ * machine one long sentence can overshoot the wall-clock target: the window
+ * is a FLOOR, not a ceiling. Two sentences or 25 s of wall clock, whichever
+ * comes first: a fast machine reaches the verdict in seconds, a 0.1×-realtime
+ * machine within roughly half a minute.
+ */
+export const CALIBRATION_WINDOW = { minSentences: 2, maxWallMs: 25_000 };
+
+/**
+ * Above this estimated total compute, the dialog leads with "shorten the
+ * script or use Upload narration" rather than a neutral continue prompt.
+ * 45 minutes of real-time compute — the same number as the platform's audio
+ * ceiling, on the reasoning that nobody should wait longer for speech than
+ * the longest video the platform will make of it.
+ */
+export const ESTIMATE_SANITY_COMPUTE_SEC = 45 * 60;
+
+/** The pure arithmetic, shared by the calibration verdict and every revision. */
+export function estimateFromProgress(sample: {
+  charsDone: number;
+  charsTotal: number;
+  audioSecDone: number;
+  computeSecDone: number;
+  sentencesDone: number;
+}): SpeechEstimate {
+  const audioSecPerChar = sample.charsDone > 0 ? sample.audioSecDone / sample.charsDone : 0;
+  const computeSecPerAudioSec =
+    sample.audioSecDone > 0 ? sample.computeSecDone / sample.audioSecDone : 0;
+  const estimatedTotalAudioSec = sample.charsTotal * audioSecPerChar;
+  const estimatedTotalComputeSec = estimatedTotalAudioSec * computeSecPerAudioSec;
+  return {
+    computeSecPerAudioSec,
+    audioSecPerComputeSec: computeSecPerAudioSec > 0 ? 1 / computeSecPerAudioSec : 0,
+    estimatedTotalAudioSec,
+    estimatedTotalComputeSec,
+    estimatedRemainingComputeSec: Math.max(0, estimatedTotalComputeSec - sample.computeSecDone),
+    calibratedOnSentences: sample.sentencesDone,
+  };
+}
 
 /**
  * The dtypes under evaluation. fp32 is the shipped default; fp16 and q8 exist
@@ -127,25 +199,42 @@ export async function loadEngine(
   // tokenizer, the model itself — must come from our bucket, never the
   // Hugging Face bridge (measured at 0.96 MB/s, capture 69).
   configureModelHost(env);
-  const tts = await KokoroTTS.from_pretrained(TTS_MODEL_ID, {
-    device: "webgpu",
-    dtype: opts.dtype ?? "fp32",
-    progress_callback: (event: {
-      status?: string;
-      file?: string;
-      loaded?: number;
-      total?: number;
-    }) => {
-      if (event.status === "progress" && event.file) {
-        onProgress({
-          stage: "model",
-          file: event.file,
-          loadedBytes: event.loaded ?? 0,
-          totalBytes: event.total ?? 0,
-        });
-      }
-    },
-  });
+  // And the ONNX runtime's own wasm files likewise: wasmPaths is the only
+  // source ORT consults (backends/onnx.js sets the jsDelivr default only
+  // when unset), so this assignment removes jsDelivr from the critical path
+  // with the same no-silent-fallback property as the model host.
+  (env as { backends: { onnx: { wasm: { wasmPaths: string } } } }).backends.onnx.wasm.wasmPaths =
+    ORT_WASM_BASE_URL;
+  let tts: Awaited<ReturnType<typeof KokoroTTS.from_pretrained>>;
+  try {
+    tts = await KokoroTTS.from_pretrained(TTS_MODEL_ID, {
+      device: "webgpu",
+      dtype: opts.dtype ?? "fp32",
+      progress_callback: (event: {
+        status?: string;
+        file?: string;
+        loaded?: number;
+        total?: number;
+      }) => {
+        if (event.status === "progress" && event.file) {
+          onProgress({
+            stage: "model",
+            file: event.file,
+            loadedBytes: event.loaded ?? 0,
+            totalBytes: event.total ?? 0,
+          });
+        }
+      },
+    });
+  } catch (err) {
+    // A failed bucket fetch (model or runtime files) lands here as a raw
+    // loader error; the user gets a sentence, the console keeps the detail.
+    // No retry against any other host exists — that is the design.
+    throw new Error(
+      "The voice engine could not be downloaded. Please check your connection and try again. " +
+        `(internal: ${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
   return {
     async generate(text: string, voice: string) {
       // Seeding comes FIRST, and it throws. kokoro-js hardcodes a Hugging
@@ -173,10 +262,28 @@ export async function generateSpeech(opts: {
   engine: TtsEngine;
   onProgress: (progress: TtsProgress) => void;
   signal?: AbortSignal;
+  /**
+   * Presented ONCE, at the first sentence boundary past CALIBRATION_WINDOW,
+   * with the measured per-machine estimate. Returning "cancel" aborts with
+   * nothing persisted anywhere — the zero-persistence property is what makes
+   * cancelling free. Omitted by the Preview instrument, whose three fixed
+   * sentences must run uninterrupted.
+   */
+  onCalibration?: (estimate: SpeechEstimate) => Promise<"continue" | "cancel">;
+  /** Test seams. Defaults are the shipped behaviour. */
+  calibrationWindow?: { minSentences: number; maxWallMs: number };
+  nowMs?: () => number;
 }): Promise<GeneratedSpeech> {
-  const { sentences, voice, engine, onProgress, signal } = opts;
+  const { sentences, voice, engine, onProgress, signal, onCalibration } = opts;
   if (sentences.length === 0)
     throw new Error("The script is empty. Paste or upload some text first.");
+
+  const window = opts.calibrationWindow ?? CALIBRATION_WINDOW;
+  const nowMs = opts.nowMs ?? (() => performance.now());
+  const charsTotal = sentences.reduce((sum, sentence) => sum + sentence.length, 0);
+  const startedAtMs = nowMs();
+  let charsDone = 0;
+  let calibrated = false;
 
   const ceilingSamples = MAX_AUDIO_DURATION_SECONDS * TTS_SAMPLE_RATE;
   const parts: Array<Int16Array<ArrayBuffer>> = [];
@@ -211,12 +318,42 @@ export async function generateSpeech(opts: {
       throw new ScriptTooLongError(totalSamples / TTS_SAMPLE_RATE, index + 1, sentences.length);
     }
 
+    charsDone += sentences[index].length;
+    const computeSecDone = (nowMs() - startedAtMs) / 1000;
+    const audioSecDone = totalSamples / TTS_SAMPLE_RATE;
+    // Revised at EVERY boundary once any audio exists — the estimate stays
+    // live for the whole run rather than freezing at the calibration sample.
+    const estimate = estimateFromProgress({
+      charsDone,
+      charsTotal,
+      audioSecDone,
+      computeSecDone,
+      sentencesDone: index + 1,
+    });
+
     onProgress({
       stage: "generating",
       sentence: index + 1,
       totalSentences: sentences.length,
-      secondsGenerated: totalSamples / TTS_SAMPLE_RATE,
+      secondsGenerated: audioSecDone,
+      estimatedRemainingComputeSec:
+        index + 1 < sentences.length ? estimate.estimatedRemainingComputeSec : 0,
     });
+
+    // The decision point: first boundary past the window (floor, not ceiling
+    // — see CALIBRATION_WINDOW), and only when there is another sentence to
+    // spend time on. Cancelling here costs the seconds already spent and
+    // nothing else: no row, no byte, no cache entry of ours exists yet.
+    if (
+      !calibrated &&
+      onCalibration &&
+      index + 1 < sentences.length &&
+      (index + 1 >= window.minSentences || computeSecDone * 1000 >= window.maxWallMs)
+    ) {
+      calibrated = true;
+      const verdict = await onCalibration(estimate);
+      if (verdict === "cancel") throw new Error("Generation was cancelled.");
+    }
   }
 
   onProgress({ stage: "assembling" });

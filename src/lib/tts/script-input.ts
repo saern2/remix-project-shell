@@ -21,6 +21,57 @@ const NON_TERMINAL = new Set(
 );
 
 /**
+ * Strips markdown STRUCTURE from a pasted script, keeping the words.
+ *
+ * PRODUCTION EVIDENCE, 2026-08-16: a pasted script containing
+ * "--- ## CHAPTER ONE — THE KINGDOM OF EMBERS" had the dashes and hashes
+ * SPOKEN by the TTS and persisted as scene 43 with visual query "chapter one
+ * kingdom embers". Scripts arrive from Docs, Word and chat assistants wearing
+ * markdown; the narration must wear none of it.
+ *
+ * ONE CLEANING, BEFORE THE SPLIT. splitScriptIntoSentences calls this first,
+ * so the text TTS speaks and the text that becomes scenes are the same text
+ * by construction — they cannot diverge.
+ *
+ * IDENTITY ON PLAIN PROSE — the regression guarantee. Every pattern here
+ * anchors on markdown syntax (line-leading markers, paired delimiters,
+ * bracket-paren links); ordinary narration passes through byte-identical, so
+ * the working path's sentence arrays are unchanged. Paragraph breaks are NOT
+ * newly preserved: the splitter has always collapsed all whitespace (the line
+ * below this function's call site), and preserving them would move scene
+ * boundaries on the path that works today — out of scope by instruction.
+ */
+export function sanitizeScript(text: string): string {
+  return (
+    text
+      // Fenced code blocks: dropped whole — code is not narration.
+      .replace(/```[\s\S]*?```/g, " ")
+      // ATX headings: keep the heading text, lose the hashes.
+      .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+      // Horizontal rules (---, ***, ___), a line of their own.
+      .replace(/^\s{0,3}(?:[-*_]\s*){3,}$/gm, " ")
+      // Blockquote markers.
+      .replace(/^\s{0,3}>\s?/gm, "")
+      // Bullet markers. The text of the item stays.
+      .replace(/^\s{0,3}[-*+]\s+/gm, "")
+      // Numbered-list markers ("1. " / "1) ") at line start only.
+      .replace(/^\s{0,3}\d{1,3}[.)]\s+/gm, "")
+      // Images: keep the alt text, lose the syntax.
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+      // Links: keep the link text.
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+      // Bold / italics / strikethrough: keep the emphasised words.
+      .replace(/(\*\*|__)(?=\S)([\s\S]*?\S)\1/g, "$2")
+      .replace(/\*(?=\S)([^*]*\S)\*/g, "$1")
+      // Underscore italics only at word boundaries, so snake_case survives.
+      .replace(/\b_([^_\n]+)_\b/g, "$1")
+      .replace(/~~(?=\S)([\s\S]*?\S)~~/g, "$1")
+      // Inline code: keep the content.
+      .replace(/`([^`\n]+)`/g, "$1")
+  );
+}
+
+/**
  * Splits narration text into spoken sentences.
  *
  * Deliberately simple and deliberately conservative: a wrong merge costs one
@@ -30,7 +81,7 @@ const NON_TERMINAL = new Set(
  * which only ever sees one sentence at a time.
  */
 export function splitScriptIntoSentences(script: string): string[] {
-  const text = script.replace(/\s+/g, " ").trim();
+  const text = sanitizeScript(script).replace(/\s+/g, " ").trim();
   if (!text) return [];
 
   const sentences: string[] = [];
@@ -71,7 +122,7 @@ export function splitScriptIntoSentences(script: string): string[] {
 
 /** Rough spoken duration for the pre-check. The real ceiling is sample-counted. */
 export function estimateSpokenSeconds(script: string): number {
-  const words = script.trim().split(/\s+/).filter(Boolean).length;
+  const words = sanitizeScript(script).trim().split(/\s+/).filter(Boolean).length;
   return (words / NARRATION_WORDS_PER_MINUTE) * 60;
 }
 

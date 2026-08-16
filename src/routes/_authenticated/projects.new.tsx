@@ -41,9 +41,16 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { checkWebGpu } from "@/lib/tts/webgpu";
+import { checkWebGpu, type WebGpuVerdict } from "@/lib/tts/webgpu";
 import { checkScript, extractScriptText, splitScriptIntoSentences } from "@/lib/tts/script-input";
-import { TTS_VOICES, parseDtypeParam, type TtsProgress } from "@/lib/tts/generate";
+import {
+  ESTIMATE_SANITY_COMPUTE_SEC,
+  TTS_VOICES,
+  parseDtypeParam,
+  type SpeechEstimate,
+  type TtsProgress,
+} from "@/lib/tts/generate";
+import { isModelCached } from "@/lib/tts/model-host";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -82,14 +89,21 @@ function NewProject() {
   const [voice, setVoice] = useState<string>(TTS_VOICES[0].id);
   const [scriptWarning, setScriptWarning] = useState<string | null>(null);
   // null = not yet probed; the probe runs when the script tab is opened, so
-  // the refusal appears BEFORE a script is written, not after.
-  const [webGpu, setWebGpu] = useState<{ ok: boolean; message?: string } | null>(null);
+  // the refusal appears BEFORE a script is written, not after. The ok verdict
+  // carries the adapter survey (limits + vendor info) for the fleet line.
+  const [webGpu, setWebGpu] = useState<WebGpuVerdict | null>(null);
   useEffect(() => {
     if (mode !== "script" || webGpu !== null) return;
-    void checkWebGpu().then((verdict) =>
-      setWebGpu(verdict.ok ? { ok: true } : { ok: false, message: verdict.message }),
-    );
+    void checkWebGpu().then(setWebGpu);
   }, [mode, webGpu]);
+
+  // The calibration decision, surfaced as a dialog. generateSpeech pauses at a
+  // sentence boundary awaiting the resolve — Continue or Cancel, with Cancel
+  // free because nothing has been persisted anywhere yet.
+  const [calibration, setCalibration] = useState<{
+    estimate: SpeechEstimate;
+    resolve: (verdict: "continue" | "cancel") => void;
+  } | null>(null);
   const { data: existingProjects = [], isLoading: projectsLoading } = useProjects();
   const { isAdmin } = useIsAdmin();
   const usage = projectUsage(existingProjects.length, { isAdmin });
@@ -267,12 +281,19 @@ function NewProject() {
     try {
       const dtype = parseDtypeParam(window.location.search);
       const { loadEngine, generateSpeech, PREVIEW_TEXT } = await import("@/lib/tts/generate");
+      // Same label honesty as the main flow: the cache, not the events,
+      // knows whether bytes will cross the network.
+      const previewModelCached = await isModelCached(dtype);
       const engine = await loadEngine(
         (event) => {
           if (event.stage === "model") {
             const pct =
               event.totalBytes > 0 ? Math.round((event.loadedBytes / event.totalBytes) * 100) : 0;
-            setPreviewNote(`Downloading the ${dtype} voice model — ${pct}%…`);
+            setPreviewNote(
+              previewModelCached
+                ? `Loading the ${dtype} voice model from your browser's cache — ${pct}%…`
+                : `Downloading the ${dtype} voice model — ${pct}%… (one-time)`,
+            );
           }
         },
         { dtype },
@@ -284,19 +305,37 @@ function NewProject() {
         voice,
         engine,
         onProgress: () => {},
+        // Deliberately no onCalibration: the fixed three sentences ARE the
+        // instrument, and a pause dialog would corrupt its timing.
       });
       const computeSec = (performance.now() - startedAt) / 1000;
-      const ratio = speech.durationSec / computeSec;
+      // Display direction: audio per compute — bigger is faster. The held
+      // fleet measurements use the inverse (computeSecPerAudioSec, bigger is
+      // slower); both are in the payload so nobody divides by memory.
+      const audioSecPerComputeSec = speech.durationSec / computeSec;
       const note =
         `${speech.durationSec.toFixed(1)}s of speech in ${computeSec.toFixed(1)}s — ` +
-        `${ratio.toFixed(1)}× realtime (${dtype})`;
+        `${audioSecPerComputeSec.toFixed(1)}× realtime (${dtype})`;
       setPreviewNote(note);
       console.info("[tts-harness]", {
         dtype,
         voice,
         speechSec: Number(speech.durationSec.toFixed(2)),
         computeSec: Number(computeSec.toFixed(2)),
-        speedRatio: Number(ratio.toFixed(2)),
+        // Kept name: this is audioSecPerComputeSec (the display ratio). Fleet
+        // data already collected under this key; renaming would fork the survey.
+        speedRatio: Number(audioSecPerComputeSec.toFixed(2)),
+        computeSecPerAudioSec: Number((computeSec / speech.durationSec).toFixed(2)),
+        modelCached: previewModelCached,
+        // Fleet survey (A3): the adapter's size limits and identity, so a
+        // defensible capability threshold can be set from data later.
+        ...(webGpu?.ok
+          ? {
+              maxBufferSize: webGpu.survey.maxBufferSize,
+              maxStorageBufferBindingSize: webGpu.survey.maxStorageBufferBindingSize,
+              adapter: webGpu.survey.info,
+            }
+          : {}),
       });
       const url = URL.createObjectURL(speech.wavBlob);
       const player = new Audio(url);
@@ -337,15 +376,28 @@ function NewProject() {
       // ── Generate: browser only, nothing persisted anywhere ──────────────
       setStage("Loading the voice engine…");
       const { loadEngine, generateSpeech } = await import("@/lib/tts/generate");
+      // The progress events cannot tell a cached read from a download — they
+      // fire identically for both (hub.js), which is how a fully-cached load
+      // once displayed "Downloading — 62%". The truthful label comes from
+      // asking the cache directly, before anything loads.
+      const modelCached = await isModelCached("fp32");
       const onProgress = (event: TtsProgress) => {
         if (event.stage === "model") {
           const pct = event.totalBytes > 0 ? (event.loadedBytes / event.totalBytes) * 100 : 0;
-          setStage("Downloading the voice model — one-time, kept by your browser…");
+          setStage(
+            modelCached
+              ? "Loading the voice model from your browser's cache…"
+              : "Downloading the voice model (one-time, kept by your browser)…",
+          );
           setProgress(Math.round(pct));
         } else if (event.stage === "generating") {
+          const remaining =
+            event.estimatedRemainingComputeSec != null && event.estimatedRemainingComputeSec > 0
+              ? ` — about ${describeComputeTime(event.estimatedRemainingComputeSec)} left on this computer`
+              : "";
           setStage(
             `Generating speech — sentence ${event.sentence} of ${event.totalSentences} ` +
-              `(${formatDuration(Math.round(event.secondsGenerated))} of narration so far)`,
+              `(${formatDuration(Math.round(event.secondsGenerated))} of narration so far)${remaining}`,
           );
           setProgress(Math.round((event.sentence / event.totalSentences) * 100));
         } else {
@@ -355,7 +407,25 @@ function NewProject() {
       };
       const engine = await loadEngine(onProgress);
       const sentences = splitScriptIntoSentences(script);
-      const speech = await generateSpeech({ sentences, voice, engine, onProgress });
+      const speech = await generateSpeech({
+        sentences,
+        voice,
+        engine,
+        onProgress,
+        // Pauses at a sentence boundary with the measured per-machine
+        // estimate; the dialog's buttons resolve the promise. Preview never
+        // passes this — its fixed three sentences are the instrument.
+        onCalibration: (estimate) =>
+          new Promise<"continue" | "cancel">((resolve) => {
+            setCalibration({
+              estimate,
+              resolve: (verdict) => {
+                setCalibration(null);
+                resolve(verdict);
+              },
+            });
+          }),
+      });
 
       // ── Persist: the upload path's own sequence, verbatim ───────────────
       setStage("Creating project…");
@@ -495,6 +565,58 @@ function NewProject() {
           </AlertDescription>
         </Alert>
       ) : null}
+
+      {/*
+        The calibration verdict: measured on THIS machine, presented before the
+        long part begins. generateSpeech is paused at a sentence boundary until
+        a button resolves it. The 2026-08-16 survey found 12-year-old machines
+        at 2.5-7.5 HOURS for a 45-minute script — this dialog is how that stops
+        being a surprise discovered two hours in.
+      */}
+      <AlertDialog open={calibration !== null}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {calibration &&
+              calibration.estimate.estimatedTotalComputeSec > ESTIMATE_SANITY_COMPUTE_SEC
+                ? "This will take a very long time on this computer"
+                : "Ready to generate on this computer"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {calibration ? (
+                calibration.estimate.estimatedTotalComputeSec > ESTIMATE_SANITY_COMPUTE_SEC ? (
+                  <>
+                    Based on the first sentences, generating this narration here would take about{" "}
+                    <span className="font-medium text-foreground">
+                      {describeComputeTime(calibration.estimate.estimatedTotalComputeSec)}
+                    </span>
+                    . We recommend shortening the script, or recording the narration yourself and
+                    using Upload narration instead. Nothing has been saved, so cancelling is free —
+                    but you can continue if you want, keeping this tab open the whole time.
+                  </>
+                ) : (
+                  <>
+                    Based on the first sentences, generating this narration will take about{" "}
+                    <span className="font-medium text-foreground">
+                      {describeComputeTime(calibration.estimate.estimatedTotalComputeSec)}
+                    </span>{" "}
+                    on this computer. Keep this tab open while it runs. Nothing is saved until it
+                    finishes, so cancelling is free.
+                  </>
+                )
+              ) : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => calibration?.resolve("cancel")}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={() => calibration?.resolve("continue")}>
+              Continue
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={confirmDeleteOldest} onOpenChange={setConfirmDeleteOldest}>
         <AlertDialogContent>
@@ -755,6 +877,19 @@ function NewProject() {
       </Card>
     </main>
   );
+}
+
+/**
+ * "40s", "12 min", "2.5 hours" — the calibration estimate's units, coarse on
+ * purpose: a per-machine extrapolation from a few sentences does not deserve
+ * minute precision, and offering it would invite the user to time it.
+ */
+function describeComputeTime(seconds: number): string {
+  if (seconds >= 5400) {
+    const hours = Math.round(seconds / 1800) / 2;
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return formatDuration(Math.round(seconds));
 }
 
 function uploadWithProgress(
