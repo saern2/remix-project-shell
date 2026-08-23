@@ -155,6 +155,28 @@ const config = {
   chunkLeaseRenewMs: intEnv('CHUNK_LEASE_RENEW_MS', 20_000),
   fairnessPriorityStride: intEnv('FAIRNESS_PRIORITY_STRIDE', 1000),
 
+  /**
+   * Watchdog circuit breaker (Round A, after the 22 August outage): this many
+   * watchdog kills inside the window opens the breaker for the open duration.
+   *
+   * 8 kills / 900s, derived rather than guessed: with 4 chunk slots and >=300s
+   * per kill the physical ceiling is 12 kills per 900s window, baseline is
+   * ~0.04 expected kills per window (kill rate 0.10%), one deterministic
+   * bad-content chunk maxes ~3 per window and two concurrent bad chunks ~6 —
+   * so 8 means three-plus chunks dying at once, which is systemic overload and
+   * nothing else. See watchdogBreaker.js for the full derivation and the
+   * outage numbers.
+   */
+  watchdogBreakerKills: intEnv('WATCHDOG_BREAKER_KILLS', 8),
+  watchdogBreakerWindowSeconds: intEnv('WATCHDOG_BREAKER_WINDOW_S', 900),
+  /**
+   * How long the breaker stays open: a plain expiring Redis key, after which
+   * normal retry resumes (it reopens if kills immediately re-breach). Two
+   * watchdog budgets' worth — long enough for in-flight contention to drain,
+   * short enough that a transient storm does not blank the platform for long.
+   */
+  watchdogBreakerOpenSeconds: intEnv('WATCHDOG_BREAKER_OPEN_S', 600),
+
   // Legacy total-duration download cap, kept for backward compatibility but no
   // longer the primary guard. The download path now aborts on *stall* (no bytes
   // for downloadStallTimeoutSeconds) with an absolute downloadMaxSeconds backstop,
@@ -244,6 +266,15 @@ if (config.downloadStallTimeoutSeconds <= 0) {
 }
 if (config.downloadMaxSeconds <= 0) {
   throw new Error('DOWNLOAD_MAX_SECONDS must be > 0, got: ' + config.downloadMaxSeconds);
+}
+if (config.watchdogBreakerKills <= 0) {
+  throw new Error('WATCHDOG_BREAKER_KILLS must be > 0, got: ' + config.watchdogBreakerKills);
+}
+if (config.watchdogBreakerWindowSeconds <= 0) {
+  throw new Error('WATCHDOG_BREAKER_WINDOW_S must be > 0, got: ' + config.watchdogBreakerWindowSeconds);
+}
+if (config.watchdogBreakerOpenSeconds <= 0) {
+  throw new Error('WATCHDOG_BREAKER_OPEN_S must be > 0, got: ' + config.watchdogBreakerOpenSeconds);
 }
 
 module.exports = config;

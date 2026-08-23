@@ -316,6 +316,96 @@ describe('declared means declared', () => {
   }, 60000);
 });
 
+describe('the breaker marker changes the words and nothing else (Round A pin)', () => {
+  // The declare path is recently-repaired ground — 205 re-declarations over
+  // ~17 hours before _declaredAt existed. The B4 change may select a
+  // different MESSAGE when the recorded chunk reasons carry the breaker's
+  // marker; the decision to declare, the _declaredAt stamp, and the
+  // skip-forever branch must be identical with and without it. Both projects
+  // here walk the exact same lifecycle; only the words may differ.
+  const { recordChunkFailureDetail } = require('../../src/chunkRecovery');
+  const { BREAKER_USER_MESSAGE } = require('../../src/watchdogBreaker');
+
+  async function driveToDeclaredWithReasons(projectId, seedReason) {
+    await buildFlow(projectId, 2);
+    if (seedReason) {
+      // Exactly what the exhaustion handler records: the thrown message.
+      await recordChunkFailureDetail(redis, projectId, 1, seedReason);
+    }
+    await redis.del(`bull:${CHUNK_QUEUE}:${projectId}-chunk-1`);
+    let declared = null;
+    let sweeps = 0;
+    for (let round = 0; round < (MAX_RECONCILES_PER_PROJECT + 2) * 2; round += 1) {
+      sweeps += 1;
+      const findings = await sweep();
+      declared = findings.find((finding) => finding.action === 'declared-unrecoverable');
+      if (declared) break;
+    }
+    expect(declared).not.toBeNull();
+    const parent = await Job.fromId(stitchQueue, `${projectId}-stitch`);
+    return { parent, sweeps };
+  }
+
+  it('identical lifecycle, different words', async () => {
+    const withMarker = await driveToDeclaredWithReasons('loaded', BREAKER_USER_MESSAGE);
+    resetReconcilerState();
+    const without = await driveToDeclaredWithReasons('ordinary', null);
+
+    // THE DECISION: same number of sweeps to reach the declaration — the
+    // marker read sits inside the already-taken declare branch and cannot
+    // advance or delay it.
+    expect(withMarker.sweeps).toBe(without.sweeps);
+
+    // THE STAMP: _status and a valid _declaredAt in both, byte-identical in
+    // structure (same keys added to job data).
+    for (const { parent } of [withMarker, without]) {
+      expect(parent.data._status).toBe('failed');
+      expect(Date.parse(parent.data._declaredAt)).not.toBeNaN();
+    }
+    const addedKeys = (parent) =>
+      Object.keys(parent.data).filter((key) => key.startsWith('_')).sort();
+    expect(addedKeys(withMarker.parent)).toEqual(addedKeys(without.parent));
+
+    // THE WORDS: the only permitted difference. Both keep the envelope a
+    // person needs — what happened, that nothing was lost, what to do.
+    expect(withMarker.parent.data._error).toMatch(/under heavy load/);
+    expect(withMarker.parent.data._error).toMatch(/stopped early/);
+    expect(without.parent.data._error).toMatch(/could not be rendered after repeated attempts/);
+    expect(without.parent.data._error).not.toMatch(/under heavy load/);
+    for (const { parent } of [withMarker, without]) {
+      expect(parent.data._error).toMatch(/^Rendering could not finish: /);
+      expect(parent.data._error).toMatch(/Nothing was lost from your project/);
+      expect(parent.data._error).toMatch(/start the render again/);
+    }
+
+    // THE SKIP: declared means declared for both — later sweeps are silent,
+    // and nothing is re-declared.
+    const declaredSoFar = reconcilerCounters().declared;
+    for (let round = 0; round < 4; round += 1) {
+      expect(await sweep()).toEqual([]);
+    }
+    expect(reconcilerCounters().declared).toBe(declaredSoFar);
+  }, 120000);
+
+  it('the marker read cannot fail a declaration: an unreadable detail hash keeps the generic words', async () => {
+    // Poison the detail key type so HGETALL errors — readChunkFailureDetails
+    // swallows it and returns []; the declaration must proceed generically.
+    await buildFlow('poisoned', 2);
+    await redis.set('render:chunk-failure:poisoned', 'not-a-hash');
+    await redis.del(`bull:${CHUNK_QUEUE}:poisoned-chunk-1`);
+    let declared = null;
+    for (let round = 0; round < (MAX_RECONCILES_PER_PROJECT + 2) * 2; round += 1) {
+      const findings = await sweep();
+      declared = findings.find((finding) => finding.action === 'declared-unrecoverable');
+      if (declared) break;
+    }
+    expect(declared).not.toBeNull();
+    const parent = await Job.fromId(stitchQueue, 'poisoned-stitch');
+    expect(parent.data._status).toBe('failed');
+    expect(parent.data._error).toMatch(/could not be rendered after repeated attempts/);
+  }, 120000);
+});
+
 describe('the janitor cannot destroy what the reconciler needs', () => {
   it('skips temp directories belonging to a project still waiting', () => {
     // MEASURED on 2026-08-09: the sweep deleted 61 directories and 968 MB

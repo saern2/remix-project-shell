@@ -50,6 +50,7 @@ const { reuseCachedChunkOutput, registerChunkOutput } = require('./chunkCache');
 const { DelayedError } = require('bullmq');
 const { parentProjectId } = require('./fairScheduling');
 const admission = require('./admissionControl');
+const breaker = require('./watchdogBreaker');
 const maintenance = require('./maintenance');
 const {
   CHUNK_BAND_END,
@@ -1314,6 +1315,57 @@ async function deferChunk(job, token) {
   throw new DelayedError();
 }
 
+/**
+ * The watchdog circuit breaker's gate (Round A, Item 1).
+ *
+ * Placed BEFORE the admission gate, deliberately: while the breaker is open no
+ * project may be newly admitted. Without that ordering, slots freed by
+ * fast-failing projects would admit the next waiters straight into the same
+ * storm — at ~1 minute per exhausted retry ladder, an open breaker would
+ * cascade-fail the entire queue inside its own open window.
+ *
+ *  - ADMITTED projects fail fast with a plain worded error: they are the work
+ *    burning 300s slot-windows producing nothing, and failing in milliseconds
+ *    is the breaker's whole point (B3: fail, do not defer — silent waiting is
+ *    the failure class this codebase keeps removing).
+ *  - NOT-YET-ADMITTED projects hold at the existing deferral path, with the
+ *    same waiting-slot notice the admission gate publishes, so the wait is
+ *    visible in the UI exactly like any other admission wait. They are burning
+ *    nothing; failing them too would only widen the blast radius.
+ *
+ * A breaker that cannot be read degrades to 'proceed' inside breakerVerdict:
+ * normal operation, never refusal, is the failure posture of a load guard.
+ */
+async function gateOnBreaker(job, token) {
+  const redis = getCancelRedis();
+  const projectId = parentProjectId(job);
+  const verdict = await breaker.breakerVerdict(redis, projectId);
+  if (verdict.action === 'proceed') return;
+
+  if (verdict.action === 'fail-fast') {
+    logger.warn(
+      {
+        jobId: job.id,
+        projectId,
+        openUntil: new Date(verdict.openUntil).toISOString(),
+        chunkIndex: job.data?.chunk_index ?? null,
+      },
+      'Watchdog breaker is open; failing admitted chunk fast instead of burning a slot',
+    );
+    throw new Error(breaker.BREAKER_USER_MESSAGE);
+  }
+
+  // 'hold': same channel as an ordinary admission wait, so the status poll
+  // shows waiting-slot rather than the round-18 "waiting, 0 ahead" blind spot.
+  await publishJobHealth(redis, parentJobIdOf(job.id), {
+    state: 'waiting-slot',
+    phase: 'admission',
+    chunkIndex: job.data?.chunk_index ?? null,
+    limit: admission.admissionLimit(),
+  });
+  return deferChunk(job, token);
+}
+
 async function processRenderJob(job, token) {
   const payload = job.data;
   const jobId = job.id;
@@ -1321,6 +1373,11 @@ async function processRenderJob(job, token) {
   // Maintenance before admission: a frozen platform should not be handing out
   // slots, and a job that parks here has consumed nothing at all.
   if (await gateOnMaintenance(job, token)) return { status: 'frozen' };
+
+  // Breaker before admission: while it is open, admitted work fails fast and
+  // nothing new is admitted into the storm. See gateOnBreaker for why the
+  // ordering is load-bearing.
+  if (payload.is_chunk) await gateOnBreaker(job, token);
 
   // Admission first: nothing is downloaded, no temp directory is made, and no
   // capacity is consumed by a project that is only waiting for its turn.
@@ -1663,6 +1720,31 @@ async function processRenderJob(job, token) {
         willRetry: willRetry(job),
       };
       logger.error(detail, 'Chunk killed by watchdog; failing the job so BullMQ retries it');
+      // Feed the circuit breaker — this branch runs exactly once per kill
+      // (watchdog.fired), which is what makes the rolling window honest.
+      // Failure to record must never mask the kill itself.
+      try {
+        const outcome = await breaker.recordWatchdogKill(getCancelRedis(), {
+          jobId,
+          attempt: (job.attemptsMade ?? 0) + 1,
+        });
+        if (outcome.opened) {
+          // Once per OPENING, never per kill: the reconciler's 205
+          // re-declarations already proved what repetition does to a
+          // level-50 line's value as a signal. This is the alarm.
+          logger.error(
+            {
+              kills: outcome.count,
+              windowSeconds: config.watchdogBreakerWindowSeconds,
+              openSeconds: config.watchdogBreakerOpenSeconds,
+              openUntil: new Date(outcome.openUntil).toISOString(),
+            },
+            'WATCHDOG_BREAKER_OPEN: kill threshold breached; admitted chunks now fail fast and no new projects are admitted until it closes',
+          );
+        }
+      } catch (breakerErr) {
+        logger.warn({ jobId, err: breakerErr.message }, 'Watchdog kill not recorded by breaker');
+      }
       await publishJobHealth(getCancelRedis(), parentJobIdOf(jobId), {
         state: detail.willRetry ? 'retrying' : 'failing',
         reason: 'watchdog',

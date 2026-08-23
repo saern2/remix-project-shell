@@ -47,10 +47,16 @@ const RECOVERY_TTL_MS = 24 * 60 * 60 * 1000;
 /**
  * How many times a terminally-failed chunk is put back.
  *
- * Two, deliberately. Each recovery is a full fresh attempt cycle (jobAttempts
- * tries), so this is up to three cycles in total before the project is declared
- * broken. Past that the failure is not transient and repeating it only extends
- * the silence this exists to end.
+ * Two, deliberately. CORRECTED 2026-08-23 (Round A, V1): each recovery grants
+ * exactly ONE more run, not a fresh attempt cycle. job.retry() below is called
+ * without resetAttemptsMade, and BullMQ 5 only clears attemptsMade when that
+ * option is passed (job.js retry() / reprocessJob.lua, verified in the
+ * installed 5.12) — so the retried run comes back with attemptsMade already at
+ * the cap and is terminal again the moment it fails. The true ceiling is
+ * jobAttempts + MAX_CHUNK_RECOVERIES = 3 + 2 = 5 runs per chunk (~1,500s of
+ * slot time at the 300s watchdog budget), not the 9 runs / three full cycles
+ * this comment used to claim. Past that the failure is not transient and
+ * repeating it only extends the silence this exists to end.
  */
 const MAX_CHUNK_RECOVERIES = 2;
 
