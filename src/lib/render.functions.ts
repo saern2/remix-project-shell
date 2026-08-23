@@ -114,6 +114,50 @@ export const submitRenderJob = createServerFn({ method: "POST" })
       throw new Error(`Project is not ready to render (status: ${project.status}).`);
     }
 
+    // ── Submission ceiling (Round A, Item 2) ──────────────────────────────
+    // The 22 August outage: 42 projects submitted in 40 minutes, nothing
+    // anywhere refused, and the pile-up drove chunk times past the watchdog
+    // until ~two-thirds of 12 hours of render capacity produced nothing. This
+    // is the refusal that was missing, placed before any expensive work.
+    //
+    // Counted with the admin client — the ceiling is platform-wide load, and
+    // RLS would hide other users' jobs. The age cutoff is required, not
+    // defensive: one zombie row (c1c1586e, 19 days at 0%) must not hold a
+    // ceiling slot forever. This project's own rows are excluded — it cannot
+    // be in front of itself, and its own stale rows are exactly the zombie
+    // class. Fail-open on a count error: this is a load guard, not a security
+    // gate, and a transient DB blip must not block all submissions.
+    {
+      const {
+        maxInflightProjects,
+        shouldRefuseSubmission,
+        inflightRefusalMessage,
+        INFLIGHT_RENDER_STATUSES,
+        INFLIGHT_STALE_AFTER_HOURS,
+      } = await import("@/lib/render-inflight");
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const cutoffIso = new Date(
+        Date.now() - INFLIGHT_STALE_AFTER_HOURS * 60 * 60 * 1000,
+      ).toISOString();
+      const { count, error: inflightErr } = await supabaseAdmin
+        .from("render_jobs")
+        .select("id", { count: "exact", head: true })
+        .in("status", [...INFLIGHT_RENDER_STATUSES])
+        .neq("project_id", projectId)
+        .gte("created_at", cutoffIso);
+      if (inflightErr) {
+        console.warn("[render] in-flight count unavailable; ceiling not enforced this call", {
+          projectId,
+          error: inflightErr.message,
+        });
+      } else {
+        const limit = maxInflightProjects();
+        if (shouldRefuseSubmission(count ?? 0, limit)) {
+          throw new Error(inflightRefusalMessage(count ?? 0, limit));
+        }
+      }
+    }
+
     // Load scenes in timeline order. The plain path requires selected_clips;
     // fixed-duration rendering uses render_clip_slices as the source of truth.
     const { data: scenes, error: scenesErr } = await supabase
