@@ -61,6 +61,15 @@ vi.mock("@/integrations/supabase/client.server", () => ({
       }
       if (table === "render_jobs") {
         return {
+          // The Round A submission ceiling's in-flight count: an empty
+          // platform, so these tests exercise the paths below the ceiling.
+          select: () => ({
+            in: () => ({
+              neq: () => ({
+                gte: async () => ({ count: 0, error: null }),
+              }),
+            }),
+          }),
           insert: (row: unknown) => ({
             select: () => ({
               single: () => renderJobInsert(row),

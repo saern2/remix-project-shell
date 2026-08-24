@@ -21,6 +21,11 @@ import {
 import { describeChunkPhase, describeQueuePosition, describeStitchPhase } from "@/lib/render-queue";
 import { pollWithAuthRetry } from "@/lib/auth-retry.browser";
 import { retryModeForProject } from "@/lib/render-retry";
+import {
+  fetchAllSelectedClips,
+  SELECTED_CLIPS_SELECT,
+  selectedClipsByScene,
+} from "@/lib/selected-clips";
 import { describeUserFacingError, TRANSIENT_RETRYING } from "@/lib/user-errors";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -212,18 +217,23 @@ function ProjectDetail() {
     enabled: !!project && (isReady || project.status === "matching_footage"),
     queryKey: ["selected-clips", projectId],
     queryFn: async () => {
-      // Single query: join selected_clips → scenes (via scene_id FK) → clip_candidates.
-      // This avoids the previous two-step pattern (fetch scene IDs first, then
-      // fetch selected_clips with an IN filter) which caused a serial round-trip
-      // and made the Timeline appear late.
-      const { data, error } = await supabase
-        .from("selected_clips")
-        .select(
-          "scene_id, in_point, out_point, clip_candidates!inner(id, url, thumbnail_url, duration_sec, provider, provider_clip_id), scenes!inner(project_id)",
-        )
-        .eq("scenes.project_id", projectId);
-      if (error) throw error;
-      return data ?? [];
+      // Joined fetch (selected_clips → scenes → clip_candidates), now ordered
+      // by scene_id and range-paginated (Round A, Item 3). The unordered,
+      // uncapped version threw two live 57014 statement-timeout 500s on
+      // 2026-08-23 and would silently truncate to an arbitrary 1000 rows past
+      // PostgREST's max-rows. scene_id is UNIQUE on selected_clips, so this is
+      // a total order and pages cannot skip or duplicate. Sub-1000-row
+      // projects — all of them, at the current workload — still cost exactly
+      // one round trip. A source pin in selected-clips.test.ts guards this
+      // query shape.
+      return fetchAllSelectedClips((from, to) =>
+        supabase
+          .from("selected_clips")
+          .select(SELECTED_CLIPS_SELECT)
+          .eq("scenes.project_id", projectId)
+          .order("scene_id", { ascending: true })
+          .range(from, to),
+      );
     },
     refetchInterval: (query) => (project?.status === "matching_footage" ? 3000 : false),
   });
@@ -251,21 +261,10 @@ function ProjectDetail() {
     refetchInterval: () => (project?.status === "matching_footage" ? 1500 : false),
   });
 
-  const clipsByScene = useMemo(() => {
-    const map = new Map<string, { thumb: string | null; url: string; duration: number }>();
-    for (const row of clipsQuery.data ?? []) {
-      const c = row as unknown as {
-        scene_id: string;
-        clip_candidates: { thumbnail_url: string | null; url: string; duration_sec: number };
-      };
-      map.set(c.scene_id, {
-        thumb: c.clip_candidates.thumbnail_url,
-        url: c.clip_candidates.url,
-        duration: Number(c.clip_candidates.duration_sec),
-      });
-    }
-    return map;
-  }, [clipsQuery.data]);
+  const clipsByScene = useMemo(
+    () => selectedClipsByScene(clipsQuery.data ?? []),
+    [clipsQuery.data],
+  );
 
   // Sort clip slices by scene idx (from scenesQuery) then slice_index.
   // render_clip_slices has no idx column — scene_id is a UUID, not a sequence,
