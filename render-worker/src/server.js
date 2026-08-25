@@ -30,6 +30,7 @@ const { getQueue, getJobStatus, getRedisConnection, startWorker, getFlowProducer
 const { validatePayload } = require('./renderJob');
 const { buildChunkOpts, buildStitchOpts, writeCancelFlag } = require('./pipelineReliability');
 const { cancelJobsByPrefix } = require('./cancelJobs');
+const { logCpuVisibility } = require('./cpuVisibility');
 const maintenance = require('./maintenance');
 const admission = require('./admissionControl');
 const {
@@ -438,6 +439,11 @@ async function sweepOrphanedTempDirs() {
 }
 
 async function main() {
+  // CPU visibility (Round A, Item 4): print os.cpus() beside the cgroup quota
+  // once at startup. LOG ONLY — sizing is unchanged by explicit order; see
+  // cpuVisibility.js for why correcting it would halve ffmpegThreads.
+  logCpuVisibility(logger, config);
+
   // Start the BullMQ worker in the same process (simple deployment)
   // For separate worker processes: run `node src/worker.js` instead
   startWorker();

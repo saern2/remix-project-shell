@@ -33,7 +33,8 @@
 const { Job } = require('bullmq');
 const config = require('./config');
 const logger = require('./logger');
-const { recoverFailedChunk } = require('./chunkRecovery');
+const { recoverFailedChunk, readChunkFailureDetails } = require('./chunkRecovery');
+const { BREAKER_REASON_MARKER } = require('./watchdogBreaker');
 
 /** Cheap enough to run often; long enough that two sweeps still beat a human. */
 const RECONCILE_INTERVAL_MS = 150_000;
@@ -269,11 +270,22 @@ async function reconcileOnce({ stitchQueue, chunkQueue, redis, now = Date.now() 
     );
 
     if (record.repairs >= MAX_RECONCILES_PER_PROJECT) {
-      const message = await declareUnrecoverable(
-        stitchJob,
-        `${inspection.failed.length + inspection.missing.length} segment(s) could not be rendered after repeated attempts`,
-        now,
-      );
+      const unhealthyCount = inspection.failed.length + inspection.missing.length;
+      let detail = `${unhealthyCount} segment(s) could not be rendered after repeated attempts`;
+      // B4: when the chunks died because the watchdog breaker was open, the
+      // PROJECT-level message the user reads must say heavy load, not just a
+      // segment count. The recorded per-chunk reasons carry the breaker's
+      // marker phrase; reading them is advisory — the declaration must not
+      // fail because the detail hash was unreadable.
+      try {
+        const reasons = await readChunkFailureDetails(redis, projectId);
+        if (reasons.some((entry) => String(entry.reason).includes(BREAKER_REASON_MARKER))) {
+          detail = `the system was under heavy load and ${unhealthyCount} segment(s) were stopped early`;
+        }
+      } catch {
+        // Keep the generic detail.
+      }
+      const message = await declareUnrecoverable(stitchJob, detail, now);
       counters.declared += 1;
       // Fires ONCE per project — the declared-skip branch above guarantees it.
       // That is what makes this line an alarm rather than the noise it was
