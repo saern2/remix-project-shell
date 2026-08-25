@@ -42,15 +42,20 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { checkWebGpu, type WebGpuVerdict } from "@/lib/tts/webgpu";
-import { checkScript, extractScriptText, splitScriptIntoSentences } from "@/lib/tts/script-input";
 import {
-  ESTIMATE_SANITY_COMPUTE_SEC,
-  TTS_VOICES,
-  parseDtypeParam,
-  type SpeechEstimate,
-  type TtsProgress,
-} from "@/lib/tts/generate";
+  checkScript,
+  estimateSpokenSeconds,
+  extractScriptText,
+  splitScriptIntoSentences,
+} from "@/lib/tts/script-input";
+import { TTS_VOICES, parseDtypeParam } from "@/lib/tts/generate";
 import { isModelCached } from "@/lib/tts/model-host";
+import {
+  completeNarration,
+  pollNarrationJob,
+  submitNarrationJob,
+} from "@/lib/tts/narration.functions";
+import { driveNarration } from "@/lib/tts/narration-client";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -97,13 +102,6 @@ function NewProject() {
     void checkWebGpu().then(setWebGpu);
   }, [mode, webGpu]);
 
-  // The calibration decision, surfaced as a dialog. generateSpeech pauses at a
-  // sentence boundary awaiting the resolve — Continue or Cancel, with Cancel
-  // free because nothing has been persisted anywhere yet.
-  const [calibration, setCalibration] = useState<{
-    estimate: SpeechEstimate;
-    resolve: (verdict: "continue" | "cancel") => void;
-  } | null>(null);
   const { data: existingProjects = [], isLoading: projectsLoading } = useProjects();
   const { isAdmin } = useIsAdmin();
   const usage = projectUsage(existingProjects.length, { isAdmin });
@@ -262,6 +260,9 @@ function NewProject() {
   };
 
   const runPersistScript = useServerFn(persistScriptTranscript);
+  const runSubmitNarration = useServerFn(submitNarrationJob);
+  const runPollNarration = useServerFn(pollNarrationJob);
+  const runCompleteNarration = useServerFn(completeNarration);
 
   // ── The dtype comparison harness ──────────────────────────────────────────
   // Speaks PREVIEW_TEXT in the selected voice and plays it. Creates NOTHING —
@@ -350,19 +351,22 @@ function NewProject() {
   };
 
   /**
-   * The script path. Generation runs FIRST, entirely in this tab, with no
-   * project row anywhere — an interrupted tab leaves nothing at all, not even
-   * an orphaned 'uploading' project. Persistence begins only after the
-   * sample-exact gate has passed, and from there this is the upload path's
-   * own sequence: project row, signed PUT, audio_assets, then one server
-   * call that writes transcript + scenes and hands over to the pipeline.
+   * The script path (Round B: server-side). Sanitisation and splitting run
+   * HERE — the worker performs zero text processing, so the sentences the
+   * scenes are built from are the sentences spoken, byte for byte. The
+   * project row is created first in an honestly-named state
+   * ('generating_narration'); the tts-worker synthesises and uploads the WAV
+   * server-side; then the handoff replays the upload path's own tail:
+   * audio_assets -> status 'uploading' -> the unchanged
+   * persistScriptTranscript. A closed tab loses nothing: the project page
+   * resumes this exact loop (narration-client.ts) on the next visit.
+   *
+   * No WebGPU gate here any more — the server renders speech for machines
+   * the browser path refused or crawled on. The Preview button keeps its
+   * browser engine (and its gate) as the measurement instrument.
    */
   const handleScriptSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (webGpu && !webGpu.ok) {
-      toast.error(webGpu.message);
-      return;
-    }
     const verdict = checkScript(script);
     if (!verdict.ok) {
       toast.error(verdict.message);
@@ -373,70 +377,16 @@ function NewProject() {
     setProgress(0);
     let projectId: string | null = null;
     try {
-      // ── Generate: browser only, nothing persisted anywhere ──────────────
-      setStage("Loading the voice engine…");
-      const { loadEngine, generateSpeech } = await import("@/lib/tts/generate");
-      // The progress events cannot tell a cached read from a download — they
-      // fire identically for both (hub.js), which is how a fully-cached load
-      // once displayed "Downloading — 62%". The truthful label comes from
-      // asking the cache directly, before anything loads.
-      const modelCached = await isModelCached("fp32");
-      const onProgress = (event: TtsProgress) => {
-        if (event.stage === "model") {
-          const pct = event.totalBytes > 0 ? (event.loadedBytes / event.totalBytes) * 100 : 0;
-          setStage(
-            modelCached
-              ? "Loading the voice model from your browser's cache…"
-              : "Downloading the voice model (one-time, kept by your browser)…",
-          );
-          setProgress(Math.round(pct));
-        } else if (event.stage === "generating") {
-          const remaining =
-            event.estimatedRemainingComputeSec != null && event.estimatedRemainingComputeSec > 0
-              ? ` — about ${describeComputeTime(event.estimatedRemainingComputeSec)} left on this computer`
-              : "";
-          setStage(
-            `Generating speech — sentence ${event.sentence} of ${event.totalSentences} ` +
-              `(${formatDuration(Math.round(event.secondsGenerated))} of narration so far)${remaining}`,
-          );
-          setProgress(Math.round((event.sentence / event.totalSentences) * 100));
-        } else {
-          setStage("Assembling the audio…");
-          setProgress(100);
-        }
-      };
-      const engine = await loadEngine(onProgress);
       const sentences = splitScriptIntoSentences(script);
-      const speech = await generateSpeech({
-        sentences,
-        voice,
-        engine,
-        onProgress,
-        // Pauses at a sentence boundary with the measured per-machine
-        // estimate; the dialog's buttons resolve the promise. Preview never
-        // passes this — its fixed three sentences are the instrument.
-        onCalibration: (estimate) =>
-          new Promise<"continue" | "cancel">((resolve) => {
-            setCalibration({
-              estimate,
-              resolve: (verdict) => {
-                setCalibration(null);
-                resolve(verdict);
-              },
-            });
-          }),
-      });
 
-      // ── Persist: the upload path's own sequence, verbatim ───────────────
       setStage("Creating project…");
-      setProgress(0);
       const { data: userData } = await supabase.auth.getUser();
       if (!userData.user) throw new Error("Not signed in.");
       const { data: project, error: projectError } = await supabase
         .from("projects")
         .insert({
           name: name.trim() || "Untitled project",
-          status: "uploading",
+          status: "generating_narration",
           user_id: userData.user.id,
           niche: category === "space" ? "space" : "general",
           category: category === "none" ? null : category,
@@ -453,37 +403,31 @@ function NewProject() {
       }
       projectId = project.id;
 
-      const path = `${project.id}/${crypto.randomUUID()}.wav`;
-      const { data: signed, error: signedError } = await supabase.storage
-        .from("audio")
-        .createSignedUploadUrl(path);
-      if (signedError || !signed) {
-        throw new Error(signedError?.message ?? "Could not get upload URL.");
-      }
-
-      setStage("Uploading narration…");
-      const wavFile = new File([speech.wavBlob], "narration.wav", { type: "audio/wav" });
-      await uploadWithProgress(signed.signedUrl, wavFile, setProgress);
-
-      const { error: assetError } = await supabase.from("audio_assets").insert({
-        project_id: project.id,
-        storage_path: path,
-        filename: "narration.wav",
-        file_size_bytes: wavFile.size,
-        mime_type: "audio/wav",
+      setStage("Sending the script to the narration server…");
+      await runSubmitNarration({
+        data: { projectId: project.id, sentences, voice, fullText: script.trim() },
       });
-      if (assetError) throw new Error(assetError.message);
 
-      setStage("Setting up scenes…");
-      await runPersistScript({
-        data: {
-          projectId: project.id,
-          fullText: script.trim(),
-          voice,
-          durationSec: speech.durationSec,
-          sentences: speech.sentences,
+      const drive = await driveNarration({
+        projectId: project.id,
+        poll: (args) => runPollNarration(args),
+        complete: (args) => runCompleteNarration(args),
+        persist: async (completion) => {
+          setStage("Setting up scenes…");
+          await runPersistScript({
+            data: {
+              projectId: project.id,
+              fullText: completion.fullText,
+              voice: completion.voice,
+              durationSec: completion.durationSec,
+              sentences: completion.sentences,
+            },
+          });
         },
+        onStage: setStage,
+        estimatedAudioSec: estimateSpokenSeconds(script),
       });
+      if (drive.outcome === "failed") throw new Error(drive.message);
 
       setBusy(false);
       toast.success("Project created.");
@@ -493,11 +437,14 @@ function NewProject() {
       // Before the project row exists, failure leaves nothing to clean up.
       // After it, surface the failure on the project the user will find.
       if (projectId) {
+        // generating_narration included: the server path's project sits there
+        // while it fails. Terminal and pipeline states are left alone — the
+        // poll may already have written a more specific message.
         await supabase
           .from("projects")
           .update({ status: "failed", error_message: describeUserFacingError(err) })
           .eq("id", projectId)
-          .in("status", ["uploading", "draft"]);
+          .in("status", ["generating_narration", "uploading", "draft"]);
       }
       toast.error(describeUserFacingError(err));
     }
@@ -567,57 +514,12 @@ function NewProject() {
       ) : null}
 
       {/*
-        The calibration verdict: measured on THIS machine, presented before the
-        long part begins. generateSpeech is paused at a sentence boundary until
-        a button resolves it. The 2026-08-16 survey found 12-year-old machines
-        at 2.5-7.5 HOURS for a 45-minute script — this dialog is how that stops
-        being a surprise discovered two hours in.
+        Round B: the per-machine calibration dialog is gone with the local
+        generation it measured — narration runs on the server at a known rate,
+        and the progress card's queue position and ETA replace it. The
+        measured-estimate machinery survives intact in generate.ts for the
+        Preview instrument.
       */}
-      <AlertDialog open={calibration !== null}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {calibration &&
-              calibration.estimate.estimatedTotalComputeSec > ESTIMATE_SANITY_COMPUTE_SEC
-                ? "This will take a very long time on this computer"
-                : "Ready to generate on this computer"}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {calibration ? (
-                calibration.estimate.estimatedTotalComputeSec > ESTIMATE_SANITY_COMPUTE_SEC ? (
-                  <>
-                    Based on the first sentences, generating this narration here would take about{" "}
-                    <span className="font-medium text-foreground">
-                      {describeComputeTime(calibration.estimate.estimatedTotalComputeSec)}
-                    </span>
-                    . We recommend shortening the script, or recording the narration yourself and
-                    using Upload narration instead. Nothing has been saved, so cancelling is free —
-                    but you can continue if you want, keeping this tab open the whole time.
-                  </>
-                ) : (
-                  <>
-                    Based on the first sentences, generating this narration will take about{" "}
-                    <span className="font-medium text-foreground">
-                      {describeComputeTime(calibration.estimate.estimatedTotalComputeSec)}
-                    </span>{" "}
-                    on this computer. Keep this tab open while it runs. Nothing is saved until it
-                    finishes, so cancelling is free.
-                  </>
-                )
-              ) : null}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => calibration?.resolve("cancel")}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction onClick={() => calibration?.resolve("continue")}>
-              Continue
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
       <AlertDialog open={confirmDeleteOldest} onOpenChange={setConfirmDeleteOldest}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -698,14 +600,10 @@ function NewProject() {
               </TabsContent>
 
               <TabsContent value="script" className="space-y-4 pt-2">
-                {webGpu && !webGpu.ok ? (
-                  <Alert>
-                    <AlertCircle className="h-4 w-4" />
-                    <AlertTitle>This browser can't generate speech</AlertTitle>
-                    <AlertDescription>{webGpu.message}</AlertDescription>
-                  </Alert>
-                ) : null}
-
+                {/* Round B: no WebGPU refusal here any more — narration runs
+                    on the server, so the machines the browser path refused
+                    are exactly who this serves. Only Preview (the browser
+                    instrument) still needs the gate. */}
                 <div className="space-y-2">
                   <Label htmlFor="script">Script</Label>
                   <Textarea
@@ -718,7 +616,7 @@ function NewProject() {
                     }}
                     placeholder="Paste your narration script here…"
                     rows={10}
-                    disabled={busy || (webGpu != null && !webGpu.ok)}
+                    disabled={busy}
                   />
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-xs text-muted-foreground">
@@ -769,8 +667,8 @@ function NewProject() {
                     </SelectContent>
                   </Select>
                   <p className="text-xs text-muted-foreground">
-                    Speech is generated on your computer — the first use downloads a voice model
-                    (about 330 MB) that your browser keeps for next time.
+                    Narration is generated on our server — no download, and closing this tab
+                    won't stop it. Preview uses your browser and needs WebGPU.
                   </p>
                   <div className="flex items-center gap-3 pt-1">
                     <Button
@@ -864,10 +762,7 @@ function NewProject() {
               </Button>
               <Button
                 type="submit"
-                disabled={
-                  busy ||
-                  (mode === "audio" ? !file : !script.trim() || (webGpu != null && !webGpu.ok))
-                }
+                disabled={busy || (mode === "audio" ? !file : !script.trim())}
               >
                 {busy ? "Working…" : "Create project"}
               </Button>
@@ -879,18 +774,6 @@ function NewProject() {
   );
 }
 
-/**
- * "40s", "12 min", "2.5 hours" — the calibration estimate's units, coarse on
- * purpose: a per-machine extrapolation from a few sentences does not deserve
- * minute precision, and offering it would invite the user to time it.
- */
-function describeComputeTime(seconds: number): string {
-  if (seconds >= 5400) {
-    const hours = Math.round(seconds / 1800) / 2;
-    return `${hours} hour${hours === 1 ? "" : "s"}`;
-  }
-  return formatDuration(Math.round(seconds));
-}
 
 function uploadWithProgress(
   url: string,
