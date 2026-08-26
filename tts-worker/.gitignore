@@ -1,0 +1,8 @@
+# The weights never enter git — they are baked into the image at build time
+# from files the operator places in models/ (see models/README.md).
+models/*.onnx
+models/*.bin
+models/*.npz
+__pycache__/
+*.pyc
+.pytest_cache/

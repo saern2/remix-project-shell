@@ -3,7 +3,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { pollPipeline, startPipeline, swapSceneClip } from "@/lib/pipeline.functions";
+import {
+  persistScriptTranscript,
+  pollPipeline,
+  startPipeline,
+  swapSceneClip,
+} from "@/lib/pipeline.functions";
+import {
+  completeNarration,
+  pollNarrationJob,
+} from "@/lib/tts/narration.functions";
+import { driveNarration } from "@/lib/tts/narration-client";
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
 import {
@@ -92,6 +102,7 @@ type ClipSlice = {
 };
 
 const STATUS_STEPS: Array<{ key: string; label: string; pct: number }> = [
+  { key: "generating_narration", label: "Generating narration", pct: 10 },
   { key: "uploading", label: "Uploading audio", pct: 15 },
   { key: "draft", label: "Audio uploaded", pct: 25 },
   { key: "transcribing", label: "Transcribing", pct: 40 },
@@ -102,6 +113,7 @@ const STATUS_STEPS: Array<{ key: string; label: string; pct: number }> = [
 
 const STATUS_LABELS: Record<string, string> = {
   draft: "Draft",
+  generating_narration: "Generating narration",
   uploading: "Uploading",
   transcribing: "Transcribing",
   generating_scenes: "Generating scenes",
@@ -128,6 +140,14 @@ const STALE_POLL_CLAIM_MS = 90_000;
 const SERVER_ERROR_WINDOW_MS = 5 * 60_000;
 
 const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_footage"]);
+/**
+ * States where the project ROW should refetch quickly. Narration is included
+ * here but deliberately NOT in IN_PROGRESS: the pipeline poll (pollPipeline)
+ * has no business with a project whose narration is still being made — the
+ * narration drive loop owns that state and hands the row into 'uploading'
+ * itself.
+ */
+const ROW_REFRESH = new Set([...IN_PROGRESS, "generating_narration"]);
 const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching", "uploading"]);
 /** A render in one of these is over; polling it again only produces a 404. */
 const RENDER_TERMINAL = new Set(["completed", "failed", "cancelled", "not_found"]);
@@ -141,6 +161,9 @@ function ProjectDetail() {
   const queryClient = useQueryClient();
   const runPoll = useServerFn(pollPipeline);
   const runStart = useServerFn(startPipeline);
+  const runPollNarration = useServerFn(pollNarrationJob);
+  const runCompleteNarration = useServerFn(completeNarration);
+  const runPersistScript = useServerFn(persistScriptTranscript);
 
   const projectQuery = useQuery({
     queryKey: ["project", projectId],
@@ -154,7 +177,7 @@ function ProjectDetail() {
       return data ? (data as Project) : null;
     },
     // Refetch quickly while the pipeline is running.
-    refetchInterval: (query) => pollIntervalWhileActive(query.state.data, IN_PROGRESS, 3000),
+    refetchInterval: (query) => pollIntervalWhileActive(query.state.data, ROW_REFRESH, 3000),
   });
 
   const project = projectQuery.data;
@@ -675,6 +698,54 @@ function ProjectDetail() {
     };
   }, [projectStatus, projectId, queryClient, runPoll, navigate]);
 
+  // ── Server narration resume (Round B) ──────────────────────────────────
+  // A project in generating_narration may have been created by a tab that is
+  // long gone — the worker kept going regardless. This drives the SAME loop
+  // the creating tab runs (narration-client.ts): poll, then the idempotent
+  // handoff, then the unchanged persistScriptTranscript. Failure honesty
+  // lives server-side in the poll (worker-lost, worker-failed, and the
+  // whole-state staleness ceiling all mark the project failed with a worded
+  // message); this effect only reacts to the outcome.
+  const [narrationStage, setNarrationStage] = useState<string | null>(null);
+  useEffect(() => {
+    if (projectStatus !== "generating_narration") {
+      setNarrationStage(null);
+      return;
+    }
+    let cancelled = false;
+    void driveNarration({
+      projectId,
+      poll: (args) => runPollNarration(args),
+      complete: (args) => runCompleteNarration(args),
+      persist: async (completion) => {
+        setNarrationStage("Setting up scenes…");
+        await runPersistScript({
+          data: {
+            projectId,
+            fullText: completion.fullText,
+            voice: completion.voice,
+            durationSec: completion.durationSec,
+            sentences: completion.sentences,
+          },
+        });
+      },
+      onStage: (stage) => {
+        if (!cancelled) setNarrationStage(stage);
+      },
+      isCancelled: () => cancelled,
+    }).then((outcome) => {
+      if (cancelled) return;
+      if (outcome.outcome === "failed") {
+        toast.error(describeUserFacingError(new Error(outcome.message)));
+      }
+      // persisted, moved-on and failed all mean the row changed under us.
+      queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectStatus, projectId, queryClient, runPollNarration, runCompleteNarration, runPersistScript]);
+
   const fetchMatchingProgress = useServerFn(getMatchingProgress);
   const { data: matchingCounts } = useQuery({
     queryKey: ["matching-progress", projectId],
@@ -804,6 +875,16 @@ function ProjectDetail() {
                     corpus phase assigns no scenes at all, so the step list below
                     sits still and reads as stalled. These are the numbers the
                     poll already returns, said out loud. */}
+                {/* Server narration (Round B): the stage line from the drive
+                    loop — queue position, generation progress, or the
+                    reconnect notice. Without it a resumed project would show
+                    a motionless step list for the whole synthesis. */}
+                {project.status === "generating_narration" ? (
+                  <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                    <span>{narrationStage ?? "Checking narration progress…"}</span>
+                  </div>
+                ) : null}
                 {project.status === "matching_footage" && matchingView ? (
                   <div className="space-y-2 rounded-md border bg-muted/30 p-3">
                     {/* Paused is a NOTE beside the progress, never a

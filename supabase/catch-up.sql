@@ -1710,6 +1710,20 @@ alter table public.transcripts
   add constraint transcripts_provider_check
   check (provider in ('assemblyai', 'groq_whisper', 'deepgram', 'openai_whisper', 'kokoro_browser'));
 
+-- ── 20260825000001_generating_narration_status ──────────────────────────────
+-- Round B: server-side TTS. The project row now exists BEFORE audio does, and
+-- this status is the honest name for that window ('uploading' would make a
+-- server job in flight indistinguishable from an abandoned manual upload).
+
+alter table public.projects drop constraint if exists projects_status_check;
+alter table public.projects add constraint projects_status_check check (
+  status = any (array[
+    'draft', 'uploading', 'uploaded', 'transcribing', 'generating_narration',
+    'generating_scenes', 'matching_footage', 'ready', 'rendering', 'completed',
+    'failed'
+  ])
+);
+
 -- ── Verification: what you asked to confirm ─────────────────────────────────
 -- Run this last. Every row should say 'present'.
 
@@ -1741,5 +1755,6 @@ from (
     ('analytics_baseline seeded',        to_regclass('public.analytics_baseline') is not null and exists (select 1 from public.analytics_baseline where id = 1)),
     ('render_jobs.upload_sent_bytes',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='upload_sent_bytes')),
     ('stitch_state allows finalizing',   exists (select 1 from pg_constraint where conname='render_jobs_stitch_state_check' and pg_get_constraintdef(oid) like '%finalizing%')),
-    ('transcripts allow kokoro_browser', exists (select 1 from pg_constraint where conname='transcripts_provider_check' and pg_get_constraintdef(oid) like '%kokoro_browser%'))
+    ('transcripts allow kokoro_browser', exists (select 1 from pg_constraint where conname='transcripts_provider_check' and pg_get_constraintdef(oid) like '%kokoro_browser%')),
+    ('projects allow generating_narration', exists (select 1 from pg_constraint where conname='projects_status_check' and pg_get_constraintdef(oid) like '%generating_narration%'))
 ) as checks(check_name, present);
