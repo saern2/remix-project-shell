@@ -19,6 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { LANDING_PRODUCT_NAME } from "@/lib/branding";
 
 export const Route = createFileRoute("/auth")({
   ssr: false,
@@ -579,7 +580,7 @@ function AuthFrame({ children }: { children: React.ReactNode }) {
       <div className="w-full max-w-md">
         <div className="mb-8 text-center">
           <Link to="/" className="text-2xl font-bold">
-            Auto Video Creator
+            {LANDING_PRODUCT_NAME}
           </Link>
           <p className="mt-2 text-sm text-muted-foreground">Approval-only creative workspace</p>
         </div>

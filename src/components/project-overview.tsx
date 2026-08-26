@@ -5,14 +5,17 @@ import { addHours, formatDistanceToNow } from "date-fns";
 import { useState } from "react";
 import {
   AlertCircle,
+  AudioLines,
   CheckCircle2,
   Clock3,
+  FileText,
   FolderKanban,
   Loader2,
   Plus,
   Trash2,
   Video,
 } from "lucide-react";
+import { APP_PRODUCT_NAME } from "@/lib/branding";
 import { supabase } from "@/integrations/supabase/client";
 import { deleteProject } from "@/lib/deleteProject";
 import { useIsAdmin } from "@/hooks/use-is-admin";
@@ -245,6 +248,10 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
             ))}
           </div>
         ) : projects.length === 0 ? (
+          /* Round C (R2): the first-run state offers both paths as equals —
+             one line each, no time promises. The links mirror the nav: bare
+             /projects/new is the audio default, ?mode=script preselects the
+             script tab (project-mode.ts). */
           <Card>
             <CardContent className="flex flex-col items-center py-14 text-center">
               <span className="grid h-12 w-12 place-items-center rounded-lg bg-primary-subtle text-primary">
@@ -252,10 +259,22 @@ export function ProjectOverview({ projectsOnly = false }: { projectsOnly?: boole
               </span>
               <h3 className="mt-4 text-base font-semibold">Create your first video</h3>
               <p className="mt-1 max-w-sm text-sm text-muted-foreground">
-                Upload a voiceover and Scene Smith will prepare the scenes and footage.
+                Start from a narration you recorded, or paste a script and {APP_PRODUCT_NAME}{" "}
+                narrates it for you.
               </p>
-              <div className="mt-5">
-                <CreateProjectAction atLimit={false} />
+              <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
+                <Button asChild>
+                  <Link to="/projects/new">
+                    <AudioLines className="mr-2 h-4 w-4" />
+                    Audio to Video
+                  </Link>
+                </Button>
+                <Button asChild variant="outline">
+                  <Link to="/projects/new" search={{ mode: "script" } as never}>
+                    <FileText className="mr-2 h-4 w-4" />
+                    Script to Video
+                  </Link>
+                </Button>
               </div>
             </CardContent>
           </Card>

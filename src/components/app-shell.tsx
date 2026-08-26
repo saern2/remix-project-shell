@@ -9,6 +9,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleUserRound,
+  FileText,
   FolderKanban,
   LayoutDashboard,
   LogOut,
@@ -20,6 +21,8 @@ import {
   UsersRound,
   type LucideIcon,
 } from "lucide-react";
+import { isNavItemActive } from "@/lib/nav-active";
+import { APP_PRODUCT_NAME } from "@/lib/branding";
 import { useIsAdmin } from "@/hooks/use-is-admin";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
@@ -44,12 +47,24 @@ type ShellPath =
   | "/account"
   | "/admin"
   | "/users";
-type NavItem = { label: string; to: ShellPath; icon: LucideIcon; exact?: boolean };
+type NavItem = {
+  label: string;
+  to: ShellPath;
+  icon: LucideIcon;
+  exact?: boolean;
+  /** Round C: the two project-creation entries share one route; the mode
+   * param is what distinguishes them, in the link and in the highlight. */
+  search?: { mode: "script" };
+};
 
 const PRIMARY_NAV: NavItem[] = [
   { label: "Dashboard", to: "/dashboard", icon: LayoutDashboard, exact: true },
   { label: "Stats", to: "/stats", icon: ChartColumnBig, exact: true },
+  // Equal billing, adjacent, one route: Audio keeps the bare URL (the
+  // default tab, so every pre-existing /projects/new link is unchanged);
+  // Script preselects its tab via ?mode=script (see project-mode.ts).
   { label: "Audio to Video", to: "/projects/new", icon: AudioLines },
+  { label: "Script to Video", to: "/projects/new", icon: FileText, search: { mode: "script" } },
   { label: "Projects", to: "/projects", icon: FolderKanban },
 ] as const;
 
@@ -58,11 +73,10 @@ const SECONDARY_NAV: NavItem[] = [
   { label: "Account", to: "/account", icon: CircleUserRound },
 ] as const;
 
-function isActive(pathname: string, to: string, exact?: boolean) {
-  if (to === "/dashboard" && !exact)
-    return pathname === "/dashboard" || pathname.startsWith("/projects/");
-  return exact ? pathname === to : pathname === to || pathname.startsWith(`${to}/`);
-}
+// The active matcher lives in lib/nav-active.ts (pure, tested): with two
+// entries on /projects/new it must read the search params too, and exactly
+// one may highlight. The highlight follows the URL, not the live tab — a
+// decision (operator's R4), documented there.
 
 function ThemeMenuItems() {
   const { theme, setTheme } = useTheme();
@@ -79,16 +93,24 @@ function ThemeMenuItems() {
 }
 
 function ShellNav({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: () => void }) {
-  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const location = useRouterState({
+    select: (state) => ({
+      pathname: state.location.pathname,
+      search: state.location.search as Record<string, unknown>,
+    }),
+  });
   const { isAdmin } = useIsAdmin();
 
   const renderLink = (item: NavItem) => {
-    const active = isActive(pathname, item.to, item.exact);
+    const active = isNavItemActive(location, item);
     const Icon = item.icon;
     return (
       <Link
         key={item.label}
         to={item.to}
+        // The route declares no validateSearch, so the param rides untyped;
+        // project-mode.ts treats anything but "script" as the audio default.
+        search={(item.search ?? {}) as never}
         aria-current={active ? "page" : undefined}
         title={collapsed ? item.label : undefined}
         onClick={onNavigate}
@@ -191,7 +213,7 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground">
             <AudioLines className="h-5 w-5" />
           </span>
-          {!collapsed ? <span className="font-semibold">Scene Smith</span> : null}
+          {!collapsed ? <span className="font-semibold">{APP_PRODUCT_NAME}</span> : null}
         </div>
         <ShellNav collapsed={collapsed} />
         <div className="border-t p-3">{accountMenu}</div>
@@ -222,13 +244,13 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
               <span className="grid h-9 w-9 place-items-center rounded-md bg-primary text-primary-foreground">
                 <AudioLines className="h-5 w-5" />
               </span>
-              Scene Smith
+              {APP_PRODUCT_NAME}
             </SheetTitle>
             <ShellNav collapsed={false} onNavigate={() => setMobileOpen(false)} />
             <div className="border-t p-3">{accountMenu}</div>
           </SheetContent>
         </Sheet>
-        <span className="text-sm font-semibold">Scene Smith</span>
+        <span className="text-sm font-semibold">{APP_PRODUCT_NAME}</span>
         <span className="text-muted-foreground" title={`${resolvedTheme} theme`}>
           {resolvedTheme === "dark" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
         </span>

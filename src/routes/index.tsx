@@ -11,31 +11,34 @@ import { HeroDemo } from "@/components/landing/HeroDemo";
 import { cn } from "@/lib/utils";
 import { useEffect, useState } from "react";
 import { AudioLines, ArrowRight, Menu, X } from "lucide-react";
+import { LANDING_PRODUCT_NAME } from "@/lib/branding";
+
+// Search-result and social-preview text (Round C): states BOTH inputs, and
+// promises no wait time anywhere — the in-app queue shows the live estimate.
+// "narrated for you on our servers" is the verified 2026-08-26 production
+// claim (tts-worker, server-side); nothing here says browser, download, or
+// WebGPU, because none of that is true any more.
+const META_TITLE = `${LANDING_PRODUCT_NAME} — Voiceover or script in, video out`;
+const META_DESCRIPTION =
+  `${LANDING_PRODUCT_NAME} turns a voiceover — or a script narrated for you on our servers — ` +
+  "into a publish-ready video: transcribed, split into scenes, matched to stock footage, and rendered. " +
+  "No editing timeline required.";
+const META_SOCIAL_DESCRIPTION =
+  "Upload audio or paste a script — narration is generated on our servers when you start from text. " +
+  "Scene matching, stock footage, custom pacing, and auto-render.";
 
 export const Route = createFileRoute("/")({
   ssr: false,
   head: () => ({
     meta: [
-      { title: "Auto Video Creator — Upload a voiceover, get a video" },
-      {
-        name: "description",
-        content:
-          "Auto Video Creator transcribes your audio, breaks it into scenes, matches stock footage, and renders a publish-ready video. No editing timeline required.",
-      },
-      { property: "og:title", content: "Auto Video Creator — Upload a voiceover, get a video" },
-      {
-        property: "og:description",
-        content:
-          "Transcription, scene matching, stock footage, custom pacing, and auto-render from a single audio file.",
-      },
+      { title: META_TITLE },
+      { name: "description", content: META_DESCRIPTION },
+      { property: "og:title", content: META_TITLE },
+      { property: "og:description", content: META_SOCIAL_DESCRIPTION },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:title", content: "Auto Video Creator — Upload a voiceover, get a video" },
-      {
-        name: "twitter:description",
-        content:
-          "Transcription, scene matching, stock footage, custom pacing, and auto-render from a single audio file.",
-      },
+      { name: "twitter:title", content: META_TITLE },
+      { name: "twitter:description", content: META_SOCIAL_DESCRIPTION },
     ],
   }),
   beforeLoad: async () => {
@@ -45,12 +48,23 @@ export const Route = createFileRoute("/")({
   component: Landing,
 });
 
-const TAGS = ["Transcription", "Scene matching", "Stock footage", "Custom pacing", "Auto-render"];
+// "Script narration" added (Round C): the one narration term, keeping the
+// list at six rather than becoming a list of nine.
+const TAGS = [
+  "Script narration",
+  "Transcription",
+  "Scene matching",
+  "Stock footage",
+  "Custom pacing",
+  "Auto-render",
+];
 
 const STEPS = [
   {
-    title: "Upload your audio",
-    body: "Drop in a voiceover or narration file. That's the entire brief.",
+    // Step 1 covers both inputs (Round C); steps 2-5 are downstream of
+    // narration and identical for both modes — confirmed unchanged.
+    title: "Start with audio — or a script",
+    body: "Drop in a voiceover, or paste your script and we narrate it on our servers. Either one is the entire brief.",
   },
   {
     title: "We break it into scenes",
@@ -73,7 +87,20 @@ const STEPS = [
 const FAQ = [
   {
     q: "What do I need to provide?",
-    a: "Just an audio file — a voiceover, narration, or recorded script. Nothing else required.",
+    // Both inputs, equal billing (Round C). "Generated for you" is the
+    // verified server path — no browser, no download, nothing on the user's
+    // machine (largest browser payload in the whole measured run: 57 KB).
+    a: "An audio file — a voiceover or recorded narration — or just a script. Paste the text and the narration is generated for you. Nothing else required.",
+  },
+  {
+    // New in Round C. Every claim traced to the 2026-08-26 production run:
+    // server-side (tts-worker, RTF 0.760 under concurrent render load); no
+    // WebGPU/GPU/download, identical on any machine; the job survives a
+    // closed tab and the project resumes on the next visit; the queue shows
+    // a live estimate. Deliberately NO end-to-end wait time stated — the
+    // in-app estimate owns that number.
+    q: "How does script narration work?",
+    a: "Your script is read by a natural-sounding voice on our servers — nothing runs on your computer and there's nothing to download, so it works the same on any machine. You don't need to keep the tab open: the job keeps going, and your project picks up where it left off next time you look. A live time estimate shows while it runs.",
   },
   {
     q: "Where does the footage come from?",
@@ -89,6 +116,10 @@ const FAQ = [
   },
   {
     q: "How long can my video be?",
+    // KEEP THIS WORDING — it was wrong once already (dc4227e fixed "a few
+    // minutes" → 45). The numbers are CONFIRMED by production measurement,
+    // 2026-08-26: 303 sentences → 763.775 s of narration = 2.4 words/sec,
+    // so 45 min ≈ 6,480 words ≈ the "roughly 6,500-word script" stated here.
     a: "Narration up to 45 minutes renders reliably — roughly a 6,500-word script. Longer pieces should be split into parts, one project each.",
   },
 ];
@@ -133,7 +164,7 @@ function Landing() {
           <div className="flex min-w-0 items-center gap-2">
             <AudioLines className="h-5 w-5 shrink-0 text-primary" />
             <span className="truncate text-lg font-semibold tracking-tight">
-              Auto Video Creator
+              {LANDING_PRODUCT_NAME}
             </span>
           </div>
 
@@ -205,13 +236,17 @@ function Landing() {
           <div className="relative mx-auto flex min-h-screen max-w-6xl flex-col items-center justify-center px-6 pb-24 pt-32 text-center sm:pt-36">
             <p className="text-sm text-muted-foreground">{TAGS.join(" · ")}</p>
 
+            {/* Round C: both inputs, same cadence, still concrete — the
+                closer "Get a video." survives intact. */}
             <h1 className="text-display mt-6 max-w-3xl text-foreground">
-              Upload a voiceover. Get a <em className="italic text-primary">video</em>.
+              Upload a voiceover or paste a script. Get a{" "}
+              <em className="italic text-primary">video</em>.
             </h1>
 
             <p className="mx-auto mt-6 max-w-2xl text-base leading-relaxed text-muted-foreground sm:text-lg">
-              Auto Video Creator transcribes, matches footage, scores pacing, and renders a
-              publish-ready video from a single audio file. No editing timeline required.
+              {LANDING_PRODUCT_NAME} starts from a single audio file — or narrates your script for
+              you — then matches footage, scores pacing, and renders a publish-ready video. No
+              editing timeline required.
             </p>
 
             <div className="mt-10 flex flex-wrap items-center justify-center gap-4">
@@ -314,7 +349,7 @@ function Landing() {
         <section className="border-t border-border bg-linear-to-b from-background to-surface">
           <div className="mx-auto max-w-6xl px-6 py-24 text-center sm:py-32">
             <h2 className="mx-auto max-w-2xl text-4xl font-bold tracking-tight sm:text-5xl">
-              Your next video is one upload away.
+              Your next video is one upload — or one script — away.
             </h2>
             <div className="mt-10 flex flex-wrap items-center justify-center gap-4">
               <Button size="lg" asChild>
@@ -333,7 +368,7 @@ function Landing() {
 
       <footer className="border-t border-border bg-surface">
         <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-6 py-12 text-sm text-muted-foreground sm:flex-row">
-          <span className="font-medium text-foreground">Auto Video Creator</span>
+          <span className="font-medium text-foreground">{LANDING_PRODUCT_NAME}</span>
           <nav className="flex flex-wrap items-center justify-center gap-6" aria-label="Footer">
             {NAV_LINKS.map((l) => (
               <a key={l.href} href={l.href} className="transition-colors hover:text-foreground">
@@ -344,7 +379,7 @@ function Landing() {
               Sign in
             </Link>
           </nav>
-          <span>Audio in, publish-ready video out.</span>
+          <span>Audio or script in, publish-ready video out.</span>
         </div>
       </footer>
     </div>
