@@ -47,11 +47,12 @@ import {
   shouldWarnAboutPool,
 } from "@/lib/pexels-pool-health";
 import { ArrowLeft, Loader2, RefreshCw, Upload, ShieldCheck, Trash2 } from "lucide-react";
+import { LANDING_PRODUCT_NAME } from "@/lib/branding";
 
 export const Route = createFileRoute("/_authenticated/admin")({
   head: () => ({
     meta: [
-      { title: "Admin panel — Auto Video Creator" },
+      { title: `Admin panel — ${LANDING_PRODUCT_NAME}` },
       { name: "description", content: "Review platform activity and stock provider health." },
       { name: "robots", content: "noindex" },
     ],

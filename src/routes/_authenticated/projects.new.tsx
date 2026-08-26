@@ -1,4 +1,5 @@
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate, useSearch } from "@tanstack/react-router";
+import { initialProjectMode } from "@/lib/project-mode";
 import { useEffect, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { supabase } from "@/integrations/supabase/client";
@@ -89,7 +90,12 @@ function NewProject() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState<string>("");
-  const [mode, setMode] = useState<"audio" | "script">("audio");
+  // Round C (R1): the nav's "Script to Video" entry preselects its tab via
+  // ?mode=script; a bare URL keeps the audio default every legacy link
+  // expects. ONLY the initial value reads the URL — the Tabs mode switch and
+  // both submit handlers are untouched.
+  const urlSearch = useSearch({ strict: false }) as Record<string, unknown>;
+  const [mode, setMode] = useState<"audio" | "script">(initialProjectMode(urlSearch));
   const [script, setScript] = useState("");
   const [voice, setVoice] = useState<string>(TTS_VOICES[0].id);
   const [scriptWarning, setScriptWarning] = useState<string | null>(null);

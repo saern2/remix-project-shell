@@ -9,11 +9,12 @@ import { AdminAccessPanel } from "@/components/admin-access-panel";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { LANDING_PRODUCT_NAME } from "@/lib/branding";
 
 export const Route = createFileRoute("/_authenticated/users")({
   head: () => ({
     meta: [
-      { title: "User management - Auto Video Creator" },
+      { title: `User management - ${LANDING_PRODUCT_NAME}` },
       { name: "description", content: "Manage user accounts, approvals, and access secrets." },
       { name: "robots", content: "noindex" },
     ],

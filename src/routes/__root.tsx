@@ -15,6 +15,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { decideAuthInvalidation } from "@/lib/auth-invalidation";
 import { Toaster } from "@/components/ui/sonner";
 import { ThemeProvider, themeBootScript } from "@/components/theme-provider";
+import { LANDING_PRODUCT_NAME } from "@/lib/branding";
 
 function NotFoundComponent() {
   return (
@@ -76,9 +77,8 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   );
 }
 
-const APP_TITLE = "Auto Video Creator v2";
-const APP_DESCRIPTION =
-  "Turn audio into scene-matched video. Upload a track and let Auto Video Creator draft a video for you.";
+const APP_TITLE = `${LANDING_PRODUCT_NAME} v2`;
+const APP_DESCRIPTION = `Turn audio into scene-matched video. Upload a track and let ${LANDING_PRODUCT_NAME} draft a video for you.`;
 
 export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
   head: () => ({

@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Monitor, Moon, Sun } from "lucide-react";
 import { useTheme, type ThemePreference } from "@/components/theme-provider";
 import { Button } from "@/components/ui/button";
+import { APP_PRODUCT_NAME } from "@/lib/branding";
 
 export const Route = createFileRoute("/_authenticated/settings")({ component: SettingsPage });
 
@@ -19,7 +20,7 @@ function SettingsPage() {
         <p className="text-sm font-medium text-primary">Workspace</p>
         <h1 className="mt-1 text-2xl font-semibold">Settings</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Choose how Scene Smith looks on this device.
+          Choose how {APP_PRODUCT_NAME} looks on this device.
         </p>
       </div>
       <section className="border-t py-6" aria-labelledby="appearance-heading">
