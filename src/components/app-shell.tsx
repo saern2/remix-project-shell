@@ -9,6 +9,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleUserRound,
+  Clapperboard,
   FileText,
   FolderKanban,
   LayoutDashboard,
@@ -52,9 +53,9 @@ type NavItem = {
   to: ShellPath;
   icon: LucideIcon;
   exact?: boolean;
-  /** Round C: the two project-creation entries share one route; the mode
+  /** Rounds C/D: the project-creation entries share one route; the mode
    * param is what distinguishes them, in the link and in the highlight. */
-  search?: { mode: "script" };
+  search?: { mode: "script" | "motion" };
 };
 
 const PRIMARY_NAV: NavItem[] = [
@@ -65,6 +66,7 @@ const PRIMARY_NAV: NavItem[] = [
   // Script preselects its tab via ?mode=script (see project-mode.ts).
   { label: "Audio to Video", to: "/projects/new", icon: AudioLines },
   { label: "Script to Video", to: "/projects/new", icon: FileText, search: { mode: "script" } },
+  { label: "Motion Explainer", to: "/projects/new", icon: Clapperboard, search: { mode: "motion" } },
   { label: "Projects", to: "/projects", icon: FolderKanban },
 ] as const;
 

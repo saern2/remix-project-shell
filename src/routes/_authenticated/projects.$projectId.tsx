@@ -13,6 +13,8 @@ import {
   completeNarration,
   pollNarrationJob,
 } from "@/lib/tts/narration.functions";
+import { pollMotionJob } from "@/lib/motion/motion.functions";
+import { describeMotionStage } from "@/lib/motion/motion";
 import { driveNarration } from "@/lib/tts/narration-client";
 import { submitRenderJob, pollRenderJob, cancelRenderJob } from "@/lib/render.functions";
 import { deleteProject } from "@/lib/deleteProject";
@@ -114,6 +116,7 @@ const STATUS_STEPS: Array<{ key: string; label: string; pct: number }> = [
 const STATUS_LABELS: Record<string, string> = {
   draft: "Draft",
   generating_narration: "Generating narration",
+  generating_motion: "Generating explainer",
   uploading: "Uploading",
   transcribing: "Transcribing",
   generating_scenes: "Generating scenes",
@@ -147,7 +150,7 @@ const IN_PROGRESS = new Set(["transcribing", "generating_scenes", "matching_foot
  * narration drive loop owns that state and hands the row into 'uploading'
  * itself.
  */
-const ROW_REFRESH = new Set([...IN_PROGRESS, "generating_narration"]);
+const ROW_REFRESH = new Set([...IN_PROGRESS, "generating_narration", "generating_motion"]);
 const RENDER_ACTIVE = new Set(["queued", "downloading", "rendering", "stitching", "uploading"]);
 /** A render in one of these is over; polling it again only produces a 404. */
 const RENDER_TERMINAL = new Set(["completed", "failed", "cancelled", "not_found"]);
@@ -162,6 +165,7 @@ function ProjectDetail() {
   const runPoll = useServerFn(pollPipeline);
   const runStart = useServerFn(startPipeline);
   const runPollNarration = useServerFn(pollNarrationJob);
+  const runPollMotion = useServerFn(pollMotionJob);
   const runCompleteNarration = useServerFn(completeNarration);
   const runPersistScript = useServerFn(persistScriptTranscript);
 
@@ -473,7 +477,13 @@ function ProjectDetail() {
   };
 
   // Poll worker while the current render job is active.
+  //
+  // Round D: NOT while the explainer is being generated — a motion project's
+  // render_jobs row sits 'queued' as the shared-ceiling vehicle, but the
+  // RENDER worker has never heard of it, and polling would turn its honest
+  // 404 into a failed row. The motion poll effect below owns that state.
   useEffect(() => {
+    if (project?.status === "generating_motion") return;
     if (!renderJobId || !renderJobStatus || !RENDER_ACTIVE.has(renderJobStatus)) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -513,7 +523,55 @@ function ProjectDetail() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [renderJobId, renderJobStatus, projectId, queryClient, runPollRender, navigate]);
+  }, [renderJobId, renderJobStatus, project?.status, projectId, queryClient, runPollRender, navigate]);
+
+  // ── Motion explainer drive (Round D) ──────────────────────────────────
+  // The poll owns the whole lifecycle server-side (verdict, failure
+  // honesty, the completion handoff into the ordinary completed-render
+  // playback path); this effect just keeps asking and shows the stage.
+  // Tab-close survivable by construction: any visit to this page resumes.
+  const [motionStage, setMotionStage] = useState<string | null>(null);
+  useEffect(() => {
+    if (project?.status !== "generating_motion") {
+      setMotionStage(null);
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      try {
+        const poll = await runPollMotion({ data: { projectId } });
+        if (cancelled) return;
+        if (poll.status === "waiting") {
+          setMotionStage(
+            describeMotionStage({
+              status: poll.worker_status,
+              queue_position: poll.queue_position,
+              eta_seconds: poll.eta_seconds,
+              progress_pct: poll.progress_pct,
+            }),
+          );
+          timer = setTimeout(tick, 5000);
+          return;
+        }
+        if (poll.status === "failed") {
+          toast.error(describeUserFacingError(new Error(poll.error)));
+        }
+        // failed, completed and moved-on all changed the row server-side.
+        queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+        queryClient.invalidateQueries({ queryKey: ["render-job", projectId] });
+      } catch {
+        if (cancelled) return;
+        setMotionStage("Reconnecting to the explainer service…");
+        timer = setTimeout(tick, 5000);
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [project?.status, projectId, queryClient, runPollMotion]);
 
   // One-shot poll for completed jobs whose stored output_url is missing or is a
   // pre-signed upload URL (not a playback URL). This happens when:
@@ -1097,7 +1155,15 @@ function ProjectDetail() {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  {renderJob && RENDER_ACTIVE.has(renderJob.status) ? (
+                  {project.status === "generating_motion" ? (
+                    /* Round D: the explainer's own stage line; the queued
+                       render_jobs row beneath it is the ceiling/delivery
+                       vehicle, not a render to poll. */
+                    <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                      <span>{motionStage ?? "Checking explainer progress…"}</span>
+                    </div>
+                  ) : renderJob && RENDER_ACTIVE.has(renderJob.status) ? (
                     <>
                       <div className="flex items-center gap-2 text-sm text-muted-foreground">
                         <Loader2 className="h-4 w-4 animate-spin" />

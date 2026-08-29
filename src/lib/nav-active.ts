@@ -1,10 +1,11 @@
 /**
  * Which nav entry lights up (Round C, Item 1).
  *
- * Two entries share /projects/new — Audio to Video (no search param, the
- * default tab, so every legacy bare link still lands on it) and Script to
- * Video (?mode=script). The old matcher compared pathname only, which would
- * light both; the mode param is the discriminator, and exactly one matches.
+ * The project-creation entries share /projects/new — Audio to Video (no
+ * search param, the default tab, so every legacy bare link still lands on
+ * it), Script to Video (?mode=script) and Motion Explainer (?mode=motion).
+ * The old matcher compared pathname only, which would light them all; the
+ * mode param is the discriminator, and exactly one matches.
  *
  * DECISION, NOT OVERSIGHT (operator's R4): the highlight follows the URL,
  * not the live tab. A user who arrives via "Audio to Video" and clicks the
@@ -20,7 +21,7 @@
 export type NavTarget = {
   to: string;
   exact?: boolean;
-  search?: { mode: "script" };
+  search?: { mode: "script" | "motion" };
 };
 
 export type NavLocation = {
@@ -38,8 +39,12 @@ export function isNavItemActive(location: NavLocation, item: NavTarget): boolean
     : pathname === item.to || pathname.startsWith(`${item.to}/`);
   if (!pathMatches) return false;
   if (item.to === "/projects/new") {
-    const scriptMode = location.search["mode"] === "script";
-    return item.search?.mode === "script" ? scriptMode : !scriptMode;
+    // Three entries share the route (audio bare, script and motion via the
+    // mode param); an unrecognised param counts as the audio default, the
+    // same rule initialProjectMode applies — so highlight and content agree.
+    const raw = location.search["mode"];
+    const urlMode = raw === "script" || raw === "motion" ? raw : undefined;
+    return urlMode === item.search?.mode;
   }
   return true;
 }

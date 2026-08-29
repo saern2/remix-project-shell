@@ -1724,6 +1724,30 @@ alter table public.projects add constraint projects_status_check check (
   ])
 );
 
+-- ── 20260829000001_motion_explainers ────────────────────────────────────────
+-- Round D: bring-your-own-key motion explainers. Encrypted key storage
+-- (service-role only, zero authenticated grants) and the honest status for
+-- a project whose explainer is being generated server-side.
+
+create table if not exists public.user_provider_keys (
+  user_id uuid primary key references public.users(id) on delete cascade,
+  ciphertext text not null,
+  key_tail text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table public.user_provider_keys enable row level security;
+grant all on public.user_provider_keys to service_role;
+
+alter table public.projects drop constraint if exists projects_status_check;
+alter table public.projects add constraint projects_status_check check (
+  status = any (array[
+    'draft', 'uploading', 'uploaded', 'transcribing', 'generating_narration',
+    'generating_motion', 'generating_scenes', 'matching_footage', 'ready',
+    'rendering', 'completed', 'failed'
+  ])
+);
+
 -- ── Verification: what you asked to confirm ─────────────────────────────────
 -- Run this last. Every row should say 'present'.
 
@@ -1756,5 +1780,7 @@ from (
     ('render_jobs.upload_sent_bytes',    exists (select 1 from information_schema.columns where table_schema='public' and table_name='render_jobs' and column_name='upload_sent_bytes')),
     ('stitch_state allows finalizing',   exists (select 1 from pg_constraint where conname='render_jobs_stitch_state_check' and pg_get_constraintdef(oid) like '%finalizing%')),
     ('transcripts allow kokoro_browser', exists (select 1 from pg_constraint where conname='transcripts_provider_check' and pg_get_constraintdef(oid) like '%kokoro_browser%')),
-    ('projects allow generating_narration', exists (select 1 from pg_constraint where conname='projects_status_check' and pg_get_constraintdef(oid) like '%generating_narration%'))
+    ('projects allow generating_narration', exists (select 1 from pg_constraint where conname='projects_status_check' and pg_get_constraintdef(oid) like '%generating_narration%')),
+    ('user_provider_keys (table)',       to_regclass('public.user_provider_keys') is not null),
+    ('projects allow generating_motion', exists (select 1 from pg_constraint where conname='projects_status_check' and pg_get_constraintdef(oid) like '%generating_motion%'))
 ) as checks(check_name, present);

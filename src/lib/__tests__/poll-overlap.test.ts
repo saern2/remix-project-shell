@@ -153,9 +153,11 @@ describe("the project query that drives the churn is unchanged", () => {
   it("still refetches every 3s while in progress", () => {
     // This is deliberately NOT the variable being changed. The poll effect no
     // longer cares how often the row is refetched, which is the point.
-    // (Round B: the set is ROW_REFRESH — IN_PROGRESS plus generating_narration,
-    // so a narrating project's row refreshes too — same 3s cadence.)
+    // (Round B added generating_narration to the set; Round D adds
+    // generating_motion — same 3s cadence for both driven states.)
     expect(page).toMatch(/pollIntervalWhileActive\(query\.state\.data, ROW_REFRESH, 3000\)/);
-    expect(page).toMatch(/ROW_REFRESH = new Set\(\[\.\.\.IN_PROGRESS, "generating_narration"\]\)/);
+    expect(page).toMatch(
+      /ROW_REFRESH = new Set\(\[\.\.\.IN_PROGRESS, "generating_narration", "generating_motion"\]\)/,
+    );
   });
 });
