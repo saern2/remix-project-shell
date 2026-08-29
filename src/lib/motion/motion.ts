@@ -35,21 +35,23 @@ export const MOTION_LOST_MESSAGE =
 
 /**
  * The models offered, with honesty labels from the measured runs
- * (2026-08-26/27): GLM and DeepSeek completed end to end; Claude was
- * unavailable both times — AgentRouter releases Claude in daily batches
- * (23:00 and 11:00 UTC) and returns 402 in between.
+ * (2026-08-26/28): GLM and DeepSeek (v4 Flash — the id that actually ran
+ * the 28 Aug job) completed end to end; Claude was unavailable both
+ * earlier times — AgentRouter releases Claude in daily batches (23:00 and
+ * 11:00 UTC) and returns 402 in between. Opus 4.8 is offered as the
+ * fallback when Opus 5 is batch-limited. The worker passes the id through
+ * to the provider verbatim, so every id here must match AgentRouter's
+ * exactly — a wrong string is a failed job.
  */
 export const MOTION_MODELS: Array<{ id: string; label: string }> = [
   { id: "glm-5.3", label: "GLM 5.3 — verified working" },
-  { id: "deepseek-v3.2", label: "DeepSeek — verified working" },
+  { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash — verified working" },
   { id: "claude-opus-5", label: "Claude Opus 5 — released in daily batches, may be unavailable" },
+  { id: "claude-opus-4-8", label: "Claude Opus 4.8 — fallback when Opus 5 is unavailable" },
 ];
 
-/**
- * The AgentRouter signup link. OPERATOR: swap in the referral URL before
- * publish — the disclosure line below is already in place either way.
- */
-export const AGENTROUTER_SIGNUP_URL = "https://agentrouter.org";
+/** The AgentRouter signup link (referral; disclosure line sits beneath it). */
+export const AGENTROUTER_SIGNUP_URL = "https://agentrouter.org/register?aff=sF1j";
 
 /** Item 4's mandated copy, verbatim — pinned by test. */
 export const MOTION_KEY_COPY = {

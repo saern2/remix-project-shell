@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  AGENTROUTER_SIGNUP_URL,
   describeMotionStage,
   keyTail,
   MOTION_DURATION_COPY,
@@ -40,11 +41,27 @@ describe("the mandated key copy (Item 4 + D10), pinned verbatim", () => {
     expect(MOTION_DURATION_COPY).toContain("close this tab");
   });
 
+  it("the model ids are the operator-confirmed AgentRouter identifiers, verbatim", () => {
+    // The worker passes the id through to the provider unchanged, so a wrong
+    // string is a failed job. deepseek-v4-flash is the id that ran the
+    // successful 28 Aug job (v3.2 was never verified against the account).
+    expect(MOTION_MODELS.map((m) => m.id)).toEqual([
+      "glm-5.3",
+      "deepseek-v4-flash",
+      "claude-opus-5",
+      "claude-opus-4-8",
+    ]);
+  });
+
   it("the model list labels Claude's batch availability and names the verified pair", () => {
     const labels = MOTION_MODELS.map((m) => m.label).join(" | ");
     expect(labels).toContain("verified working");
     expect(labels).toContain("may be unavailable");
     expect(MOTION_MODELS[0].id).not.toContain("claude"); // a verified model is the default
+  });
+
+  it("the signup link is the referral URL, so the disclosure line is true", () => {
+    expect(AGENTROUTER_SIGNUP_URL).toBe("https://agentrouter.org/register?aff=sF1j");
   });
 });
 
