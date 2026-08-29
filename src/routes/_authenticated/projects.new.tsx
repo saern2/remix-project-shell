@@ -1,5 +1,16 @@
 import { createFileRoute, Link, useNavigate, useSearch } from "@tanstack/react-router";
-import { initialProjectMode } from "@/lib/project-mode";
+import { initialProjectMode, type ProjectMode } from "@/lib/project-mode";
+import {
+  AGENTROUTER_SIGNUP_URL,
+  MOTION_DURATION_COPY,
+  MOTION_KEY_COPY,
+  MOTION_MODELS,
+} from "@/lib/motion/motion";
+import {
+  getProviderKeyStatus,
+  saveProviderKey,
+  submitMotionJob,
+} from "@/lib/motion/motion.functions";
 import { useEffect, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { supabase } from "@/integrations/supabase/client";
@@ -95,7 +106,56 @@ function NewProject() {
   // expects. ONLY the initial value reads the URL — the Tabs mode switch and
   // both submit handlers are untouched.
   const urlSearch = useSearch({ strict: false }) as Record<string, unknown>;
-  const [mode, setMode] = useState<"audio" | "script">(initialProjectMode(urlSearch));
+  const [mode, setMode] = useState<ProjectMode>(initialProjectMode(urlSearch));
+
+  // ── Motion explainer state (Round D, Item 4) ──────────────────────────
+  const [motionBrief, setMotionBrief] = useState("");
+  const [motionModel, setMotionModel] = useState<string>(MOTION_MODELS[0].id);
+  const [motionKeyInput, setMotionKeyInput] = useState("");
+  const [replacingKey, setReplacingKey] = useState(false);
+  const [keyStatus, setKeyStatus] = useState<{ hasKey: boolean; tail: string | null } | null>(null);
+  const runGetKeyStatus = useServerFn(getProviderKeyStatus);
+  const runSaveKey = useServerFn(saveProviderKey);
+  const runSubmitMotion = useServerFn(submitMotionJob);
+  useEffect(() => {
+    if (mode !== "motion" || keyStatus !== null) return;
+    runGetKeyStatus({}).then(setKeyStatus, () => setKeyStatus({ hasKey: false, tail: null }));
+  }, [mode, keyStatus, runGetKeyStatus]);
+
+  /**
+   * The motion path: save the key if one was entered, submit, and hand off
+   * to the project page — which owns the 30-60 minute poll loop, so this
+   * tab can close the moment the submission is accepted.
+   */
+  const handleMotionSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!motionBrief.trim() || motionBrief.trim().length < 10) {
+      toast.error("Please describe the explainer in at least a sentence.");
+      return;
+    }
+    setBusy(true);
+    setStage("Submitting your explainer…");
+    setProgress(0);
+    try {
+      if (motionKeyInput.trim()) {
+        const saved = await runSaveKey({ data: { key: motionKeyInput.trim() } });
+        setKeyStatus({ hasKey: true, tail: saved.tail });
+        setMotionKeyInput("");
+        setReplacingKey(false);
+      }
+      const result = await runSubmitMotion({
+        data: { name: name.trim(), brief: motionBrief.trim(), model: motionModel },
+      });
+      setBusy(false);
+      toast.success("Explainer started. You can close this tab — it keeps running.");
+      navigate({ to: "/projects/$projectId", params: { projectId: result.projectId } });
+    } catch (err) {
+      setBusy(false);
+      // submitMotionJob persists nothing on refusal (rows are removed), so
+      // there is no project to mark failed — the toast is the whole story.
+      toast.error(describeUserFacingError(err));
+    }
+  };
   const [script, setScript] = useState("");
   const [voice, setVoice] = useState<string>(TTS_VOICES[0].id);
   const [scriptWarning, setScriptWarning] = useState<string | null>(null);
@@ -553,7 +613,9 @@ function NewProject() {
         </CardHeader>
         <CardContent>
           <form
-            onSubmit={mode === "audio" ? handleSubmit : handleScriptSubmit}
+            onSubmit={
+              mode === "audio" ? handleSubmit : mode === "script" ? handleScriptSubmit : handleMotionSubmit
+            }
             className="space-y-6"
           >
             <div className="space-y-2">
@@ -567,13 +629,16 @@ function NewProject() {
               />
             </div>
 
-            <Tabs value={mode} onValueChange={(value) => setMode(value as "audio" | "script")}>
-              <TabsList className="grid w-full grid-cols-2">
+            <Tabs value={mode} onValueChange={(value) => setMode(value as ProjectMode)}>
+              <TabsList className="grid w-full grid-cols-3">
                 <TabsTrigger value="audio" disabled={busy}>
                   Upload narration
                 </TabsTrigger>
                 <TabsTrigger value="script" disabled={busy}>
                   Write a script
+                </TabsTrigger>
+                <TabsTrigger value="motion" disabled={busy}>
+                  Motion explainer
                 </TabsTrigger>
               </TabsList>
 
@@ -693,8 +758,86 @@ function NewProject() {
                   </div>
                 </div>
               </TabsContent>
+
+              <TabsContent value="motion" className="space-y-4 pt-2">
+                <div className="space-y-2">
+                  <Label htmlFor="motion-brief">Explainer brief</Label>
+                  <Textarea
+                    id="motion-brief"
+                    value={motionBrief}
+                    onChange={(e) => setMotionBrief(e.target.value)}
+                    placeholder="A 20-second explainer for a SaaS analytics dashboard: five scenes, dark glass UI, end on the product name…"
+                    rows={8}
+                    disabled={busy}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    An AI motion-graphics agent designs and renders a 1080p explainer from this
+                    brief. {MOTION_DURATION_COPY}
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="motion-model">AI model</Label>
+                  <Select value={motionModel} onValueChange={setMotionModel} disabled={busy}>
+                    <SelectTrigger id="motion-model">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {MOTION_MODELS.map((model) => (
+                        <SelectItem key={model.id} value={model.id}>
+                          {model.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {/* Item 4's mandated key block, with the D10 additions: the
+                    referral disclosure and the honest duration shape. */}
+                <div className="space-y-2 rounded-md border p-4">
+                  <p className="text-sm font-medium">{MOTION_KEY_COPY.intro}</p>
+                  <p className="text-sm">
+                    <a
+                      href={AGENTROUTER_SIGNUP_URL}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-medium text-primary hover:underline"
+                    >
+                      {MOTION_KEY_COPY.linkLabel}
+                    </a>
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {MOTION_KEY_COPY.referralDisclosure}
+                  </p>
+                  <p className="text-sm text-muted-foreground">{MOTION_KEY_COPY.steps}</p>
+                  <p className="text-sm text-muted-foreground">{MOTION_KEY_COPY.claudeBatches}</p>
+                  {keyStatus?.hasKey && !replacingKey ? (
+                    <p className="text-sm">
+                      Key ending in <span className="font-mono">…{keyStatus.tail}</span> is saved.{" "}
+                      <button
+                        type="button"
+                        className="font-medium text-primary hover:underline"
+                        onClick={() => setReplacingKey(true)}
+                      >
+                        Replace it
+                      </button>
+                    </p>
+                  ) : (
+                    <Input
+                      type="password"
+                      value={motionKeyInput}
+                      onChange={(e) => setMotionKeyInput(e.target.value)}
+                      placeholder="Paste your API token"
+                      disabled={busy}
+                      autoComplete="off"
+                    />
+                  )}
+                </div>
+              </TabsContent>
             </Tabs>
 
+            {mode !== "motion" ? (
+            <>
             <div className="space-y-2">
               <Label htmlFor="category">Visual theme</Label>
               <Select
@@ -752,6 +895,8 @@ function NewProject() {
                 </div>
               ) : null}
             </div>
+            </>
+            ) : null}
 
             {busy ? (
               <div className="space-y-2">
@@ -768,7 +913,14 @@ function NewProject() {
               </Button>
               <Button
                 type="submit"
-                disabled={busy || (mode === "audio" ? !file : !script.trim())}
+                disabled={
+                  busy ||
+                  (mode === "audio"
+                    ? !file
+                    : mode === "script"
+                      ? !script.trim()
+                      : !motionBrief.trim())
+                }
               >
                 {busy ? "Working…" : "Create project"}
               </Button>
